@@ -1,0 +1,15 @@
+/.env
+/.DS_Store
+/target/
+/logs/
+/frontend/.next/
+/frontend/out/
+/frontend/node_modules/
+**/node_modules/
+**/.turbo/
+**/.cache/
+**/*.log
+**/.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/.venv/

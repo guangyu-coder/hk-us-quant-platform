@@ -1,0 +1,67 @@
+version: '3.8'
+
+# Development environment with hot reload
+services:
+  # PostgreSQL with TimescaleDB
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: quant-postgres-dev
+    environment:
+      POSTGRES_DB: quant_platform_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    networks:
+      - quant-dev-network
+
+  # Redis for development
+  redis:
+    image: redis:7-alpine
+    container_name: quant-redis-dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_dev_data:/data
+    networks:
+      - quant-dev-network
+
+  # Development application with hot reload
+  app-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: quant-app-dev
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/quant_platform_dev
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: development
+      LOG_LEVEL: debug
+      RUST_LOG: hk_us_quant_platform=debug,sqlx=info,redis=info
+      PAPER_TRADING: true
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - quant-dev-network
+    volumes:
+      - .:/app
+      - cargo_cache:/usr/local/cargo/registry
+      - target_cache:/app/target
+    working_dir: /app
+
+networks:
+  quant-dev-network:
+    driver: bridge
+
+volumes:
+  postgres_dev_data:
+  redis_dev_data:
+  cargo_cache:
+  target_cache:
