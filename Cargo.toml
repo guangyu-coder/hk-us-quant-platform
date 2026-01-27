@@ -67,6 +67,9 @@ rand = "0.8"
 # HTTP client for broker APIs
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
+# WebSocket client for streaming data
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+
 [dev-dependencies]
 # Property-based testing
 proptest = "1.4"

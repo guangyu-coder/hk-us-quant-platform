@@ -59,6 +59,12 @@ pub enum AppError {
 
     #[error("Broker error: {message}")]
     Broker { message: String },
+
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
+
+    #[error("Broker API error: {0}")]
+    BrokerApi(String),
 }
 
 impl AppError {
@@ -160,6 +166,8 @@ impl AppError {
             AppError::Portfolio { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Risk { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Broker { .. } => StatusCode::BAD_GATEWAY,
+            AppError::WebSocket(_) => StatusCode::BAD_GATEWAY,
+            AppError::BrokerApi(_) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -183,6 +191,8 @@ impl AppError {
             AppError::Portfolio { .. } => "portfolio",
             AppError::Risk { .. } => "risk",
             AppError::Broker { .. } => "broker",
+            AppError::WebSocket(_) => "websocket",
+            AppError::BrokerApi(_) => "broker_api",
         }
     }
 }

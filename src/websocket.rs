@@ -1,4 +1,3 @@
-use crate::error::AppResult;
 use crate::events::{EventBus, PlatformEvent};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -140,7 +139,7 @@ impl WSManager {
     /// Broadcast platform events
     pub fn broadcast_event(&self, event: &PlatformEvent) {
         let msg = match event {
-            PlatformEvent::MarketData { data } => WSMessage::MarketData(MarketDataUpdate {
+            PlatformEvent::MarketDataReceived { data } => WSMessage::MarketData(MarketDataUpdate {
                 symbol: data.symbol.clone(),
                 price: data.price.to_string(),
                 volume: data.volume,
@@ -151,23 +150,23 @@ impl WSManager {
                 symbol: signal.symbol.clone(),
                 signal_type: format!("{:?}", signal.signal_type),
                 strength: signal.strength,
-                timestamp: signal.generated_at,
+                timestamp: signal.timestamp,
             }),
             PlatformEvent::OrderFilled {
-                order_id, symbol, filled_quantity, avg_price, ..
+                order_id, filled_quantity, fill_price, ..
             } => WSMessage::OrderUpdate(OrderUpdate {
                 order_id: order_id.to_string(),
-                symbol: symbol.clone(),
+                symbol: "N/A".to_string(), // We don't have symbol in OrderFilled event
                 status: "filled".to_string(),
                 filled_qty: Some(*filled_quantity),
-                avg_price: Some(avg_price.to_string()),
+                avg_price: Some(fill_price.to_string()),
                 timestamp: chrono::Utc::now(),
             }),
             PlatformEvent::OrderRejected {
-                order_id, symbol, reason, ..
+                order_id, reason, ..
             } => WSMessage::OrderUpdate(OrderUpdate {
                 order_id: order_id.to_string(),
-                symbol: symbol.clone(),
+                symbol: "N/A".to_string(), // We don't have symbol in OrderRejected event
                 status: format!("rejected: {}", reason),
                 filled_qty: None,
                 avg_price: None,
@@ -209,7 +208,7 @@ async fn handle_socket(socket: WebSocket, state: WSState) {
     let mut broadcast_rx = state.manager.subscribe();
 
     // Spawn task to forward broadcasts to client
-    let conn_id_clone = conn_id.clone();
+    let _conn_id_clone = conn_id.clone();
     let forward_task = tokio::spawn(async move {
         while let Ok(msg) = broadcast_rx.recv().await {
             match serde_json::to_string(&msg) {
@@ -237,7 +236,7 @@ async fn handle_socket(socket: WebSocket, state: WSState) {
                     }
                 }
             }
-            Ok(Message::Ping(data)) => {
+            Ok(Message::Ping(_data)) => {
                 debug!("Ping from {}", conn_id);
                 // Pong is handled automatically by axum
             }

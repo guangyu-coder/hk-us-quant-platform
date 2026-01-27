@@ -28,6 +28,7 @@ mod risk;
 mod strategy;
 mod types;
 mod broker;
+mod market_data;
 mod websocket;
 
 use crate::config::AppConfig;
@@ -320,63 +321,56 @@ async fn get_market_data_history(
     Path(symbol): Path<String>,
     Query(query): Query<MarketDataHistoryQuery>,
 ) -> Result<Json<Value>, AppError> {
+    use crate::market_data::yahoo_finance::YahooFinanceClient;
+    use chrono::{Duration, NaiveDate, TimeZone};
+    
     info!("Fetching historical market data for: {}", symbol);
     
-    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("market_data.py");
-        
-    let mut cmd = Command::new("python3");
-    cmd.arg(script_path)
-       .arg("--symbol")
-       .arg(&symbol)
-       .arg("--history");
-
-    if !query.start.is_empty() {
-        cmd.arg("--start").arg(&query.start);
-    }
+    let yahoo_client = YahooFinanceClient::new();
     
-    if !query.end.is_empty() {
-        cmd.arg("--end").arg(&query.end);
-    }
-    
-    if let Some(interval) = &query.interval {
-        cmd.arg("--interval").arg(interval);
+    // Parse dates or use defaults
+    let end = if query.end.is_empty() {
+        chrono::Utc::now()
     } else {
-        // Default to 1day if not provided
-        cmd.arg("--interval").arg("1day");
-    }
+        NaiveDate::parse_from_str(&query.end, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| chrono::Utc.from_local_datetime(&d.and_hms_opt(0, 0, 0)?).single())
+            .unwrap_or_else(chrono::Utc::now)
+    };
     
-    // Default outputsize if no dates provided (handled by script logic too, but explicit here is fine)
-    if query.start.is_empty() && query.end.is_empty() {
-        cmd.arg("--outputsize").arg("30");
-    }
-
-    let output = cmd.output()
-        .await
-        .map_err(|e| AppError::market_data(format!("Failed to run history script: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::market_data(format!(
-            "History script failed: {}",
-            stderr
-        )));
-    }
-
-    let data: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| AppError::market_data(format!("Invalid history response: {}", e)))?;
-        
-    if data.get("success") != Some(&serde_json::json!(true)) {
-         return Err(AppError::market_data(format!(
-            "Historical data unavailable for {}: {}",
-            symbol,
-            data.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error")
-        )));
-    }
+    let start = if query.start.is_empty() {
+        end - Duration::days(30) // Default 30 days
+    } else {
+        NaiveDate::parse_from_str(&query.start, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| chrono::Utc.from_local_datetime(&d.and_hms_opt(0, 0, 0)?).single())
+            .unwrap_or_else(|| end - Duration::days(30))
+    };
     
-    // Return the data array directly as expected by frontend
-    Ok(Json(data.get("data").cloned().unwrap_or(json!([]))))
+    let interval = query.interval.as_deref().unwrap_or("1d");
+    
+    match yahoo_client.get_historical_bars(&symbol, start, end, interval).await {
+        Ok(bars) => {
+            let data: Vec<Value> = bars.iter().map(|bar| {
+                json!({
+                    "timestamp": bar.timestamp,
+                    "open": bar.open_price.and_then(|p| p.to_f64()),
+                    "high": bar.high_price.and_then(|p| p.to_f64()),
+                    "low": bar.low_price.and_then(|p| p.to_f64()),
+                    "close": bar.price.to_f64(),
+                    "volume": bar.volume,
+                })
+            }).collect();
+            
+            Ok(Json(json!(data)))
+        },
+        Err(e) => {
+            Err(AppError::market_data(format!(
+                "Failed to fetch historical data for {}: {}",
+                symbol, e
+            )))
+        }
+    }
 }
 
 async fn get_market_data_batch(
@@ -601,102 +595,33 @@ async fn run_backtest(
 }
 
 async fn fetch_market_data_value(symbol: &str) -> Result<Value, AppError> {
-    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("market_data.py");
+    use crate::market_data::yahoo_finance::YahooFinanceClient;
     
-    // Set a timeout for the script execution (e.g., 5 seconds)
-    let timeout_duration = std::time::Duration::from_secs(5);
+    // Try Yahoo Finance first (free, no API key needed)
+    let yahoo_client = YahooFinanceClient::new();
     
-    let command_future = Command::new("python3")
-        .arg(script_path)
-        .arg("--symbol")
-        .arg(symbol)
-        .output();
-
-    let output = match tokio::time::timeout(timeout_duration, command_future).await {
-        Ok(result) => result,
-        Err(_) => {
-             info!("Market data script timed out for {}. Using mock data.", symbol);
-             return Ok(get_mock_market_data(symbol));
-        }
-    };
-
-    // Fallback to mock data on any error to ensure UI availability
-    let output = match output {
-        Ok(out) => out,
+    match yahoo_client.get_quote(symbol).await {
+        Ok(data) => {
+            let change = data.price_change();
+            let change_percent = data.price_change_percent();
+            
+            Ok(json!({
+                "symbol": data.symbol,
+                "price": data.price.to_f64().unwrap_or(0.0),
+                "volume": data.volume,
+                "timestamp": data.timestamp,
+                "previous_close": data.previous_close.and_then(|p| p.to_f64()),
+                "change": change.and_then(|c| c.to_f64()),
+                "change_percent": change_percent,
+                "data_source": "Yahoo Finance",
+                "exchange": data.exchange.unwrap_or_else(|| "N/A".to_string()),
+            }))
+        },
         Err(e) => {
-            info!("Failed to run market data script for {}: {}. Using mock data.", symbol, e);
-            return Ok(get_mock_market_data(symbol));
+            info!("Yahoo Finance failed for {}: {}. Using mock data.", symbol, e);
+            Ok(get_mock_market_data(symbol))
         }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        info!("Market data script failed for {}: {}. Using mock data.", symbol, stderr);
-        return Ok(get_mock_market_data(symbol));
     }
-
-    let data: Value = match serde_json::from_slice(&output.stdout) {
-        Ok(v) => v,
-        Err(e) => {
-             info!("Invalid market data response for {}: {}. Using mock data.", symbol, e);
-             return Ok(get_mock_market_data(symbol));
-        }
-    };
-
-    if data.get("success") != Some(&serde_json::json!(true)) {
-        let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
-        info!("Market data unavailable for {}: {}. Using mock data.", symbol, err);
-        return Ok(get_mock_market_data(symbol));
-    }
-
-    let price_data = &data["data"];
-    let previous_close = price_data
-        .get("previous_close")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let current_price = price_data
-        .get("price")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let open_price = price_data
-        .get("open")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(previous_close);
-    let high_price = price_data
-        .get("high")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(current_price);
-    let low_price = price_data
-        .get("low")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(current_price);
-    let volume = price_data
-        .get("volume")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let change = current_price - previous_close;
-    let change_percent = if previous_close != 0.0 {
-        (change / previous_close) * 100.0
-    } else {
-        0.0
-    };
-
-    Ok(json!({
-        "symbol": symbol,
-        "price": current_price,
-        "previous_close": previous_close,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "volume": volume,
-        "change": change,
-        "change_percent": change_percent,
-        "timestamp": data.get("timestamp").unwrap_or(&serde_json::json!("")),
-        "source": "twelvedata"
-    }))
 }
 
 fn parse_datetime(input: &str) -> Result<DateTime<Utc>, AppError> {

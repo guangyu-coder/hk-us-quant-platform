@@ -1,10 +1,10 @@
 use crate::error::{AppError, AppResult};
-use crate::types::{Order, OrderSide, OrderStatus, OrderType, Position};
+use crate::types::{Order, OrderStatus};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 pub mod alpaca;
 
