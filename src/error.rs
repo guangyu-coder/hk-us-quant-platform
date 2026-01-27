@@ -56,6 +56,9 @@ pub enum AppError {
 
     #[error("Risk management error: {message}")]
     Risk { message: String },
+
+    #[error("Broker error: {message}")]
+    Broker { message: String },
 }
 
 impl AppError {
@@ -130,6 +133,13 @@ impl AppError {
         }
     }
 
+    /// Create a broker error
+    pub fn broker(message: impl Into<String>) -> Self {
+        Self::Broker {
+            message: message.into(),
+        }
+    }
+
     /// Get the HTTP status code for this error
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -149,6 +159,7 @@ impl AppError {
             AppError::Execution { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Portfolio { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Risk { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            AppError::Broker { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -171,6 +182,7 @@ impl AppError {
             AppError::Execution { .. } => "execution",
             AppError::Portfolio { .. } => "portfolio",
             AppError::Risk { .. } => "risk",
+            AppError::Broker { .. } => "broker",
         }
     }
 }

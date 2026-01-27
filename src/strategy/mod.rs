@@ -10,6 +10,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+pub mod indicators;
+pub mod strategies;
+
+pub use strategies::{
+    BollingerBandsStrategy, DualMACrossoverStrategy, MACDStrategy, RSIStrategy,
+};
+
 /// Strategy trait for implementing trading strategies
 #[async_trait]
 pub trait Strategy: Send + Sync {
@@ -199,6 +206,14 @@ impl StrategyService {
                 Ok(Box::new(SimpleMovingAverageStrategy::new(config.clone())?))
             }
             "mean_reversion" => Ok(Box::new(MeanReversionStrategy::new(config.clone())?)),
+            "rsi" | "rsi_strategy" => Ok(Box::new(RSIStrategy::new(config.clone())?)),
+            "macd" | "macd_strategy" => Ok(Box::new(MACDStrategy::new(config.clone())?)),
+            "bollinger" | "bollinger_bands" => {
+                Ok(Box::new(BollingerBandsStrategy::new(config.clone())?))
+            }
+            "dual_ma" | "ma_crossover" => {
+                Ok(Box::new(DualMACrossoverStrategy::new(config.clone())?))
+            }
             _ => Err(AppError::strategy(format!(
                 "Unknown strategy type: {}",
                 config.name

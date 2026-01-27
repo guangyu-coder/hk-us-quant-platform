@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Web framework
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = { version = "1.0", features = ["full"] }
@@ -23,6 +23,7 @@ hyper = { version = "1.0", features = ["full"] }
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"
+futures-util = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -62,6 +63,9 @@ async-trait = "0.1"
 
 # Random data generation (for mock data fallback)
 rand = "0.8"
+
+# HTTP client for broker APIs
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 # Property-based testing

@@ -27,6 +27,8 @@ mod portfolio;
 mod risk;
 mod strategy;
 mod types;
+mod broker;
+mod websocket;
 
 use crate::config::AppConfig;
 use crate::data::handlers::DataEventHandler;
