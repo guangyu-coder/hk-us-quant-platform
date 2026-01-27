@@ -14,7 +14,7 @@ pub mod indicators;
 pub mod strategies;
 
 pub use strategies::{
-    BollingerBandsStrategy, DualMACrossoverStrategy, MACDStrategy, RSIStrategy,
+    BollingerBandsStrategy, DualMACrossoverStrategy, MACDStrategy, PairsTradingStrategy, RSIStrategy,
 };
 
 /// Strategy trait for implementing trading strategies
@@ -213,6 +213,9 @@ impl StrategyService {
             }
             "dual_ma" | "ma_crossover" => {
                 Ok(Box::new(DualMACrossoverStrategy::new(config.clone())?))
+            }
+            "pairs_trading" | "statistical_arbitrage" => {
+                Ok(Box::new(PairsTradingStrategy::new(config.clone())?))
             }
             _ => Err(AppError::strategy(format!(
                 "Unknown strategy type: {}",

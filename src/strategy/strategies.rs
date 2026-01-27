@@ -516,3 +516,190 @@ impl Strategy for DualMACrossoverStrategy {
             .unwrap_or("Dual MA Crossover: Trade on golden/death crosses")
     }
 }
+
+/// Pairs Trading Strategy
+/// - Monitors the price ratio between two correlated assets (Asset A / Asset B)
+/// - Calculates the Z-score of the ratio (deviation from mean)
+/// - Buy A / Sell B when ratio is too low (Z-score < -threshold)
+/// - Sell A / Buy B when ratio is too high (Z-score > threshold)
+/// - Close positions when ratio returns to mean
+pub struct PairsTradingStrategy {
+    config: StrategyConfig,
+    asset_a: String,
+    asset_b: String,
+    lookback_period: usize,
+    threshold: f64,
+    price_history_a: RwLock<Vec<Decimal>>,
+    price_history_b: RwLock<Vec<Decimal>>,
+}
+
+impl PairsTradingStrategy {
+    pub fn new(config: StrategyConfig) -> AppResult<Self> {
+        let asset_a = config
+            .parameters
+            .get("asset_a")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::AppError::strategy("Missing parameter: asset_a"))?
+            .to_string();
+
+        let asset_b = config
+            .parameters
+            .get("asset_b")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::error::AppError::strategy("Missing parameter: asset_b"))?
+            .to_string();
+
+        let lookback_period = config
+            .parameters
+            .get("lookback_period")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+
+        let threshold = config
+            .parameters
+            .get("threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(2.0);
+
+        Ok(Self {
+            config,
+            asset_a,
+            asset_b,
+            lookback_period,
+            threshold,
+            price_history_a: RwLock::new(Vec::new()),
+            price_history_b: RwLock::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl Strategy for PairsTradingStrategy {
+    async fn generate_signals(&self, market_data: &MarketData) -> AppResult<Vec<Signal>> {
+        let symbol = &market_data.symbol;
+        let price = market_data.price;
+        let mut signals = Vec::new();
+
+        // Only process if it's one of our pair assets
+        if symbol != &self.asset_a && symbol != &self.asset_b {
+            return Ok(signals);
+        }
+
+        // Update history
+        {
+            let mut history = if symbol == &self.asset_a {
+                self.price_history_a.write().unwrap()
+            } else {
+                self.price_history_b.write().unwrap()
+            };
+            history.push(price);
+            if history.len() > self.lookback_period {
+                history.remove(0);
+            }
+        }
+
+        // Check if we have enough data for both assets
+        let history_a = self.price_history_a.read().unwrap();
+        let history_b = self.price_history_b.read().unwrap();
+
+        if history_a.len() < self.lookback_period || history_b.len() < self.lookback_period {
+            return Ok(signals);
+        }
+
+        // Calculate ratios and Z-score
+        let mut ratios = Vec::with_capacity(self.lookback_period);
+        for i in 0..self.lookback_period {
+            let price_a = history_a[i];
+            let price_b = history_b[i];
+            if !price_b.is_zero() {
+                ratios.push(price_a / price_b);
+            }
+        }
+
+        if ratios.len() < self.lookback_period {
+            return Ok(signals);
+        }
+
+        let current_ratio = *ratios.last().unwrap();
+        let sum: Decimal = ratios.iter().sum();
+        let mean = sum / Decimal::from(ratios.len());
+
+        let variance: Decimal = ratios
+            .iter()
+            .map(|value| {
+                let diff = value - mean;
+                diff * diff
+            })
+            .sum::<Decimal>()
+            / Decimal::from(ratios.len());
+        
+        let std_dev = variance.sqrt().unwrap_or(Decimal::ONE);
+        
+        if std_dev.is_zero() {
+             return Ok(signals);
+        }
+
+        let z_score = (current_ratio - mean) / std_dev;
+        let z_val = z_score.to_f64().unwrap_or(0.0);
+
+        debug!("Pairs Trading {}-{}: Ratio={}, Mean={}, Z-Score={}", 
+               self.asset_a, self.asset_b, current_ratio, mean, z_val);
+
+        // Generate signals based on Z-score
+        if z_val > self.threshold {
+            // Ratio is too high: Short A, Long B
+            signals.push(Signal::new(
+                self.config.id.clone(),
+                self.asset_a.clone(),
+                SignalType::Sell,
+                1.0,
+            ));
+            signals.push(Signal::new(
+                self.config.id.clone(),
+                self.asset_b.clone(),
+                SignalType::Buy,
+                1.0,
+            ));
+        } else if z_val < -self.threshold {
+            // Ratio is too low: Long A, Short B
+            signals.push(Signal::new(
+                self.config.id.clone(),
+                self.asset_a.clone(),
+                SignalType::Buy,
+                1.0,
+            ));
+            signals.push(Signal::new(
+                self.config.id.clone(),
+                self.asset_b.clone(),
+                SignalType::Sell,
+                1.0,
+            ));
+        } else if z_val.abs() < 0.5 {
+             // Close positions when ratio returns to mean (optional implementation)
+             // For now, we just emit 'Hold' or nothing
+        }
+
+        Ok(signals)
+    }
+
+    async fn update_parameters(
+        &mut self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> AppResult<()> {
+        if let Some(v) = params.get("threshold").and_then(|v| v.as_f64()) {
+            self.threshold = v;
+        }
+        Ok(())
+    }
+
+    fn get_name(&self) -> &str {
+        &self.config.name
+    }
+
+    fn get_description(&self) -> &str {
+        self.config
+            .description
+            .as_deref()
+            .unwrap_or("Pairs Trading Strategy: Statistical arbitrage on asset correlation")
+    }
+}
