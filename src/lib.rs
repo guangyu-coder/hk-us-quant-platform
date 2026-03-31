@@ -3,6 +3,7 @@ pub mod data;
 pub mod error;
 pub mod events;
 pub mod execution;
+pub mod market_data;
 pub mod portfolio;
 pub mod risk;
 pub mod strategy;

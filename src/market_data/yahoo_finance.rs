@@ -191,10 +191,8 @@ impl YahooFinanceClient {
 
             let bar = MarketData {
                 symbol: result.meta.symbol.clone(),
-                timestamp: DateTime::from_timestamp(ts, 0)
-                    .unwrap_or_else(Utc::now),
-                price: Decimal::from_str(&close.to_string())
-                    .unwrap_or(Decimal::ZERO),
+                timestamp: DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now),
+                price: Decimal::from_str(&close.to_string()).unwrap_or(Decimal::ZERO),
                 volume,
                 bid_price: None,
                 ask_price: None,

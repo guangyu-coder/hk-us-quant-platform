@@ -21,15 +21,15 @@ pub fn ema(prices: &[Decimal], period: usize) -> Option<Decimal> {
     }
 
     let multiplier = Decimal::from(2) / Decimal::from(period + 1);
-    
+
     // Start with SMA for first EMA value
     let initial_sma = sma(&prices[..period], period)?;
-    
+
     let mut ema_value = initial_sma;
     for price in prices.iter().skip(period) {
         ema_value = (*price - ema_value) * multiplier + ema_value;
     }
-    
+
     Some(ema_value)
 }
 
@@ -59,8 +59,16 @@ impl RSI {
     pub fn update(&mut self, price: Decimal) -> Option<Decimal> {
         if let Some(prev) = self.prev_price {
             let change = price - prev;
-            let gain = if change > Decimal::ZERO { change } else { Decimal::ZERO };
-            let loss = if change < Decimal::ZERO { change.abs() } else { Decimal::ZERO };
+            let gain = if change > Decimal::ZERO {
+                change
+            } else {
+                Decimal::ZERO
+            };
+            let loss = if change < Decimal::ZERO {
+                change.abs()
+            } else {
+                Decimal::ZERO
+            };
 
             self.gains.push_back(gain);
             self.losses.push_back(loss);
@@ -71,8 +79,10 @@ impl RSI {
             }
 
             if self.gains.len() == self.period {
-                let avg_gain: Decimal = self.gains.iter().sum::<Decimal>() / Decimal::from(self.period);
-                let avg_loss: Decimal = self.losses.iter().sum::<Decimal>() / Decimal::from(self.period);
+                let avg_gain: Decimal =
+                    self.gains.iter().sum::<Decimal>() / Decimal::from(self.period);
+                let avg_loss: Decimal =
+                    self.losses.iter().sum::<Decimal>() / Decimal::from(self.period);
 
                 self.avg_gain = Some(avg_gain);
                 self.avg_loss = Some(avg_loss);
@@ -185,7 +195,7 @@ impl BollingerBands {
         }
 
         let middle_band = sma(prices, self.period)?;
-        
+
         // Calculate standard deviation
         let recent_prices: Vec<_> = prices.iter().rev().take(self.period).cloned().collect();
         let variance: Decimal = recent_prices
@@ -193,20 +203,20 @@ impl BollingerBands {
             .map(|p| (*p - middle_band).powi(2))
             .sum::<Decimal>()
             / Decimal::from(self.period);
-        
+
         let std_dev = variance.sqrt().unwrap_or(Decimal::ZERO);
         let band_width = self.std_dev_multiplier * std_dev;
 
         let upper_band = middle_band + band_width;
         let lower_band = middle_band - band_width;
-        
+
         let current_price = *prices.last()?;
         let bandwidth = if middle_band != Decimal::ZERO {
             (upper_band - lower_band) / middle_band
         } else {
             Decimal::ZERO
         };
-        
+
         let percent_b = if upper_band != lower_band {
             (current_price - lower_band) / (upper_band - lower_band)
         } else {
@@ -241,15 +251,15 @@ impl ATR {
         }
 
         let mut true_ranges = Vec::new();
-        
+
         for i in 1..ohlc.len() {
             let (high, low, _) = ohlc[i];
             let (_, _, prev_close) = ohlc[i - 1];
-            
+
             let tr1 = high - low;
             let tr2 = (high - prev_close).abs();
             let tr3 = (low - prev_close).abs();
-            
+
             let true_range = tr1.max(tr2).max(tr3);
             true_ranges.push(true_range);
         }
@@ -277,8 +287,14 @@ impl Stochastic {
     }
 
     /// Calculate from high, low, close data
-    pub fn calculate(&self, highs: &[Decimal], lows: &[Decimal], closes: &[Decimal]) -> Option<StochasticResult> {
-        if highs.len() < self.k_period || lows.len() < self.k_period || closes.len() < self.k_period {
+    pub fn calculate(
+        &self,
+        highs: &[Decimal],
+        lows: &[Decimal],
+        closes: &[Decimal],
+    ) -> Option<StochasticResult> {
+        if highs.len() < self.k_period || lows.len() < self.k_period || closes.len() < self.k_period
+        {
             return None;
         }
 
@@ -288,7 +304,7 @@ impl Stochastic {
             let start = i + 1 - self.k_period;
             let highest_high = highs[start..=i].iter().max()?.clone();
             let lowest_low = lows[start..=i].iter().min()?.clone();
-            
+
             let k = if highest_high != lowest_low {
                 (closes[i] - lowest_low) / (highest_high - lowest_low) * Decimal::from(100)
             } else {
@@ -323,11 +339,23 @@ mod tests {
     #[test]
     fn test_rsi() {
         let prices: Vec<Decimal> = vec![
-            dec("44"), dec("44.25"), dec("44.5"), dec("43.75"), dec("44.5"),
-            dec("44.25"), dec("44.125"), dec("43.75"), dec("44.5"), dec("44.25"),
-            dec("44.5"), dec("45"), dec("45.5"), dec("46"), dec("45.5"),
+            dec("44"),
+            dec("44.25"),
+            dec("44.5"),
+            dec("43.75"),
+            dec("44.5"),
+            dec("44.25"),
+            dec("44.125"),
+            dec("43.75"),
+            dec("44.5"),
+            dec("44.25"),
+            dec("44.5"),
+            dec("45"),
+            dec("45.5"),
+            dec("46"),
+            dec("45.5"),
         ];
-        
+
         let rsi = RSI::calculate(&prices, 14);
         assert!(rsi.is_some());
         let rsi_val = rsi.unwrap();
@@ -340,7 +368,7 @@ mod tests {
         let prices: Vec<Decimal> = (1..=20).map(|i| Decimal::from(100 + i)).collect();
         let bb = BollingerBands::new(20, 2.0);
         let result = bb.calculate(&prices);
-        
+
         assert!(result.is_some());
         let bands = result.unwrap();
         assert!(bands.upper_band > bands.middle_band);

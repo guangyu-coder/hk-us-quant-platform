@@ -40,27 +40,30 @@ A high-performance quantitative trading platform for Hong Kong and US markets, b
 - PostgreSQL with TimescaleDB extension
 - Redis
 
-### Development Setup
+### Containerized Setup
 
 1. **Clone and setup the project**:
    ```bash
    git clone <repository>
    cd hk-us-quant-platform
-   cp .env.example .env
    ```
 
-2. **Start infrastructure services**:
+2. **Start the full stack**:
    ```bash
-   docker-compose up -d postgres redis
+   ./scripts/deploy.sh up --build
    ```
 
-3. **Install dependencies and run**:
+3. **Check service status**:
    ```bash
-   cargo build
-   cargo run
+   ./scripts/deploy.sh status
    ```
 
-4. **Run tests**:
+4. **Stop the stack**:
+   ```bash
+   ./scripts/deploy.sh down
+   ```
+
+5. **Run tests**:
    ```bash
    # Unit tests
    cargo test
@@ -71,15 +74,10 @@ A high-performance quantitative trading platform for Hong Kong and US markets, b
 
 ### Production Setup
 
-1. **Build optimized binary**:
-   ```bash
-   cargo build --release
-   ```
-
-2. **Run with Docker**:
-   ```bash
-   docker-compose up --build
-   ```
+Use the same container entrypoint:
+```bash
+./scripts/deploy.sh up --build
+```
 
 ## Configuration
 
@@ -219,11 +217,14 @@ src/
 
 ### Docker Deployment
 ```bash
-# Build and run with Docker Compose
-docker-compose up --build
+# Build and run
+./scripts/deploy.sh up --build
 
-# Scale services
-docker-compose up --scale app=3
+# Stop services
+./scripts/deploy.sh down
+
+# Remove services and volumes
+./scripts/deploy.sh destroy
 ```
 
 ### Environment Variables

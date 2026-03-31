@@ -1,85 +1,96 @@
-# Multi-stage build for Rust application
-FROM rust:1.75-slim as builder
+# syntax=docker/dockerfile:1.7
 
-# Install system dependencies
+# Shared base image for all Rust build stages
+FROM rust:1.89-slim-bookworm AS chef
+
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libpq-dev \
     curl \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
-# Copy manifests first for better caching
+# Build dependency graph once so dependency compilation can be cached
+FROM chef AS planner
+
 COPY Cargo.toml Cargo.lock ./
-
-# Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build dependencies (this will be cached if Cargo.toml doesn't change)
-RUN cargo build --release && rm -rf src target/release/deps/hk_us_quant_platform*
-
-# Copy source code
 COPY src ./src
 COPY migrations ./migrations
+COPY scripts ./scripts
 
-# Build the application
-RUN cargo build --release
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Compile dependencies using the generated recipe
+FROM chef AS builder
+
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+COPY scripts ./scripts
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && \
+    cp /app/target/release/hk-us-quant-platform /app/hk-us-quant-platform
 
 # Runtime stage
-FROM debian:bookworm-slim as runtime
+FROM debian:trixie-slim AS runtime
 
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libpq5 \
     curl \
+    python3 \
+    python3-pip \
+    && pip3 install --no-cache-dir --break-system-packages \
+        requests \
+        yfinance \
+        pandas \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app user for security
 RUN useradd -m -u 1001 -s /bin/bash appuser
 
 WORKDIR /app
 
-# Copy the binary from builder stage
-COPY --from=builder /app/target/release/hk-us-quant-platform /app/
+COPY --from=builder /app/hk-us-quant-platform /app/
 COPY --from=builder /app/migrations /app/migrations
+COPY --from=builder /app/scripts /app/scripts
 
-# Copy configuration files
 COPY .env.example /app/.env
 COPY config /app/config
 
-# Create logs directory
-RUN mkdir -p /app/logs
-
-# Change ownership to app user
-RUN chown -R appuser:appuser /app
+RUN mkdir -p /app/logs && chown -R appuser:appuser /app
 
 USER appuser
 
-# Expose port
 EXPOSE 8080
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the application
 CMD ["./hk-us-quant-platform"]
 
 # Development stage (optional)
-FROM builder as development
+FROM chef AS development
 
-# Install additional development tools
 RUN cargo install cargo-watch sqlx-cli
 
-# Copy source for development
 COPY . .
 
-# Expose port for development
 EXPOSE 8080
 
-# Development command with hot reload
 CMD ["cargo", "watch", "-x", "run"]

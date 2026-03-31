@@ -1,10 +1,12 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { MarketDataWidget } from '@/components/market/MarketDataWidget';
-import { marketDataApi } from '@/lib/api';
+import { marketDataApi, WebSocketManager } from '@/lib/api';
+import { formatMarketNumber, formatMarketPrice, getMarketStatusLabel, inferCurrency } from '@/lib/market';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { Search, Loader2, TrendingUp, TrendingDown, RefreshCw } from 'lucide-react';
+import type { MarketData, MarketDataMeta, MarketQuoteResult } from '@/types';
 
 // 默认热门股票列表
 const defaultPopularStocks = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', '0700.HK', '0941.HK', 'AMZN'];
@@ -15,6 +17,8 @@ interface StockData {
   price: number;
   change: number;
   changePercent: number;
+  currency?: string;
+  exchange?: string;
 }
 
 interface SearchResult {
@@ -25,13 +29,171 @@ interface SearchResult {
   instrument_type: string;
 }
 
+interface ChartPoint {
+  timestamp: string;
+  time: string;
+  price: number;
+  volume: number;
+}
+
+const toFiniteNumber = (value: unknown, fallback = 0): number => {
+  const num = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(num) ? num : fallback;
+};
+
+const normalizeSearchSymbol = (result: SearchResult): string => {
+  const rawSymbol = result.symbol.trim().toUpperCase();
+  const exchange = result.exchange.trim().toUpperCase();
+  const country = result.country.trim().toUpperCase();
+
+  if (rawSymbol.endsWith('.HK')) {
+    return rawSymbol;
+  }
+
+  const isHongKong =
+    country.includes('HONG KONG') ||
+    exchange.includes('HK') ||
+    exchange.includes('HONG KONG');
+
+  if (isHongKong && /^\d+$/.test(rawSymbol)) {
+    const normalizedCode = rawSymbol.length >= 4 ? rawSymbol : rawSymbol.padStart(4, '0');
+    return `${normalizedCode}.HK`;
+  }
+
+  return rawSymbol;
+};
+
+const formatChartLabel = (timestamp: string): string => {
+  if (!timestamp) {
+    return '';
+  }
+
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+};
+
+const getHistoryParams = (selectedTimeframe: string) => {
+  let interval = '1d';
+  let startDate = '';
+  const endDate = '';
+
+  const now = new Date();
+  const start = new Date();
+
+  switch (selectedTimeframe) {
+    case '1D':
+      interval = '15m';
+      start.setDate(now.getDate() - 1);
+      startDate = start.toISOString().split('T')[0];
+      break;
+    case '1W':
+      interval = '1h';
+      start.setDate(now.getDate() - 7);
+      startDate = start.toISOString().split('T')[0];
+      break;
+    case '1M':
+      interval = '1d';
+      start.setMonth(now.getMonth() - 1);
+      startDate = start.toISOString().split('T')[0];
+      break;
+    case '3M':
+      interval = '1d';
+      start.setMonth(now.getMonth() - 3);
+      startDate = start.toISOString().split('T')[0];
+      break;
+    case '1Y':
+      interval = '1wk';
+      start.setFullYear(now.getFullYear() - 1);
+      startDate = start.toISOString().split('T')[0];
+      break;
+    default:
+      interval = '1d';
+  }
+
+  return { interval, startDate, endDate };
+};
+
+const getChartRefreshInterval = (selectedTimeframe: string): number => {
+  switch (selectedTimeframe) {
+    case '1D':
+      return 15000;
+    case '1W':
+      return 30000;
+    default:
+      return 60000;
+  }
+};
+
+const applyQuoteToChartData = (
+  existingData: ChartPoint[],
+  quote: Partial<MarketData> | null
+): ChartPoint[] => {
+  if (!quote || existingData.length === 0 || !Number.isFinite(quote.price)) {
+    return existingData;
+  }
+
+  const timestamp = quote.timestamp || new Date().toISOString();
+  const nextPoint: ChartPoint = {
+    timestamp,
+    time: formatChartLabel(timestamp),
+    price: quote.price ?? NaN,
+    volume: toFiniteNumber(quote.volume),
+  };
+
+  const updatedData = [...existingData];
+  const lastIndex = updatedData.length - 1;
+  const lastPoint = updatedData[lastIndex];
+
+  if (!lastPoint) {
+    return [nextPoint];
+  }
+
+  const nextTime = new Date(timestamp).getTime();
+  const lastTime = new Date(lastPoint.timestamp).getTime();
+
+  if (Number.isFinite(nextTime) && Number.isFinite(lastTime) && nextTime > lastTime) {
+    updatedData[lastIndex] = {
+      ...lastPoint,
+      price: nextPoint.price,
+      volume: nextPoint.volume,
+    };
+    return updatedData;
+  }
+
+  updatedData[lastIndex] = {
+    ...lastPoint,
+    price: nextPoint.price,
+    volume: nextPoint.volume,
+  };
+
+  return updatedData;
+};
+
 export default function MarketPage() {
+  const wsManagerRef = useRef<WebSocketManager | null>(null);
+  const selectedSymbolRef = useRef('AAPL');
   const [selectedTimeframe, setSelectedTimeframe] = useState('1D');
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL');
   const [stockData, setStockData] = useState<StockData[]>([]);
-  const [chartData, setChartData] = useState<any[]>([]);
+  const [chartData, setChartData] = useState<ChartPoint[]>([]);
+  const [selectedQuote, setSelectedQuote] = useState<MarketQuoteResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [chartLoading, setChartLoading] = useState(false);
+  const [chartRefreshing, setChartRefreshing] = useState(false);
+  const [lastChartUpdatedAt, setLastChartUpdatedAt] = useState<string | null>(null);
+  const [chartMeta, setChartMeta] = useState<MarketDataMeta | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
   
   // 搜索相关状态
   const [searchQuery, setSearchQuery] = useState('');
@@ -39,55 +201,52 @@ export default function MarketPage() {
   const [isSearching, setIsSearching] = useState(false);
   const [showSearchResults, setShowSearchResults] = useState(false);
 
-  // 获取热门股票数据
-  const fetchStockData = async () => {
-    // 只有第一次加载时设置 loading
-    if (stockData.length === 0) setLoading(true);
-    
-    const stocks: StockData[] = [];
-    
-    // 使用 batch API 获取数据
-    try {
-      const data = await marketDataApi.getMultipleSymbols(defaultPopularStocks);
-      
-      // 处理返回数据
-      if (Array.isArray(data)) {
-        data.forEach((item: any) => {
-           if (item.success !== false) {
-             const stockNames: Record<string, string> = {
-               'AAPL': 'Apple Inc.',
-               'GOOGL': 'Alphabet Inc.',
-               'MSFT': 'Microsoft Corp.',
-               'TSLA': 'Tesla Inc.',
-               '0700.HK': 'Tencent Holdings',
-               '0941.HK': 'China Mobile',
-               'AMZN': 'Amazon.com',
-             };
-
-             stocks.push({
-               symbol: item.symbol,
-               name: stockNames[item.symbol] || item.symbol,
-               price: item.price,
-               change: item.change,
-               changePercent: item.change_percent,
-             });
-           }
-        });
-      }
-    } catch (error) {
-      console.error("Failed to fetch market data", error);
-    }
-    
-    setStockData(stocks);
-    setLoading(false);
-  };
-
   useEffect(() => {
+    const fetchStockData = async () => {
+      const stocks: StockData[] = [];
+
+      try {
+        const data = await marketDataApi.getMultipleSymbols(defaultPopularStocks);
+
+        if (Array.isArray(data)) {
+          data.forEach((item) => {
+            if (item.success && item.data) {
+              const quote = item.data;
+              const stockNames: Record<string, string> = {
+                'AAPL': 'Apple Inc.',
+                'GOOGL': 'Alphabet Inc.',
+                'MSFT': 'Microsoft Corp.',
+                'TSLA': 'Tesla Inc.',
+                '0700.HK': 'Tencent Holdings',
+                '0941.HK': 'China Mobile',
+                'AMZN': 'Amazon.com',
+              };
+
+              stocks.push({
+                symbol: quote.symbol ?? item.meta.normalized_symbol,
+                name: stockNames[quote.symbol ?? item.meta.normalized_symbol] || quote.symbol || item.meta.normalized_symbol,
+                price: toFiniteNumber(quote.price),
+                change: toFiniteNumber(quote.change),
+                changePercent: toFiniteNumber(quote.change_percent),
+                currency: typeof quote.currency === 'string' ? quote.currency : undefined,
+                exchange: typeof quote.exchange === 'string' ? quote.exchange : undefined,
+              });
+            }
+          });
+        }
+      } catch (error) {
+        console.error("Failed to fetch market data", error);
+      }
+
+      setStockData(stocks);
+      setLoading(false);
+    };
+
     fetchStockData();
     // 每30秒刷新一次数据
     const interval = setInterval(fetchStockData, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [refreshNonce]);
 
   // 处理搜索
   useEffect(() => {
@@ -118,104 +277,214 @@ export default function MarketPage() {
   }, [searchQuery]);
 
   // 选择搜索结果
-  const handleSelectSymbol = (symbol: string) => {
-    console.log('Selected symbol:', symbol);
-    setSelectedSymbol(symbol);
+  const handleSelectSymbol = (result: SearchResult) => {
+    const normalizedSymbol = normalizeSearchSymbol(result);
+    console.log('Selected symbol:', result.symbol, 'normalized to:', normalizedSymbol);
+    setSelectedSymbol(normalizedSymbol);
     setSearchQuery('');
     setShowSearchResults(false);
   };
 
-  // 获取图表数据
   useEffect(() => {
-    const generateChartData = async () => {
-      setChartLoading(true);
-      
-      // 尝试从 API 获取当前价格，如果 stockData 中没有，则单独获取
-      let currentPrice = stockData.find(s => s.symbol === selectedSymbol)?.price;
-      
-      if (!currentPrice) {
-         try {
-           const data = await marketDataApi.getRealTimeData(selectedSymbol);
-           if (data && typeof data.price === 'number') {
-             currentPrice = data.price;
-           }
-         } catch (e) {
-           console.error("Failed to fetch price for chart", e);
-         }
-      }
-      
-      if (!currentPrice) {
-        setChartData([]);
-        setChartLoading(false);
-        return;
-      }
-      
-      try {
-        // 根据 selectedTimeframe 计算 interval 和日期范围
-        let interval = '1day';
-        let startDate = '';
-        let endDate = ''; // 空字符串表示到现在
-        
-        const now = new Date();
-        const start = new Date();
-        
-        switch(selectedTimeframe) {
-          case '1D':
-            interval = '15min'; // 1天用15分钟线
-            break;
-          case '1W':
-            interval = '1h';
-            start.setDate(now.getDate() - 7);
-            startDate = start.toISOString().split('T')[0];
-            break;
-          case '1M':
-            interval = '1day';
-            start.setMonth(now.getMonth() - 1);
-            startDate = start.toISOString().split('T')[0];
-            break;
-          case '3M':
-            interval = '1day';
-            start.setMonth(now.getMonth() - 3);
-            startDate = start.toISOString().split('T')[0];
-            break;
-          case '1Y':
-            interval = '1week';
-            start.setFullYear(now.getFullYear() - 1);
-            startDate = start.toISOString().split('T')[0];
-            break;
-          default:
-            interval = '1day';
+    selectedSymbolRef.current = selectedSymbol;
+  }, [selectedSymbol]);
+
+  useEffect(() => {
+    const wsManager = new WebSocketManager();
+    wsManagerRef.current = wsManager;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+    wsManager.connect(
+      wsUrl,
+      (message) => {
+        if (message?.type !== 'MarketData' || !message.data) {
+          return;
         }
 
-        // 尝试调用历史数据接口
-        const history = await marketDataApi.getHistoricalData(selectedSymbol, startDate, endDate, interval);
-        if (Array.isArray(history) && history.length > 0) {
-           // 确保数据格式正确适配图表
-           const formattedData = history.map((item: any) => ({
-             time: item.timestamp.length > 10 ? item.timestamp.replace('T', ' ').substring(5, 16) : item.timestamp, // 简化时间显示
-             price: item.price || item.close,
-             volume: item.volume
-           }));
-           // 按时间升序排序
-           formattedData.sort((a, b) => new Date(history.find((h:any) => (h.price||h.close) === a.price)?.timestamp || 0).getTime() - new Date(history.find((h:any) => (h.price||h.close) === b.price)?.timestamp || 0).getTime());
-           
-           setChartData(formattedData);
-        } else {
-           setChartData([]);
+        const payload = message.data;
+        if (
+          typeof payload.symbol !== 'string' ||
+          payload.symbol.toUpperCase() !== selectedSymbolRef.current.toUpperCase()
+        ) {
+          return;
         }
-      } catch (e) {
-        console.error("Failed to fetch historical data", e);
-        setChartData([]);
+
+        setSelectedQuote({
+          success: true,
+          data: {
+            symbol: payload.symbol,
+            timestamp: payload.timestamp ?? new Date().toISOString(),
+            price: toFiniteNumber(payload.price),
+            volume: toFiniteNumber(payload.volume),
+            exchange: typeof payload.exchange === 'string' ? payload.exchange : undefined,
+            currency: typeof payload.currency === 'string' ? payload.currency : undefined,
+          },
+          meta: {
+            status: 'live',
+            source: 'websocket',
+            fallback_used: false,
+            is_stale: false,
+            degraded: false,
+            requested_symbol: payload.symbol,
+            normalized_symbol: payload.symbol,
+          },
+          error: null,
+        });
+      },
+      () => {
+        setWsConnected(false);
+      },
+      (connected) => setWsConnected(connected)
+    );
+
+    return () => {
+      setWsConnected(false);
+      wsManager.disconnect();
+      wsManagerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!wsManagerRef.current) {
+      return;
+    }
+
+    wsManagerRef.current.send({
+      type: 'Subscribe',
+      data: {
+        channels: [`market_data:${selectedSymbol}`],
+      },
+    });
+  }, [selectedSymbol]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchSelectedQuote = async () => {
+      try {
+        const quote = await marketDataApi.getRealTimeData(selectedSymbol);
+        if (!cancelled) {
+          setSelectedQuote(quote);
+        }
+      } catch (error) {
+        console.error('Failed to fetch selected symbol quote', error);
+      }
+    };
+
+    fetchSelectedQuote();
+    const interval = setInterval(fetchSelectedQuote, 10000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [selectedSymbol]);
+
+  // 获取图表数据
+  useEffect(() => {
+    let cancelled = false;
+
+    const generateChartData = async (backgroundRefresh = false) => {
+      if (backgroundRefresh) {
+        setChartRefreshing(true);
+      } else {
+        setChartLoading(true);
+      }
+
+      try {
+        const { interval, startDate, endDate } = getHistoryParams(selectedTimeframe);
+        const history = await marketDataApi.getHistoricalData(selectedSymbol, startDate, endDate, interval);
+        if (!cancelled) {
+          setChartMeta(history.meta);
+        }
+
+        if (!history.success || !Array.isArray(history.data) || history.data.length === 0) {
+          if (!cancelled) {
+            setChartData([]);
+          }
+          return;
+        }
+
+        const formattedData = history.data
+          .map((item) => ({
+            timestamp: typeof item.timestamp === 'string' ? item.timestamp : '',
+            time: typeof item.timestamp === 'string' ? formatChartLabel(item.timestamp) : '',
+            price: toFiniteNumber(item.price ?? item.close, NaN),
+            volume: toFiniteNumber(item.volume),
+          }))
+          .filter((item) => item.timestamp && Number.isFinite(item.price));
+
+        formattedData.sort(
+          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+
+        const mergedData = applyQuoteToChartData(formattedData, selectedQuote?.data ?? null);
+
+        if (!cancelled) {
+          setChartData(mergedData);
+          setLastChartUpdatedAt(new Date().toISOString());
+        }
+      } catch (error) {
+        console.error('Failed to fetch historical data', error);
+        if (!cancelled) {
+          setChartData([]);
+        }
       } finally {
-        setChartLoading(false);
+        if (!cancelled) {
+          if (backgroundRefresh) {
+            setChartRefreshing(false);
+          } else {
+            setChartLoading(false);
+          }
+        }
       }
     };
 
     generateChartData();
-  }, [selectedSymbol, stockData, selectedTimeframe]);
+    const interval = setInterval(
+      () => generateChartData(true),
+      getChartRefreshInterval(selectedTimeframe)
+    );
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [selectedSymbol, selectedTimeframe, selectedQuote]);
+
+  useEffect(() => {
+    setChartData((currentData) => applyQuoteToChartData(currentData, selectedQuote?.data ?? null));
+  }, [selectedQuote]);
 
   const selectedStock = stockData.find(s => s.symbol === selectedSymbol);
-  const isPositive = selectedStock ? selectedStock.change >= 0 : true;
+  const selectedMarketData = selectedQuote?.data
+    ? {
+        symbol: selectedQuote.data.symbol,
+        price: toFiniteNumber(selectedQuote.data.price),
+        change: toFiniteNumber(selectedQuote.data.change),
+        changePercent: toFiniteNumber(selectedQuote.data.change_percent),
+        exchange: selectedQuote.data.exchange,
+        currency: selectedQuote.data.currency,
+      }
+    : selectedStock
+      ? {
+          symbol: selectedStock.symbol,
+          price: selectedStock.price,
+          change: selectedStock.change,
+          changePercent: selectedStock.changePercent,
+          exchange: selectedStock.exchange,
+          currency: selectedStock.currency,
+        }
+      : null;
+  const selectedCurrency = inferCurrency(
+    selectedMarketData?.symbol ?? selectedSymbol,
+    selectedMarketData?.exchange,
+    selectedMarketData?.currency
+  );
+  const isPositive = selectedMarketData ? selectedMarketData.change >= 0 : true;
+  const quoteMeta = selectedQuote?.meta;
 
   return (
     <div className="p-6 space-y-6 max-w-[1600px] mx-auto">
@@ -250,7 +519,7 @@ export default function MarketPage() {
                 <div
                   key={`${result.symbol}-${index}`}
                   className="cursor-pointer select-none relative py-3 pl-4 pr-4 hover:bg-accent hover:text-accent-foreground transition-colors border-b border-border/50 last:border-0"
-                  onMouseDown={() => handleSelectSymbol(result.symbol)}
+                  onMouseDown={() => handleSelectSymbol(result)}
                 >
                   <div className="flex items-center justify-between mb-1">
                     <span className="font-bold text-sm">{result.symbol}</span>
@@ -276,33 +545,70 @@ export default function MarketPage() {
                 <div>
                   <h3 className="text-2xl font-bold">{selectedSymbol}</h3>
                   <div className="flex items-center gap-2 mt-1">
-                    {selectedStock && (
+                    {selectedMarketData && (
                       <>
-                        <span className="text-xl font-mono">${selectedStock.price.toFixed(2)}</span>
+                        <span className="text-xl font-mono">
+                          {formatMarketPrice(selectedMarketData.price, {
+                            symbol: selectedMarketData.symbol,
+                            exchange: selectedMarketData.exchange,
+                            currency: selectedMarketData.currency,
+                          })}
+                        </span>
                         <span className={`flex items-center text-sm font-medium px-2 py-0.5 rounded ${isPositive ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'}`}>
                           {isPositive ? <TrendingUp className="w-3 h-3 mr-1" /> : <TrendingDown className="w-3 h-3 mr-1" />}
-                          {selectedStock.change >= 0 ? '+' : ''}{selectedStock.change.toFixed(2)} ({selectedStock.changePercent.toFixed(2)}%)
+                          {selectedMarketData.change >= 0 ? '+' : ''}{formatMarketNumber(selectedMarketData.change)} ({formatMarketNumber(selectedMarketData.changePercent)}%)
                         </span>
                       </>
+                    )}
+                    {quoteMeta && (
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        quoteMeta.status === 'degraded'
+                          ? 'bg-yellow-100 text-yellow-700'
+                          : quoteMeta.status === 'error'
+                            ? 'bg-red-100 text-red-700'
+                            : 'bg-secondary text-secondary-foreground'
+                      }`}>
+                        {getMarketStatusLabel(quoteMeta)} / {quoteMeta.source}
+                      </span>
                     )}
                   </div>
                 </div>
               </div>
               
-              <div className="flex bg-secondary/50 p-1 rounded-lg">
-                {['1D', '1W', '1M', '3M', '1Y'].map((timeframe) => (
-                  <button
-                    key={timeframe}
-                    onClick={() => setSelectedTimeframe(timeframe)}
-                    className={`px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
-                      selectedTimeframe === timeframe
-                        ? 'bg-background text-foreground shadow-sm'
-                        : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-                    }`}
-                  >
-                    {timeframe}
-                  </button>
-                ))}
+              <div className="flex items-center gap-3">
+                <div className="text-right">
+                  <div className="text-xs text-muted-foreground">图表刷新</div>
+                  <div className="text-xs font-medium flex items-center justify-end gap-1">
+                    <RefreshCw className={`h-3 w-3 ${chartRefreshing ? 'animate-spin' : ''}`} />
+                    {lastChartUpdatedAt
+                      ? new Date(lastChartUpdatedAt).toLocaleTimeString('zh-CN', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                          hour12: false,
+                        })
+                      : '--:--:--'}
+                  </div>
+                  <div className={`text-[11px] ${wsConnected ? 'text-success' : 'text-muted-foreground'}`}>
+                    {wsConnected ? 'WebSocket 已连接' : 'WebSocket 断开，使用轮询'}
+                  </div>
+                </div>
+
+                <div className="flex bg-secondary/50 p-1 rounded-lg">
+                  {['1D', '1W', '1M', '3M', '1Y'].map((timeframe) => (
+                    <button
+                      key={timeframe}
+                      onClick={() => setSelectedTimeframe(timeframe)}
+                      className={`px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
+                        selectedTimeframe === timeframe
+                          ? 'bg-background text-foreground shadow-sm'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
+                      }`}
+                    >
+                      {timeframe}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
             
@@ -335,7 +641,7 @@ export default function MarketPage() {
                       fontSize={12} 
                       tickLine={false}
                       axisLine={false}
-                      tickFormatter={(value) => `$${value.toFixed(0)}`}
+                      tickFormatter={(value) => `$${toFiniteNumber(value).toFixed(0)}`}
                     />
                     <Tooltip 
                       contentStyle={{ 
@@ -344,7 +650,13 @@ export default function MarketPage() {
                         borderRadius: "var(--radius)",
                         color: "hsl(var(--popover-foreground))"
                       }}
-                      formatter={(value: number) => [`$${value.toFixed(2)}`, 'Price']}
+                      formatter={(value: number | string) => [
+                        formatMarketPrice(toFiniteNumber(value), {
+                          symbol: selectedSymbol,
+                          currency: selectedCurrency,
+                        }),
+                        'Price',
+                      ]}
                       labelStyle={{ color: "hsl(var(--muted-foreground))" }}
                     />
                     <Area 
@@ -361,9 +673,17 @@ export default function MarketPage() {
                 <div className="h-full w-full flex flex-col items-center justify-center text-muted-foreground bg-secondary/20 rounded-lg">
                   <TrendingUp className="h-12 w-12 mb-2 opacity-20" />
                   <p>暂无此时间段的图表数据</p>
+                  {chartMeta?.message && (
+                    <p className="mt-2 text-xs">{chartMeta.message}</p>
+                  )}
                 </div>
               )}
             </div>
+            {chartMeta?.status === 'degraded' && (
+              <div className="mt-4 text-xs text-yellow-700 bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-2">
+                图表数据使用降级源 `{chartMeta.source}`。{chartMeta.message ?? '上游返回不完整，已回退到备用来源。'}
+              </div>
+            )}
           </div>
           
           <MarketDataWidget symbol={selectedSymbol} />
@@ -375,7 +695,7 @@ export default function MarketPage() {
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-lg font-bold">热门资产</h3>
               <button 
-                onClick={() => fetchStockData()} 
+                onClick={() => setRefreshNonce((value) => value + 1)}
                 disabled={loading}
                 className="p-2 hover:bg-secondary rounded-full transition-colors text-muted-foreground hover:text-foreground"
               >
@@ -415,7 +735,13 @@ export default function MarketPage() {
                       <div className="text-xs text-muted-foreground">{stock.name}</div>
                     </div>
                     <div className="text-right">
-                      <div className="font-mono font-medium">${stock.price.toFixed(2)}</div>
+                      <div className="font-mono font-medium">
+                        {formatMarketPrice(stock.price, {
+                          symbol: stock.symbol,
+                          exchange: stock.exchange,
+                          currency: stock.currency,
+                        })}
+                      </div>
                       <div className={`text-xs font-medium flex items-center justify-end ${stock.change >= 0 ? 'text-success' : 'text-destructive'}`}>
                         {stock.change >= 0 ? '+' : ''}{stock.changePercent.toFixed(2)}%
                       </div>
@@ -431,7 +757,7 @@ export default function MarketPage() {
             <h3 className="text-lg font-bold mb-2 text-primary">小贴士</h3>
             <p className="text-sm text-muted-foreground">
               使用搜索栏查找 Twelve Data 支持的任何股票、ETF 或加密货币对。
-              尝试搜索 "BTC/USD" 或 "EUR/USD"。
+              尝试搜索 &quot;BTC/USD&quot; 或 &quot;EUR/USD&quot;。
             </p>
           </div>
         </div>

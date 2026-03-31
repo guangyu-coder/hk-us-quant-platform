@@ -373,6 +373,30 @@ pub enum OrderStatus {
     Rejected,
 }
 
+impl OrderStatus {
+    pub fn can_transition_to(self, next: OrderStatus) -> bool {
+        match (self, next) {
+            (current, next) if current == next => true,
+            (
+                OrderStatus::Pending,
+                OrderStatus::Submitted | OrderStatus::Cancelled | OrderStatus::Rejected,
+            ) => true,
+            (
+                OrderStatus::Submitted,
+                OrderStatus::PartiallyFilled
+                | OrderStatus::Filled
+                | OrderStatus::Cancelled
+                | OrderStatus::Rejected,
+            ) => true,
+            (
+                OrderStatus::PartiallyFilled,
+                OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected,
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Order type enumeration
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum OrderType {
@@ -397,7 +421,10 @@ pub struct Order {
     pub side: OrderSide,
     pub quantity: i64,
     pub price: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
     pub order_type: OrderType,
+    pub time_in_force: Option<String>,
+    pub extended_hours: bool,
     pub status: OrderStatus,
     pub strategy_id: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -415,7 +442,10 @@ impl Order {
             side,
             quantity,
             price: None,
+            stop_price: None,
             order_type,
+            time_in_force: Some("Day".to_string()),
+            extended_hours: false,
             status: OrderStatus::Pending,
             strategy_id: None,
             created_at: now,
@@ -430,10 +460,51 @@ impl Order {
         self
     }
 
+    pub fn with_stop_price(mut self, stop_price: Decimal) -> Self {
+        self.stop_price = Some(stop_price);
+        self
+    }
+
+    pub fn with_time_in_force(mut self, time_in_force: String) -> Self {
+        self.time_in_force = Some(time_in_force);
+        self
+    }
+
+    pub fn with_extended_hours(mut self, extended_hours: bool) -> Self {
+        self.extended_hours = extended_hours;
+        self
+    }
+
     pub fn with_strategy(mut self, strategy_id: String) -> Self {
         self.strategy_id = Some(strategy_id);
         self
     }
+
+    pub fn transition_to(&mut self, next: OrderStatus) -> Result<(), String> {
+        if !self.status.can_transition_to(next) {
+            return Err(format!(
+                "Invalid order status transition: {:?} -> {:?}",
+                self.status, next
+            ));
+        }
+
+        self.status = next;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTrade {
+    pub id: i64,
+    pub order_id: Uuid,
+    pub symbol: String,
+    pub side: String,
+    pub quantity: i64,
+    pub price: Decimal,
+    pub executed_at: DateTime<Utc>,
+    pub portfolio_id: Option<String>,
+    pub strategy_id: Option<String>,
 }
 
 /// Position structure for portfolio management
@@ -474,6 +545,7 @@ impl Position {
 pub struct StrategyConfig {
     pub id: String,
     pub name: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub parameters: HashMap<String, serde_json::Value>,
     pub risk_limits: RiskLimits,
@@ -488,6 +560,7 @@ impl StrategyConfig {
         Self {
             id,
             name,
+            display_name: None,
             description: None,
             parameters: HashMap::new(),
             risk_limits: RiskLimits::default(),
@@ -590,7 +663,14 @@ impl RiskMetrics {
 /// Backtest result structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResult {
+    pub run_id: Option<Uuid>,
     pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub parameters: Option<HashMap<String, serde_json::Value>>,
+    pub trades: Option<Vec<BacktestTrade>>,
+    pub equity_curve: Option<Vec<BacktestEquityPoint>>,
     pub start_date: DateTime<Utc>,
     pub end_date: DateTime<Utc>,
     pub initial_capital: Decimal,
@@ -602,6 +682,27 @@ pub struct BacktestResult {
     pub win_rate: f64,
     pub total_trades: i32,
     pub performance_metrics: PerformanceMetrics,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestTrade {
+    pub timestamp: DateTime<Utc>,
+    pub side: String,
+    pub quantity: i64,
+    pub signal_price: Decimal,
+    pub execution_price: Decimal,
+    pub fees: Decimal,
+    pub pnl: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestEquityPoint {
+    pub timestamp: DateTime<Utc>,
+    pub equity: Decimal,
+    pub cash: Decimal,
+    pub position_quantity: i64,
+    pub market_price: Decimal,
 }
 
 /// Performance metrics structure
@@ -617,6 +718,14 @@ pub struct PerformanceMetrics {
     pub average_loss: Decimal,
     pub largest_win: Decimal,
     pub largest_loss: Decimal,
+    // 高级风险调整指标
+    pub sortino_ratio: f64,
+    pub calmar_ratio: f64,
+    pub var_95: f64,  // 95% 置信度的日 VaR（占初始资本的比例）
+    pub cvar_95: f64, // 95% 置信度的条件 VaR（CVaR / Expected Shortfall）
+    pub avg_holding_days: f64,
+    pub consecutive_wins: i32,
+    pub consecutive_losses: i32,
 }
 
 impl Default for PerformanceMetrics {
@@ -632,6 +741,13 @@ impl Default for PerformanceMetrics {
             average_loss: Decimal::ZERO,
             largest_win: Decimal::ZERO,
             largest_loss: Decimal::ZERO,
+            sortino_ratio: 0.0,
+            calmar_ratio: 0.0,
+            var_95: 0.0,
+            cvar_95: 0.0,
+            avg_holding_days: 0.0,
+            consecutive_wins: 0,
+            consecutive_losses: 0,
         }
     }
 }

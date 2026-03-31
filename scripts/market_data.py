@@ -40,22 +40,25 @@ http = requests.Session()
 http.mount("https://", adapter)
 http.mount("http://", adapter)
 
-# Get API key from environment or use demo key
-# To use your own key, replace "demo" with your key string
-TWELVE_DATA_API_KEY = "b81562d3b1de407181a92def7d091144"
-
-# Priority:
-# 1. Command line argument (handled in functions)
-# 2. Hardcoded TWELVE_DATA_API_KEY if not "demo"
-# 3. Environment variable
-# 4. Default "demo"
-
-if TWELVE_DATA_API_KEY != "demo":
-    API_KEY = TWELVE_DATA_API_KEY
-else:
-    API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "demo")
+# API key resolution:
+# 1) --apikey CLI arg (handled in function calls)
+# 2) environment variable TWELVE_DATA_API_KEY
+API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+ALLOW_MOCK_FALLBACK = os.environ.get("ALLOW_MOCK_MARKET_DATA", "false").strip().lower() == "true"
 
 BASE_URL = "https://api.twelvedata.com"
+
+DEFAULT_LOCAL_MARKETS = [
+    {"symbol": "AAPL", "instrument_name": "Apple Inc.", "aliases": ["Apple", "苹果"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "AMZN", "instrument_name": "Amazon.com, Inc.", "aliases": ["Amazon", "亚马逊"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "GOOGL", "instrument_name": "Alphabet Inc.", "aliases": ["Google", "Alphabet", "谷歌"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "MSFT", "instrument_name": "Microsoft Corporation", "aliases": ["Microsoft", "微软"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "NVDA", "instrument_name": "NVIDIA Corporation", "aliases": ["NVIDIA", "英伟达"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "TSLA", "instrument_name": "Tesla, Inc.", "aliases": ["Tesla", "特斯拉"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
+    {"symbol": "0700.HK", "instrument_name": "Tencent Holdings Limited", "aliases": ["Tencent", "腾讯"], "exchange": "HKEX", "country": "Hong Kong", "instrument_type": "Equity"},
+    {"symbol": "0941.HK", "instrument_name": "China Mobile Limited", "aliases": ["China Mobile", "中国移动"], "exchange": "HKEX", "country": "Hong Kong", "instrument_type": "Equity"},
+    {"symbol": "9988.HK", "instrument_name": "Alibaba Group Holding Limited", "aliases": ["Alibaba", "阿里巴巴"], "exchange": "HKEX", "country": "Hong Kong", "instrument_type": "Equity"},
+]
 
 # Try to import yfinance, but don't fail if it's not installed or broken
 try:
@@ -82,6 +85,8 @@ def generate_mock_quote(symbol: str) -> Dict[str, Any]:
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "success": True,
         "source": "mock_fallback",
+        "degraded": True,
+        "fallback_used": True,
         "note": "Real data unavailable (API limit/IP block). Showing demo data.",
         "data": {
             "price": round(price, 2),
@@ -150,6 +155,8 @@ def get_quote_yahoo(symbol: str) -> Dict[str, Any]:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "success": True,
             "source": "yahoo",
+            "degraded": False,
+            "fallback_used": False,
             "data": {
                 "price": float(price or 0),
                 "previous_close": float(prev_close or 0),
@@ -167,7 +174,198 @@ def get_quote_yahoo_with_fallback(symbol: str) -> Dict[str, Any]:
     """
     Get quote from Yahoo, with mock fallback if it fails
     """
-    return get_quote_yahoo(symbol)
+    yahoo_result = get_quote_yahoo(symbol)
+    if yahoo_result.get("success"):
+        return yahoo_result
+    if ALLOW_MOCK_FALLBACK:
+        return generate_mock_quote(symbol)
+    return yahoo_result
+
+
+def _parse_local_market_symbols() -> list:
+    """
+    Build a small local universe of symbols for offline search/list fallbacks.
+    """
+    configured = os.environ.get("MARKET_DATA_SYMBOLS", "").strip()
+    symbols = []
+    seen = set()
+
+    def add_symbol(entry: Dict[str, Any]) -> None:
+        symbol = str(entry.get("symbol", "")).strip().upper()
+        if not symbol or symbol in seen:
+            return
+        seen.add(symbol)
+        symbols.append({
+            "symbol": symbol,
+            "instrument_name": entry.get("instrument_name", symbol),
+            "aliases": entry.get("aliases", []),
+            "exchange": entry.get("exchange", ""),
+            "country": entry.get("country", ""),
+            "instrument_type": entry.get("instrument_type", "Equity"),
+        })
+
+    for entry in DEFAULT_LOCAL_MARKETS:
+        add_symbol(entry)
+
+    if configured:
+        for raw_symbol in configured.split(","):
+            symbol = raw_symbol.strip().upper()
+            if not symbol:
+                continue
+            if symbol.endswith(".HK") and symbol[:-3].isdigit():
+                display_name = f"{symbol[:-3].lstrip('0') or symbol[:-3]} HK Equity"
+                exchange = "HKEX"
+                country = "Hong Kong"
+            else:
+                display_name = symbol
+                exchange = "NASDAQ" if not symbol.endswith(".HK") else "HKEX"
+                country = "United States" if exchange == "NASDAQ" else "Hong Kong"
+            add_symbol({
+                "symbol": symbol,
+                "instrument_name": display_name,
+                "exchange": exchange,
+                "country": country,
+                "instrument_type": "Equity",
+            })
+
+    return symbols
+
+
+def _search_local_market_symbols(query: str) -> list:
+    normalized = (query or "").strip().lower()
+    if not normalized:
+        return []
+
+    candidates = _parse_local_market_symbols()
+    matches = []
+    seen = set()
+
+    hk_numeric_query = normalized
+    if normalized.isdigit():
+        hk_numeric_query = normalized.zfill(4) + ".hk"
+
+    for item in candidates:
+        symbol = item["symbol"]
+        haystack = " ".join([
+            symbol,
+            item.get("instrument_name", ""),
+            " ".join(item.get("aliases", [])),
+            item.get("exchange", ""),
+            item.get("country", ""),
+            item.get("instrument_type", ""),
+        ]).lower()
+
+        score = 0
+        if normalized == symbol.lower():
+            score = 100
+        elif normalized in symbol.lower():
+            score = 90
+        elif normalized in haystack:
+            score = 70
+        elif hk_numeric_query == symbol.lower():
+            score = 95
+        elif hk_numeric_query in haystack:
+            score = 75
+
+        if score <= 0 or symbol in seen:
+            continue
+
+        seen.add(symbol)
+        matches.append((score, item))
+
+    matches.sort(key=lambda pair: (-pair[0], pair[1]["symbol"]))
+    results = [item for _, item in matches]
+
+    # If the query looks like a Hong Kong numeric code and nothing matched,
+    # synthesize a searchable HK instrument so the frontend still has a result.
+    if not results and normalized.isdigit():
+        hk_symbol = f"{normalized.upper()}.HK"
+        results.append({
+            "symbol": hk_symbol,
+            "instrument_name": f"{normalized.upper()} HK Equity",
+            "aliases": [],
+            "exchange": "HKEX",
+            "country": "Hong Kong",
+            "instrument_type": "Equity",
+        })
+
+    return results
+
+
+def map_interval_to_yahoo(interval: str) -> str:
+    normalized = (interval or "1day").lower()
+    interval_map = {
+        "1m": "1m",
+        "1min": "1m",
+        "5m": "5m",
+        "5min": "5m",
+        "15m": "15m",
+        "15min": "15m",
+        "30m": "30m",
+        "30min": "30m",
+        "1h": "60m",
+        "60m": "60m",
+        "1day": "1d",
+        "1d": "1d",
+        "day": "1d",
+        "1week": "1wk",
+        "1wk": "1wk",
+        "1w": "1wk",
+        "1month": "1mo",
+        "1mo": "1mo",
+    }
+    return interval_map.get(normalized, "1d")
+
+
+def get_historical_data_yahoo(symbol: str, interval: str = "1day", start_date: str = None, end_date: str = None) -> Dict[str, Any]:
+    """
+    Get historical data from Yahoo Finance.
+    Works well as a fallback for HK symbols such as 0700.HK.
+    """
+    if not YFINANCE_AVAILABLE:
+        return {"symbol": symbol, "success": False, "error": "yfinance not installed"}
+
+    try:
+        ticker = yf.Ticker(symbol)
+        yahoo_interval = map_interval_to_yahoo(interval)
+
+        history_kwargs: Dict[str, Any] = {"interval": yahoo_interval}
+        if start_date:
+            history_kwargs["start"] = start_date
+        if end_date:
+            history_kwargs["end"] = end_date
+        if not start_date and not end_date:
+            history_kwargs["period"] = "1mo"
+
+        hist = ticker.history(**history_kwargs)
+        if hist.empty:
+            return {"symbol": symbol, "success": False, "error": "No historical data found on Yahoo"}
+
+        processed_values = []
+        for index, row in hist.iterrows():
+            timestamp = index.to_pydatetime().isoformat()
+            processed_values.append({
+                "timestamp": timestamp,
+                "open": float(row.get("Open", 0) or 0),
+                "high": float(row.get("High", 0) or 0),
+                "low": float(row.get("Low", 0) or 0),
+                "close": float(row.get("Close", 0) or 0),
+                "price": float(row.get("Close", 0) or 0),
+                "volume": int(row.get("Volume", 0) or 0),
+            })
+
+        return {
+            "symbol": symbol,
+            "success": True,
+            "source": "yahoo",
+            "degraded": False,
+            "fallback_used": False,
+            "data": processed_values,
+        }
+    except Exception as e:
+        if ALLOW_MOCK_FALLBACK:
+            return generate_mock_history(symbol, interval, 30)
+        return {"symbol": symbol, "success": False, "error": f"Yahoo history error: {str(e)}"}
 
 
 def get_quote_tencent(symbol: str) -> Dict[str, Any]:
@@ -236,6 +434,8 @@ def get_quote_tencent(symbol: str) -> Dict[str, Any]:
             "timestamp": timestamp,
             "success": True,
             "source": "tencent",
+            "degraded": False,
+            "fallback_used": False,
             "data": {
                 "price": price,
                 "previous_close": prev_close,
@@ -258,15 +458,10 @@ def get_quote(symbol: str, apikey: str = None) -> Dict[str, Any]:
     if symbol.endswith(".HK"):
         return get_quote_tencent(symbol)
 
-    key = apikey or API_KEY
+    key = (apikey or API_KEY).strip()
     use_yahoo = False
-    
-    # If using demo key and symbol is not in popular list, prefer Yahoo immediately
-    # (Twelve Data demo only supports AAPL, TSLA, etc.)
-    is_demo = key == "demo"
-    popular_demo_stocks = ["AAPL", "TSLA", "MSFT", "EUR/USD", "BTC/USD"]
-    
-    if is_demo and symbol not in popular_demo_stocks and YFINANCE_AVAILABLE:
+
+    if not key and YFINANCE_AVAILABLE:
         use_yahoo = True
     
     if not use_yahoo:
@@ -292,6 +487,8 @@ def get_quote(symbol: str, apikey: str = None) -> Dict[str, Any]:
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "success": True,
                 "source": "twelvedata",
+                "degraded": False,
+                "fallback_used": False,
                 "data": {
                     "price": float(data.get("close", 0) or 0),
                     "previous_close": float(data.get("previous_close", 0) or 0),
@@ -305,6 +502,8 @@ def get_quote(symbol: str, apikey: str = None) -> Dict[str, Any]:
             # On network error, try Yahoo
             if YFINANCE_AVAILABLE:
                 return get_quote_yahoo_with_fallback(symbol)
+            if ALLOW_MOCK_FALLBACK:
+                return generate_mock_quote(symbol)
             return {"symbol": symbol, "success": False, "error": f"Network/API Error: {str(e)}"}
 
     # Fallback or direct Yahoo call
@@ -341,8 +540,16 @@ def search_symbols(query: str, apikey: str = None) -> Dict[str, Any]:
     """
     Search for symbols using Twelve Data API
     """
-    key = apikey or API_KEY
+    key = (apikey or API_KEY).strip()
     try:
+        if not key:
+            local_results = _search_local_market_symbols(query)
+            return {
+                "success": True,
+                "data": local_results,
+                "source": "local_fallback",
+                "note": "TWELVE_DATA_API_KEY is not configured; returning local symbol matches",
+            }
         url = f"{BASE_URL}/symbol_search"
         params = {
             "symbol": query,
@@ -353,6 +560,14 @@ def search_symbols(query: str, apikey: str = None) -> Dict[str, Any]:
         data = response.json()
         
         if "status" in data and data["status"] == "error":
+            local_results = _search_local_market_symbols(query)
+            if local_results:
+                return {
+                    "success": True,
+                    "data": local_results,
+                    "source": "local_fallback",
+                    "note": f"Twelve Data search unavailable: {data.get('message', 'API Error')}",
+                }
             return {"success": False, "error": data.get("message", "API Error")}
             
         return {
@@ -360,6 +575,14 @@ def search_symbols(query: str, apikey: str = None) -> Dict[str, Any]:
             "data": data.get("data", [])
         }
     except Exception as e:
+        local_results = _search_local_market_symbols(query)
+        if local_results:
+            return {
+                "success": True,
+                "data": local_results,
+                "source": "local_fallback",
+                "note": f"Falling back to local symbol matches after search error: {e}",
+            }
         return {"success": False, "error": str(e)}
 
 
@@ -367,8 +590,22 @@ def get_available_symbols(exchange: str = None, country: str = None, type: str =
     """
     Get list of available symbols from Twelve Data API
     """
-    key = apikey or API_KEY
+    key = (apikey or API_KEY).strip()
     try:
+        if not key:
+            data = _parse_local_market_symbols()
+            if exchange:
+                data = [item for item in data if item["exchange"].lower() == exchange.strip().lower()]
+            if country:
+                data = [item for item in data if item["country"].lower() == country.strip().lower()]
+            if type:
+                data = [item for item in data if item["instrument_type"].lower() == type.strip().lower()]
+            return {
+                "success": True,
+                "count": len(data),
+                "data": data,
+                "source": "local_fallback",
+            }
         url = f"{BASE_URL}/stocks"
         params = {
             "apikey": key
@@ -384,6 +621,21 @@ def get_available_symbols(exchange: str = None, country: str = None, type: str =
         data = response.json()
         
         if "status" in data and data["status"] == "error":
+            fallback_data = _parse_local_market_symbols()
+            if exchange:
+                fallback_data = [item for item in fallback_data if item["exchange"].lower() == exchange.strip().lower()]
+            if country:
+                fallback_data = [item for item in fallback_data if item["country"].lower() == country.strip().lower()]
+            if type:
+                fallback_data = [item for item in fallback_data if item["instrument_type"].lower() == type.strip().lower()]
+            if fallback_data:
+                return {
+                    "success": True,
+                    "count": len(fallback_data),
+                    "data": fallback_data,
+                    "source": "local_fallback",
+                    "note": f"Twelve Data list unavailable: {data.get('message', 'API Error')}",
+                }
             return {"success": False, "error": data.get("message", "API Error")}
             
         return {
@@ -392,6 +644,21 @@ def get_available_symbols(exchange: str = None, country: str = None, type: str =
             "data": data.get("data", [])
         }
     except Exception as e:
+        fallback_data = _parse_local_market_symbols()
+        if exchange:
+            fallback_data = [item for item in fallback_data if item["exchange"].lower() == exchange.strip().lower()]
+        if country:
+            fallback_data = [item for item in fallback_data if item["country"].lower() == country.strip().lower()]
+        if type:
+            fallback_data = [item for item in fallback_data if item["instrument_type"].lower() == type.strip().lower()]
+        if fallback_data:
+            return {
+                "success": True,
+                "count": len(fallback_data),
+                "data": fallback_data,
+                "source": "local_fallback",
+                "note": f"Falling back to local symbol list after error: {e}",
+            }
         return {"success": False, "error": str(e)}
 
 
@@ -428,6 +695,8 @@ def generate_mock_history(symbol: str, interval="1day", outputsize=30) -> Dict[s
         "symbol": symbol,
         "success": True,
         "source": "mock_fallback",
+        "degraded": True,
+        "fallback_used": True,
         "data": data
     }
 
@@ -436,8 +705,26 @@ def get_historical_data(symbol: str, interval: str = "1day", outputsize: int = 3
     """
     Get historical time series data
     """
-    key = apikey or API_KEY
+    if symbol.upper().endswith(".HK"):
+        yahoo_history = get_historical_data_yahoo(symbol, interval, start_date, end_date)
+        if yahoo_history.get("success"):
+            return yahoo_history
+        if ALLOW_MOCK_FALLBACK:
+            return generate_mock_history(symbol, interval, outputsize)
+        return {
+            "symbol": symbol,
+            "success": True,
+            "source": "local_fallback",
+            "degraded": True,
+            "fallback_used": True,
+            "note": yahoo_history.get("error", "HK historical data unavailable"),
+            "data": generate_mock_history(symbol, interval, outputsize)["data"],
+        }
+
+    key = (apikey or API_KEY).strip()
     try:
+        if not key and YFINANCE_AVAILABLE:
+            return get_historical_data_yahoo(symbol, interval, start_date, end_date)
         url = f"{BASE_URL}/time_series"
         params = {
             "symbol": symbol,
@@ -456,11 +743,9 @@ def get_historical_data(symbol: str, interval: str = "1day", outputsize: int = 3
         data = response.json()
         
         if "status" in data and data["status"] == "error":
-            # Fallback to mock history if API fails (e.g. limit reached or symbol not allowed in demo)
-            # popular_demo_stocks = ["AAPL", "TSLA", "MSFT", "EUR/USD", "BTC/USD", "NVDA", "AMZN", "GOOGL"]
-            # if symbol.upper() in popular_demo_stocks:
-            #      return generate_mock_history(symbol, interval, outputsize)
-                 
+            yahoo_fallback = get_historical_data_yahoo(symbol, interval, start_date, end_date)
+            if yahoo_fallback.get("success"):
+                return yahoo_fallback
             return {"symbol": symbol, "success": False, "error": data.get("message", "API Error")}
             
         values = data.get("values", [])
@@ -483,14 +768,26 @@ def get_historical_data(symbol: str, interval: str = "1day", outputsize: int = 3
             "symbol": symbol,
             "success": True,
             "meta": data.get("meta", {}),
+            "source": "twelvedata",
+            "degraded": False,
+            "fallback_used": False,
             "data": processed_values
         }
     except Exception as e:
-        # Fallback to mock history if real data fails
-        # popular_demo_stocks = ["AAPL", "TSLA", "MSFT", "EUR/USD", "BTC/USD", "NVDA", "AMZN", "GOOGL"]
-        # if symbol.upper() in popular_demo_stocks:
-        #      return generate_mock_history(symbol, interval, outputsize)
-        return {"symbol": symbol, "success": False, "error": str(e)}
+        yahoo_fallback = get_historical_data_yahoo(symbol, interval, start_date, end_date)
+        if yahoo_fallback.get("success"):
+            return yahoo_fallback
+        if ALLOW_MOCK_FALLBACK:
+            return generate_mock_history(symbol, interval, outputsize)
+        return {
+            "symbol": symbol,
+            "success": True,
+            "source": "local_fallback",
+            "degraded": True,
+            "fallback_used": True,
+            "note": str(e),
+            "data": generate_mock_history(symbol, interval, outputsize)["data"],
+        }
 
 
 if __name__ == "__main__":
@@ -501,7 +798,7 @@ if __name__ == "__main__":
     parser.add_argument("--symbols", type=str, help="Comma-separated stock symbols")
     parser.add_argument("--search", type=str, help="Search for stock symbols by name or ticker")
     parser.add_argument("--history", action="store_true", help="Get historical data")
-    parser.add_argument("--interval", type=str, default="1day", help="Interval for historical data (e.g. 1day, 1h)")
+    parser.add_argument("--interval", type=str, default="1day", help="Interval for historical data (e.g. 1day, 1h, 1week)")
     parser.add_argument("--outputsize", type=int, default=30, help="Number of data points")
     parser.add_argument("--start", type=str, help="Start date (e.g. 2023-01-01)")
     parser.add_argument("--end", type=str, help="End date (e.g. 2023-01-31)")
@@ -549,11 +846,3 @@ if __name__ == "__main__":
             "type": "unhandled_exception"
         }
         print(json.dumps(error_response, indent=2))
-
-https://accounts.google.com/o/oauth2/v2/auth?client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com&response_type=code&redirect_uri=http%3A%2F%2Flo  │
-│  calhost%3A51121%2Foauth-callback&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-p  │
-│  latform+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email+https%3A%2F%2Fwww.googl  │
-│  eapis.com%2Fauth%2Fuserinfo.profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcclog+http  │
-│  s%3A%2F%2Fwww.googleapis.com%2Fauth%2Fexperimentsandconfigs&code_challenge=gnPkeZXPXPrRs  │
-│  oC6DxssHV9gCa2dNcwTeXbHD7HEExc&code_challenge_method=S256&state=cc3901c3c1e1480026748435  │
-│  9690de92&access_type=offline&prompt=consent 

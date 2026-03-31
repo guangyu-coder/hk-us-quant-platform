@@ -11,24 +11,7 @@ export function SystemStatus() {
     refetchInterval: 30000, // 每30秒检查一次
     retry: 3,
   });
-
-  // 模拟系统状态
-  const mockHealth = {
-    status: 'healthy' as const,
-    timestamp: new Date().toISOString(),
-    services: {
-      database: 'connected',
-      redis: 'connected',
-      data_service: 'running',
-      strategy_service: 'running',
-      execution_service: 'running',
-      portfolio_service: 'running',
-      risk_service: 'running',
-    },
-  };
-
-  const displayHealth = error ? mockHealth : health;
-  const status = displayHealth?.status || 'error';
+  const status = error ? 'error' : (health?.status || 'error');
 
   const getStatusIcon = () => {
     switch (status) {
@@ -85,7 +68,7 @@ export function SystemStatus() {
         {getStatusText()}
       </span>
       {error && (
-        <span className="text-xs text-gray-500">(离线模式)</span>
+        <span className="text-xs text-gray-500">(健康检查不可用)</span>
       )}
     </div>
   );

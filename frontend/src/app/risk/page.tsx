@@ -2,18 +2,17 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { riskApi, portfolioApi } from '@/lib/api';
-import type { RiskMetrics } from '@/types';
+import type { Position } from '@/types';
+import { formatMarketPrice, formatPortfolioAmount, formatMarketTimestamp } from '@/lib/market';
 import { Shield, AlertTriangle, TrendingDown, Activity } from 'lucide-react';
 import {
-  LineChart,
-  Line,
+  BarChart,
+  Bar,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  AreaChart,
-  Area,
 } from 'recharts';
 
 export default function RiskPage() {
@@ -22,43 +21,22 @@ export default function RiskPage() {
     queryFn: () => riskApi.getRiskMetrics(),
     refetchInterval: 10000,
   });
+  const { data: riskLimits } = useQuery({
+    queryKey: ['risk-limits'],
+    queryFn: () => riskApi.getRiskLimits(),
+    refetchInterval: 30000,
+  });
 
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio'],
     queryFn: () => portfolioApi.getPortfolio(),
     refetchInterval: 5000,
   });
-
-  const mockRiskHistory = Array.from({ length: 30 }, (_, i) => ({
-    date: new Date(Date.now() - (29 - i) * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-    var_1d: 1000 + Math.random() * 2000 - 1000,
-    leverage: 1.5 + Math.random() * 1,
-    exposure: (portfolio?.total_value || 0) * (1.5 + Math.random() * 1),
-  }));
-
-  const mockAlerts = [
-    {
-      id: '1',
-      type: 'warning',
-      message: '单股票持仓超过10%',
-      timestamp: new Date(Date.now() - 3600000).toISOString(),
-      severity: 'medium',
-    },
-    {
-      id: '2',
-      type: 'info',
-      message: 'VaR在正常范围内',
-      timestamp: new Date(Date.now() - 7200000).toISOString(),
-      severity: 'low',
-    },
-    {
-      id: '3',
-      type: 'error',
-      message: '日内亏损接近上限',
-      timestamp: new Date(Date.now() - 10800000).toISOString(),
-      severity: 'high',
-    },
-  ];
+  const { data: alerts = [], isLoading: alertsLoading, error: alertsError } = useQuery({
+    queryKey: ['risk-alerts'],
+    queryFn: () => riskApi.getRiskAlerts(),
+    refetchInterval: 10000,
+  });
 
   const getAlertColor = (severity: string) => {
     switch (severity) {
@@ -79,11 +57,29 @@ export default function RiskPage() {
     return 'text-green-600';
   };
 
+  const baseCurrency = riskMetrics?.base_currency ?? portfolio?.base_currency ?? 'USD';
+  const isMixedCurrency = baseCurrency === 'MIXED';
+  const exposureData = portfolio?.positions
+    ? Object.values(portfolio.positions)
+        .map((position: Position) => ({
+          symbol: position.symbol,
+          exposure: position.market_value,
+        }))
+        .sort((a, b) => b.exposure - a.exposure)
+        .slice(0, 6)
+    : [];
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold tracking-tight">风险管理</h1>
       </div>
+
+      {isMixedCurrency && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+          当前组合包含多币种持仓，风险指标未做汇率折算。总值和敞口按原币种口径展示，避免误标成美元。
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <div className="bg-white p-6 rounded-lg shadow">
@@ -91,7 +87,7 @@ export default function RiskPage() {
             <div>
               <p className="text-sm font-medium text-gray-500">组合价值</p>
               <p className="text-2xl font-bold text-gray-900">
-                ${riskMetrics?.portfolio_value?.toFixed(2) || '0.00'}
+                {formatPortfolioAmount(riskMetrics?.portfolio_value, { currency: baseCurrency, fallback: '$0.00' })}
               </p>
             </div>
             <Shield className="h-8 w-8 text-blue-600" />
@@ -103,7 +99,7 @@ export default function RiskPage() {
             <div>
               <p className="text-sm font-medium text-gray-500">总敞口</p>
               <p className="text-2xl font-bold text-gray-900">
-                ${riskMetrics?.total_exposure?.toFixed(2) || '0.00'}
+                {formatPortfolioAmount(riskMetrics?.total_exposure, { currency: baseCurrency, fallback: '$0.00' })}
               </p>
             </div>
             <Activity className="h-8 w-8 text-purple-600" />
@@ -127,7 +123,7 @@ export default function RiskPage() {
             <div>
               <p className="text-sm font-medium text-gray-500">VaR (1日)</p>
               <p className="text-2xl font-bold text-gray-900">
-                ${riskMetrics?.var_1d?.toFixed(2) || '0.00'}
+                {formatPortfolioAmount(riskMetrics?.var_1d, { currency: baseCurrency, fallback: '$0.00' })}
               </p>
             </div>
             <AlertTriangle className="h-8 w-8 text-red-600" />
@@ -171,16 +167,44 @@ export default function RiskPage() {
             <h3 className="text-lg font-medium text-gray-900 mb-4">风险限额设置</h3>
             <div className="space-y-3">
               <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span className="text-sm text-gray-700">最大订单数量</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits?.max_order_size ?? 'N/A'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
                 <span className="text-sm text-gray-700">最大杠杆</span>
-                <span className="font-medium text-gray-900">3.0x</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits ? `${riskLimits.max_leverage.toFixed(1)}x` : 'N/A'}
+                </span>
               </div>
               <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
                 <span className="text-sm text-gray-700">单股票权重上限</span>
-                <span className="font-medium text-gray-900">10%</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits?.max_single_stock_weight !== null && riskLimits?.max_single_stock_weight !== undefined
+                    ? `${(riskLimits.max_single_stock_weight * 100).toFixed(1)}%`
+                    : '未配置'}
+                </span>
               </div>
               <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
                 <span className="text-sm text-gray-700">日内最大亏损</span>
-                <span className="font-medium text-gray-900">$50,000</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits?.max_daily_loss !== null && riskLimits?.max_daily_loss !== undefined
+                    ? formatPortfolioAmount(riskLimits.max_daily_loss, { currency: baseCurrency })
+                    : '未配置'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span className="text-sm text-gray-700">风险检查</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits?.risk_check_enabled ? '启用' : '关闭'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span className="text-sm text-gray-700">Paper Trading</span>
+                <span className="font-medium text-gray-900">
+                  {riskLimits?.paper_trading ? '启用' : '关闭'}
+                </span>
               </div>
             </div>
           </div>
@@ -188,51 +212,64 @@ export default function RiskPage() {
 
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-lg shadow">
-            <h3 className="text-lg font-medium text-gray-900 mb-4">风险趋势</h3>
+            <h3 className="text-lg font-medium text-gray-900 mb-4">当前风险敞口</h3>
             <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={mockRiskHistory}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="date" />
-                  <YAxis />
-                  <Tooltip />
-                  <Area
-                    type="monotone"
-                    dataKey="var_1d"
-                    stroke="#3b82f6"
-                    fill="#3b82f6"
-                    fillOpacity={0.3}
-                    name="VaR (1日)"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+              {exposureData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={exposureData}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="symbol" />
+                    <YAxis />
+                    <Tooltip formatter={(value: number) => formatMarketPrice(value, { currency: baseCurrency })} />
+                    <Bar dataKey="exposure" fill="#3b82f6" name="持仓敞口" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-gray-200 bg-gray-50 text-sm text-gray-500">
+                  暂无可用持仓，当前无法生成真实风险敞口图。
+                </div>
+              )}
             </div>
           </div>
 
           <div className="bg-white p-6 rounded-lg shadow">
             <h3 className="text-lg font-medium text-gray-900 mb-4">风险告警</h3>
             <div className="space-y-3 max-h-80 overflow-y-auto">
-              {mockAlerts.map((alert) => (
-                <div
-                  key={alert.id}
-                  className={`p-3 rounded-lg border ${getAlertColor(alert.severity)}`}
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1">
-                      <p className="text-sm font-medium mb-1">{alert.message}</p>
-                      <p className="text-xs text-gray-600">
-                        {new Date(alert.timestamp).toLocaleString('zh-CN')}
-                      </p>
-                    </div>
-                    <span className={`text-xs px-2 py-1 rounded-full ${
-                      alert.severity === 'high' ? 'bg-red-200' :
-                      alert.severity === 'medium' ? 'bg-yellow-200' : 'bg-blue-200'
-                    }`}>
-                      {alert.severity === 'high' ? '高' : alert.severity === 'medium' ? '中' : '低'}
-                    </span>
-                  </div>
+              {alertsLoading ? (
+                <div className="space-y-3">
+                  {[...Array(3)].map((_, index) => (
+                    <div key={index} className="h-20 animate-pulse rounded bg-gray-100" />
+                  ))}
                 </div>
-              ))}
+              ) : alerts.length > 0 ? (
+                alerts.map((alert) => (
+                  <div
+                    key={alert.id}
+                    className={`p-3 rounded-lg border ${getAlertColor(alert.severity.toLowerCase())}`}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1">
+                        <p className="mb-1 text-sm font-medium">{alert.message}</p>
+                        <p className="text-xs text-gray-600">
+                          {alert.alert_type} · {formatMarketTimestamp(alert.created_at)}
+                        </p>
+                      </div>
+                      <span className={`text-xs px-2 py-1 rounded-full ${
+                        alert.severity === 'HIGH' || alert.severity === 'CRITICAL' ? 'bg-red-200' :
+                        alert.severity === 'MEDIUM' ? 'bg-yellow-200' : 'bg-blue-200'
+                      }`}>
+                        {alert.severity}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-6 text-sm text-gray-500">
+                  {alertsError
+                    ? '风险告警接口不可用，当前不再展示模拟告警。'
+                    : `暂无真实风险告警记录。最近一次风险计算时间：${formatMarketTimestamp(riskMetrics?.calculated_at, '暂无')}`}
+                </div>
+              )}
             </div>
           </div>
         </div>

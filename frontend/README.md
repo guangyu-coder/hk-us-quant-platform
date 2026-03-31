@@ -58,18 +58,22 @@
 - Node.js 18+ 
 - npm 或 yarn
 
-### 安装依赖
+### 容器化运行
+```bash
+cd ..
+./scripts/deploy.sh up --build
+```
+
+访问 `http://localhost:3002` 查看应用。
+
+### 单独开发运行
 ```bash
 cd frontend
 npm install
-```
-
-### 开发环境运行
-```bash
 npm run dev
 ```
 
-访问 http://localhost:3000 查看应用
+默认开发端口通常为 `http://localhost:3000`。
 
 ### 生产环境构建
 ```bash
@@ -88,7 +92,7 @@ async rewrites() {
   return [
     {
       source: '/api/:path*',
-      destination: 'http://localhost:8080/api/:path*',
+      destination: `${BACKEND_ORIGIN}/api/:path*`,
     },
   ];
 }
@@ -98,11 +102,11 @@ async rewrites() {
 创建 `.env.local` 文件：
 
 ```bash
-# API基础URL (生产环境)
-NEXT_PUBLIC_API_URL=https://your-api-domain.com
+# 本地单独开发时的后端地址
+BACKEND_ORIGIN=http://localhost:8080
 
-# WebSocket URL
-NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws
+# 容器化运行时通常不需要手动设置，compose 会注入:
+# BACKEND_ORIGIN=http://backend:8080
 ```
 
 ## 📱 响应式设计
@@ -148,10 +152,12 @@ const { data, isLoading, error } = useQuery({
 ```typescript
 // WebSocket连接管理
 const wsManager = new WebSocketManager();
-wsManager.connect('ws://localhost:8080/ws', (data) => {
+wsManager.connect('ws://your-public-entry/ws', (data) => {
   // 处理实时数据更新
 });
 ```
+
+说明：当前仓库默认启动链路里 `/ws` 仍未挂载，这段代码示例仅表示客户端接入方式。
 
 ## 🧪 测试
 
@@ -205,15 +211,9 @@ vercel
 ```
 
 ### Docker部署
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY . .
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "start"]
+```bash
+cd ..
+./scripts/deploy.sh up --build
 ```
 
 ### Nginx配置
@@ -223,13 +223,13 @@ server {
     server_name your-domain.com;
     
     location / {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://frontend:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
     
     location /api/ {
-        proxy_pass http://localhost:8080/api/;
+        proxy_pass http://backend:8080/api/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }

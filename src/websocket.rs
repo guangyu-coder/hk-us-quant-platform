@@ -34,6 +34,8 @@ pub struct MarketDataUpdate {
     pub symbol: String,
     pub price: String,
     pub volume: i64,
+    pub exchange: Option<String>,
+    pub currency: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -100,7 +102,10 @@ impl WSManager {
     }
 
     /// Broadcast a message to all connected clients
-    pub fn broadcast(&self, msg: WSMessage) -> Result<usize, broadcast::error::SendError<WSMessage>> {
+    pub fn broadcast(
+        &self,
+        msg: WSMessage,
+    ) -> Result<usize, broadcast::error::SendError<WSMessage>> {
         self.broadcast_tx.send(msg)
     }
 
@@ -143,6 +148,14 @@ impl WSManager {
                 symbol: data.symbol.clone(),
                 price: data.price.to_string(),
                 volume: data.volume,
+                exchange: data.exchange.clone(),
+                currency: data.exchange.as_ref().map(|exchange| {
+                    if exchange.to_uppercase().contains("HK") {
+                        "HKD".to_string()
+                    } else {
+                        "USD".to_string()
+                    }
+                }),
                 timestamp: data.timestamp,
             }),
             PlatformEvent::SignalGenerated { signal } => WSMessage::Signal(SignalUpdate {
@@ -153,7 +166,10 @@ impl WSManager {
                 timestamp: signal.timestamp,
             }),
             PlatformEvent::OrderFilled {
-                order_id, filled_quantity, fill_price, ..
+                order_id,
+                filled_quantity,
+                fill_price,
+                ..
             } => WSMessage::OrderUpdate(OrderUpdate {
                 order_id: order_id.to_string(),
                 symbol: "N/A".to_string(), // We don't have symbol in OrderFilled event
@@ -193,6 +209,11 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WSState>) -> i
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+/// WebSocket upgrade handler with explicit state construction
+pub async fn ws_handler_with_state(ws: WebSocketUpgrade, state: WSState) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
+
 /// Handle individual WebSocket connection
 async fn handle_socket(socket: WebSocket, state: WSState) {
     let conn_id = uuid::Uuid::new_v4().to_string();
@@ -228,14 +249,12 @@ async fn handle_socket(socket: WebSocket, state: WSState) {
     let manager = state.manager.clone();
     while let Some(result) = receiver.next().await {
         match result {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<WSMessage>(&text) {
-                    Ok(msg) => handle_client_message(&manager, &conn_id, msg).await,
-                    Err(e) => {
-                        warn!("Invalid message from {}: {}", conn_id, e);
-                    }
+            Ok(Message::Text(text)) => match serde_json::from_str::<WSMessage>(&text) {
+                Ok(msg) => handle_client_message(&manager, &conn_id, msg).await,
+                Err(e) => {
+                    warn!("Invalid message from {}: {}", conn_id, e);
                 }
-            }
+            },
             Ok(Message::Ping(_data)) => {
                 debug!("Ping from {}", conn_id);
                 // Pong is handled automatically by axum

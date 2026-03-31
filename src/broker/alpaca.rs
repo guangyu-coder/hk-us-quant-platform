@@ -52,7 +52,11 @@ impl AlpacaBroker {
         if broker.is_connected().await {
             info!(
                 "Alpaca broker connected ({})",
-                if config.paper_trading { "paper" } else { "live" }
+                if config.paper_trading {
+                    "paper"
+                } else {
+                    "live"
+                }
             );
         } else {
             warn!("Alpaca broker connection could not be verified");
@@ -63,14 +67,8 @@ impl AlpacaBroker {
 
     fn auth_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "APCA-API-KEY-ID",
-            self.api_key.parse().unwrap(),
-        );
-        headers.insert(
-            "APCA-API-SECRET-KEY",
-            self.api_secret.parse().unwrap(),
-        );
+        headers.insert("APCA-API-KEY-ID", self.api_key.parse().unwrap());
+        headers.insert("APCA-API-SECRET-KEY", self.api_secret.parse().unwrap());
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
@@ -137,8 +135,9 @@ impl AlpacaBroker {
             )));
         }
 
-        serde_json::from_str(&body_text)
-            .map_err(|e| AppError::broker(format!("Failed to parse response: {} - {}", e, body_text)))
+        serde_json::from_str(&body_text).map_err(|e| {
+            AppError::broker(format!("Failed to parse response: {} - {}", e, body_text))
+        })
     }
 
     async fn api_delete(&self, endpoint: &str) -> AppResult<()> {
@@ -247,10 +246,7 @@ impl Broker for AlpacaBroker {
 
         let response: AlpacaOrder = self.api_post("/v2/orders", &alpaca_order).await?;
 
-        info!(
-            "Alpaca order submitted: {} -> {}",
-            order.id, response.id
-        );
+        info!("Alpaca order submitted: {} -> {}", order.id, response.id);
 
         Ok(BrokerOrderResult {
             broker_order_id: response.id,
@@ -261,7 +257,8 @@ impl Broker for AlpacaBroker {
     }
 
     async fn cancel_order(&self, broker_order_id: &str) -> AppResult<()> {
-        self.api_delete(&format!("/v2/orders/{}", broker_order_id)).await
+        self.api_delete(&format!("/v2/orders/{}", broker_order_id))
+            .await
     }
 
     async fn get_order_status(&self, broker_order_id: &str) -> AppResult<BrokerOrderStatus> {
@@ -311,11 +308,14 @@ impl Broker for AlpacaBroker {
 
     async fn get_quotes(&self, symbols: &[String]) -> AppResult<HashMap<String, BrokerQuote>> {
         let mut quotes = HashMap::new();
-        
+
         // Alpaca supports batch quotes
         let symbols_param = symbols.join(",");
         let response: AlpacaMultiQuoteResponse = self
-            .data_get(&format!("/v2/stocks/quotes/latest?symbols={}", symbols_param))
+            .data_get(&format!(
+                "/v2/stocks/quotes/latest?symbols={}",
+                symbols_param
+            ))
             .await?;
 
         for (symbol, quote) in response.quotes {
@@ -469,12 +469,12 @@ struct AlpacaMultiQuoteResponse {
 
 #[derive(Debug, Deserialize)]
 struct AlpacaQuote {
-    bp: String,        // bid price
-    bs: i64,           // bid size
-    ap: String,        // ask price
+    bp: String, // bid price
+    bs: i64,    // bid size
+    ap: String, // ask price
     #[serde(rename = "as")]
-    as_: i64,          // ask size
-    t: chrono::DateTime<chrono::Utc>,  // timestamp
+    as_: i64, // ask size
+    t: chrono::DateTime<chrono::Utc>, // timestamp
 }
 
 fn parse_decimal(s: &str) -> Decimal {

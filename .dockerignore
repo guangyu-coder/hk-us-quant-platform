@@ -1,0 +1,9 @@
+.git
+.gitignore
+target
+logs
+.env
+frontend/.next
+frontend/node_modules
+frontend/tsconfig.tsbuildinfo
+node_modules

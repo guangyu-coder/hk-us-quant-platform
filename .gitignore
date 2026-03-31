@@ -4,3 +4,8 @@
 .DS_Store
 .env
 /scripts/__pycache__
+/frontend/.next
+/frontend/node_modules
+/frontend/tsconfig.tsbuildinfo
+/node_modules
+/logs

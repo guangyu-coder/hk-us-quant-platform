@@ -57,9 +57,7 @@ impl AppConfig {
 
         let config = Self {
             database: DatabaseConfig {
-                url: env::var("DATABASE_URL").unwrap_or_else(|_| {
-                    "postgresql://postgres:password@localhost:5432/quant_platform".to_string()
-                }),
+                url: required_env("DATABASE_URL")?,
                 max_connections: env::var("DATABASE_MAX_CONNECTIONS")
                     .unwrap_or_else(|_| "20".to_string())
                     .parse()
@@ -78,7 +76,7 @@ impl AppConfig {
                     .context("Invalid DATABASE_IDLE_TIMEOUT")?,
             },
             redis: RedisConfig {
-                url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+                url: required_env("REDIS_URL")?,
                 max_connections: env::var("REDIS_MAX_CONNECTIONS")
                     .unwrap_or_else(|_| "10".to_string())
                     .parse()
@@ -178,4 +176,14 @@ impl AppConfig {
     pub fn is_development(&self) -> bool {
         self.get_environment().to_lowercase() == "development"
     }
+}
+
+fn required_env(name: &str) -> Result<String> {
+    let value =
+        env::var(name).with_context(|| format!("Missing required environment variable {name}"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Environment variable {name} cannot be empty");
+    }
+    Ok(trimmed.to_string())
 }

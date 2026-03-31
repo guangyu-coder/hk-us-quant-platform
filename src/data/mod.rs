@@ -11,8 +11,10 @@ use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
 pub mod handlers;
+pub mod lifecycle;
 pub mod validators;
 
+pub use lifecycle::*;
 pub use validators::*;
 
 /// Data service for market data collection, validation, and storage

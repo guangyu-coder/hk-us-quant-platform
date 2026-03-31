@@ -64,7 +64,7 @@ impl Strategy for RSIStrategy {
             let mut history = self.price_history.write().unwrap();
             let prices = history.entry(symbol.clone()).or_insert_with(Vec::new);
             prices.push(price);
-            
+
             // Keep only necessary history
             if prices.len() > self.period * 2 {
                 prices.drain(0..prices.len() - self.period * 2);
@@ -86,7 +86,8 @@ impl Strategy for RSIStrategy {
                     (SignalType::Buy, strength)
                 } else if rsi > self.overbought {
                     // Overbought - potential sell signal
-                    let strength = ((rsi - self.overbought) / (Decimal::from(100) - self.overbought))
+                    let strength = ((rsi - self.overbought)
+                        / (Decimal::from(100) - self.overbought))
                         .to_f64()
                         .unwrap_or(0.5)
                         .min(1.0);
@@ -332,7 +333,11 @@ impl Strategy for BollingerBandsStrategy {
             if let Some(result) = bb.calculate(prices) {
                 debug!(
                     "BB for {}: upper={}, middle={}, lower={}, %B={}",
-                    symbol, result.upper_band, result.middle_band, result.lower_band, result.percent_b
+                    symbol,
+                    result.upper_band,
+                    result.middle_band,
+                    result.lower_band,
+                    result.percent_b
                 );
 
                 let (signal_type, strength) = if price <= result.lower_band {
@@ -433,7 +438,7 @@ impl DualMACrossoverStrategy {
 impl Strategy for DualMACrossoverStrategy {
     async fn generate_signals(&self, market_data: &MarketData) -> AppResult<Vec<Signal>> {
         use super::indicators::sma;
-        
+
         let mut signals = Vec::new();
         let symbol = &market_data.symbol;
         let price = market_data.price;
@@ -452,12 +457,11 @@ impl Strategy for DualMACrossoverStrategy {
         // Calculate MAs and detect crossover
         let history = self.price_history.read().unwrap();
         if let Some(prices) = history.get(symbol) {
-            if let (Some(fast_ma), Some(slow_ma)) = (
-                sma(prices, self.fast_period),
-                sma(prices, self.slow_period),
-            ) {
+            if let (Some(fast_ma), Some(slow_ma)) =
+                (sma(prices, self.fast_period), sma(prices, self.slow_period))
+            {
                 let current_position: i8 = if fast_ma > slow_ma { 1 } else { -1 };
-                
+
                 let mut prev_pos = self.prev_position.write().unwrap();
                 let prev = prev_pos.get(symbol).cloned().unwrap_or(0);
 
@@ -632,18 +636,20 @@ impl Strategy for PairsTradingStrategy {
             })
             .sum::<Decimal>()
             / Decimal::from(ratios.len());
-        
+
         let std_dev = variance.sqrt().unwrap_or(Decimal::ONE);
-        
+
         if std_dev.is_zero() {
-             return Ok(signals);
+            return Ok(signals);
         }
 
         let z_score = (current_ratio - mean) / std_dev;
         let z_val = z_score.to_f64().unwrap_or(0.0);
 
-        debug!("Pairs Trading {}-{}: Ratio={}, Mean={}, Z-Score={}", 
-               self.asset_a, self.asset_b, current_ratio, mean, z_val);
+        debug!(
+            "Pairs Trading {}-{}: Ratio={}, Mean={}, Z-Score={}",
+            self.asset_a, self.asset_b, current_ratio, mean, z_val
+        );
 
         // Generate signals based on Z-score
         if z_val > self.threshold {
@@ -675,8 +681,8 @@ impl Strategy for PairsTradingStrategy {
                 1.0,
             ));
         } else if z_val.abs() < 0.5 {
-             // Close positions when ratio returns to mean (optional implementation)
-             // For now, we just emit 'Hold' or nothing
+            // Close positions when ratio returns to mean (optional implementation)
+            // For now, we just emit 'Hold' or nothing
         }
 
         Ok(signals)

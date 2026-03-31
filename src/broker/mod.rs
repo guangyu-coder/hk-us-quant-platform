@@ -98,17 +98,17 @@ pub enum BrokerOrderStatus {
 impl BrokerOrderStatus {
     pub fn to_order_status(&self) -> OrderStatus {
         match self {
-            BrokerOrderStatus::New | BrokerOrderStatus::Accepted | BrokerOrderStatus::PendingNew => {
-                OrderStatus::Submitted
-            }
+            BrokerOrderStatus::New
+            | BrokerOrderStatus::Accepted
+            | BrokerOrderStatus::PendingNew => OrderStatus::Submitted,
             BrokerOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
             BrokerOrderStatus::Filled | BrokerOrderStatus::DoneForDay => OrderStatus::Filled,
-            BrokerOrderStatus::Cancelled | BrokerOrderStatus::Expired | BrokerOrderStatus::Replaced => {
-                OrderStatus::Cancelled
-            }
-            BrokerOrderStatus::Rejected | BrokerOrderStatus::Stopped | BrokerOrderStatus::Suspended => {
-                OrderStatus::Rejected
-            }
+            BrokerOrderStatus::Cancelled
+            | BrokerOrderStatus::Expired
+            | BrokerOrderStatus::Replaced => OrderStatus::Cancelled,
+            BrokerOrderStatus::Rejected
+            | BrokerOrderStatus::Stopped
+            | BrokerOrderStatus::Suspended => OrderStatus::Rejected,
             _ => OrderStatus::Pending,
         }
     }
@@ -182,9 +182,9 @@ pub async fn create_broker(config: &BrokerConfig) -> AppResult<Box<dyn Broker>> 
             let broker = MockBroker::new();
             Ok(Box::new(broker))
         }
-        BrokerProvider::InteractiveBrokers => {
-            Err(AppError::broker("Interactive Brokers integration not yet implemented"))
-        }
+        BrokerProvider::InteractiveBrokers => Err(AppError::broker(
+            "Interactive Brokers integration not yet implemented",
+        )),
     }
 }
 
@@ -237,12 +237,15 @@ impl Broker for MockBroker {
 
     async fn submit_order(&self, order: &Order) -> AppResult<BrokerOrderResult> {
         let broker_order_id = uuid::Uuid::new_v4().to_string();
-        
+
         let mut orders = self.orders.write().await;
         orders.insert(broker_order_id.clone(), BrokerOrderStatus::Filled);
-        
-        info!("Mock broker: Order {} submitted and filled", broker_order_id);
-        
+
+        info!(
+            "Mock broker: Order {} submitted and filled",
+            broker_order_id
+        );
+
         Ok(BrokerOrderResult {
             broker_order_id,
             client_order_id: order.id.to_string(),

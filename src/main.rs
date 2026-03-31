@@ -4,7 +4,7 @@ use axum::{
     extract::Query,
     extract::State,
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
     routing::{delete, get, post, put},
     Router,
 };
@@ -14,34 +14,38 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod broker;
 mod config;
 mod data;
 mod error;
 mod events;
 mod execution;
+mod market_data;
 mod portfolio;
 mod risk;
 mod strategy;
 mod types;
-mod broker;
-mod market_data;
 mod websocket;
 
 use crate::config::AppConfig;
 use crate::data::handlers::DataEventHandler;
-use crate::data::DataService;
+use crate::data::{DataLifecycleManager, DataService};
 use crate::error::AppError;
 use crate::events::EventBus;
 use crate::execution::ExecutionService;
-use crate::portfolio::PortfolioService;
+use crate::portfolio::{PortfolioExecutionHandler, PortfolioService};
 use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
 use crate::strategy::StrategyService;
-use crate::types::{OrderSide, OrderStatus, OrderType, RiskLimits, StrategyConfig};
+use crate::types::{ExecutionTrade, OrderSide, OrderStatus, OrderType, RiskLimits, StrategyConfig};
+use crate::websocket::{
+    start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
@@ -49,6 +53,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateStrategyRequest {
     pub name: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub parameters: Option<serde_json::Value>,
     pub risk_limits: Option<RiskLimits>,
@@ -73,6 +78,7 @@ pub struct CreateOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateStrategyRequest {
     pub name: Option<String>,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub parameters: Option<serde_json::Value>,
     pub risk_limits: Option<RiskLimits>,
@@ -90,6 +96,97 @@ pub struct MarketDataHistoryQuery {
     pub start: String,
     pub end: String,
     pub interval: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperSimulationQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderAuditQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+fn normalize_history_interval(interval: Option<&str>) -> &'static str {
+    match interval.unwrap_or("1d").to_ascii_lowercase().as_str() {
+        "1m" | "1min" | "1minute" => "1m",
+        "5m" | "5min" | "5minute" => "5m",
+        "15m" | "15min" | "15minute" => "15m",
+        "30m" | "30min" | "30minute" => "30m",
+        "1h" | "60m" | "60min" => "1h",
+        "1d" | "1day" | "day" => "1d",
+        "1wk" | "1w" | "1week" | "week" => "1wk",
+        "1mo" | "1month" | "month" => "1mo",
+        _ => "1d",
+    }
+}
+
+fn normalize_market_symbol(symbol: &str) -> String {
+    let normalized = symbol.trim().to_ascii_uppercase();
+
+    if normalized.ends_with(".HK") {
+        let code = normalized.trim_end_matches(".HK");
+        if code.chars().all(|c| c.is_ascii_digit()) {
+            return format!("{:0>4}.HK", code);
+        }
+        return normalized;
+    }
+
+    if normalized.chars().all(|c| c.is_ascii_digit()) && normalized.len() <= 5 {
+        return format!("{:0>4}.HK", normalized);
+    }
+
+    normalized
+}
+
+fn is_hk_symbol(symbol: &str) -> bool {
+    let normalized = normalize_market_symbol(symbol);
+    normalized.ends_with(".HK")
+}
+
+fn market_currency_for_symbol(symbol: &str) -> &'static str {
+    if is_hk_symbol(symbol) {
+        "HKD"
+    } else {
+        "USD"
+    }
+}
+
+fn position_currency(position: &crate::types::Position) -> &'static str {
+    market_currency_for_symbol(&position.symbol)
+}
+
+fn portfolio_display_currency(portfolio: &crate::types::Portfolio) -> &'static str {
+    let currencies = portfolio
+        .positions
+        .values()
+        .map(position_currency)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if currencies.is_empty() {
+        return "USD";
+    }
+
+    if currencies.len() == 1 {
+        let currency = *currencies.iter().next().unwrap();
+        if currency == "USD" || portfolio.cash_balance == rust_decimal::Decimal::ZERO {
+            return currency;
+        }
+    }
+
+    "MIXED"
+}
+
+fn market_status_label(degraded: bool, has_error: bool) -> &'static str {
+    if has_error {
+        "error"
+    } else if degraded {
+        "degraded"
+    } else {
+        "live"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +211,25 @@ pub struct PortfolioPnlQuery {
     pub date: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioPnlHistoryQuery {
+    pub days: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestListQuery {
+    pub strategy_id: Option<String>,
+    pub symbol: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeListQuery {
+    pub strategy_id: Option<String>,
+    pub symbol: Option<String>,
+    pub limit: Option<i64>,
+}
+
 /// Application state shared across all handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -124,6 +240,8 @@ pub struct AppState {
     pub portfolio_service: Arc<PortfolioService>,
     pub risk_service: Arc<RiskService>,
     pub event_bus: Arc<EventBus>,
+    pub ws_manager: Arc<WSManager>,
+    pub lifecycle_manager: Arc<RwLock<DataLifecycleManager>>,
 }
 
 #[tokio::main]
@@ -156,6 +274,24 @@ async fn main() -> Result<()> {
         .event_bus
         .register_handler(DataEventHandler::new(app_state.data_service.clone()))
         .await?;
+    app_state
+        .event_bus
+        .register_handler(PortfolioExecutionHandler::new(
+            app_state.portfolio_service.clone(),
+            app_state.execution_service.clone(),
+            app_state.config.trading.default_portfolio_id.clone(),
+        ))
+        .await?;
+
+    start_heartbeat(app_state.ws_manager.clone(), 30);
+
+    let ws_manager = app_state.ws_manager.clone();
+    let mut event_rx = app_state.event_bus.subscribe_local();
+    tokio::spawn(async move {
+        while let Ok(event) = event_rx.recv().await {
+            ws_manager.broadcast_event(&event);
+        }
+    });
 
     // Create router
     let app = create_router(app_state);
@@ -211,6 +347,8 @@ async fn initialize_services(config: Arc<AppConfig>) -> Result<AppState> {
         )
         .await?,
     );
+    let lifecycle_manager = Arc::new(RwLock::new(DataLifecycleManager::new(db_pool.clone())));
+    let ws_manager = Arc::new(WSManager::new(1024));
 
     Ok(AppState {
         config,
@@ -220,12 +358,15 @@ async fn initialize_services(config: Arc<AppConfig>) -> Result<AppState> {
         portfolio_service,
         risk_service,
         event_bus,
+        ws_manager,
+        lifecycle_manager,
     })
 }
 
 fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route("/ws", get(websocket_upgrade))
         .route("/api/v1/market-data/:symbol", get(get_market_data))
         .route(
             "/api/v1/market-data/:symbol/history",
@@ -234,6 +375,13 @@ fn create_router(state: AppState) -> Router {
         .route("/api/v1/market-data/batch", post(get_market_data_batch))
         .route("/api/v1/market-data/search", get(search_symbols))
         .route("/api/v1/market-data/list", get(list_market_symbols))
+        .route("/api/v1/lifecycle/cleanup", post(run_cleanup))
+        .route("/api/v1/lifecycle/archival", post(run_archival))
+        .route("/api/v1/lifecycle/settings", get(get_lifecycle_settings))
+        .route(
+            "/api/v1/lifecycle/settings",
+            post(update_lifecycle_settings),
+        )
         .route("/api/v1/strategies", get(list_strategies))
         .route("/api/v1/strategies", post(create_strategy))
         .route("/api/v1/strategies/:strategy_id", put(update_strategy))
@@ -242,14 +390,23 @@ fn create_router(state: AppState) -> Router {
             "/api/v1/strategies/:strategy_id/backtest",
             post(run_backtest),
         )
+        .route("/api/v1/backtests", get(list_backtests))
+        .route("/api/v1/trades", get(list_trades))
         .route("/api/v1/orders", get(list_orders))
         .route("/api/v1/orders", post(create_order))
+        .route("/api/v1/orders/simulate", post(run_paper_matching))
         .route("/api/v1/orders/:order_id", get(get_order))
+        .route("/api/v1/orders/:order_id/audit", get(get_order_audit))
         .route("/api/v1/orders/:order_id", delete(cancel_order))
         .route("/api/v1/portfolio", get(get_portfolio))
         .route("/api/v1/portfolio/positions", get(get_positions))
         .route("/api/v1/portfolio/pnl", get(get_portfolio_pnl))
+        .route(
+            "/api/v1/portfolio/pnl/history",
+            get(get_portfolio_pnl_history),
+        )
         .route("/api/v1/risk/metrics", get(get_risk_metrics))
+        .route("/api/v1/risk/limits", get(get_risk_limits))
         .route("/api/v1/risk/alerts", get(list_risk_alerts))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -276,44 +433,33 @@ async fn health_check(State(_state): State<AppState>) -> Result<Json<Value>, App
 }
 
 async fn get_market_data(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(symbol): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     info!("Fetching real market data for: {}", symbol);
-    Ok(Json(fetch_market_data_value(&symbol).await?))
+    let market_data = match fetch_market_data_value(&symbol).await {
+        Ok(data) => data,
+        Err(error) => market_error_response(
+            &symbol,
+            &normalize_market_symbol(&symbol),
+            "backend",
+            &error.to_string(),
+        ),
+    };
+    broadcast_market_data_update(&state, &market_data);
+    Ok(Json(market_data))
 }
 
-fn get_mock_market_data(symbol: &str) -> Value {
-    // Fallback mock data
-    let base_price = match symbol {
-        "AAPL" => 150.0,
-        "GOOGL" => 2800.0,
-        "MSFT" => 380.0,
-        "TSLA" => 250.0,
-        "0700.HK" => 320.0,
-        "0941.HK" => 85.0,
-        _ => 100.0,
+async fn websocket_upgrade(
+    State(state): State<AppState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    let ws_state = WSState {
+        manager: state.ws_manager.clone(),
+        event_bus: state.event_bus.clone(),
     };
 
-    let variation = (rand::random::<f64>() - 0.5) * base_price * 0.02;
-    let price = base_price + variation;
-    let previous_close = base_price;
-    let change = price - previous_close;
-    let change_percent = (change / previous_close) * 100.0;
-
-    json!({
-        "symbol": symbol,
-        "price": price,
-        "previous_close": previous_close,
-        "open": previous_close + (rand::random::<f64>() - 0.5) * 2.0,
-        "high": price + rand::random::<f64>() * 5.0,
-        "low": price - rand::random::<f64>() * 5.0,
-        "volume": rand::random::<i64>() % 10000000 + 1000000,
-        "change": change,
-        "change_percent": change_percent,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "source": "mock"
-    })
+    ws_handler_with_state(ws, ws_state).await
 }
 
 async fn get_market_data_history(
@@ -323,53 +469,110 @@ async fn get_market_data_history(
 ) -> Result<Json<Value>, AppError> {
     use crate::market_data::yahoo_finance::YahooFinanceClient;
     use chrono::{Duration, NaiveDate, TimeZone};
-    
-    info!("Fetching historical market data for: {}", symbol);
-    
+
+    let normalized_symbol = normalize_market_symbol(&symbol);
+    info!("Fetching historical market data for: {}", normalized_symbol);
+
     let yahoo_client = YahooFinanceClient::new();
-    
+
     // Parse dates or use defaults
     let end = if query.end.is_empty() {
         chrono::Utc::now()
     } else {
         NaiveDate::parse_from_str(&query.end, "%Y-%m-%d")
             .ok()
-            .and_then(|d| chrono::Utc.from_local_datetime(&d.and_hms_opt(0, 0, 0)?).single())
+            .and_then(|d| {
+                chrono::Utc
+                    .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+                    .single()
+            })
             .unwrap_or_else(chrono::Utc::now)
     };
-    
+
     let start = if query.start.is_empty() {
         end - Duration::days(30) // Default 30 days
     } else {
         NaiveDate::parse_from_str(&query.start, "%Y-%m-%d")
             .ok()
-            .and_then(|d| chrono::Utc.from_local_datetime(&d.and_hms_opt(0, 0, 0)?).single())
+            .and_then(|d| {
+                chrono::Utc
+                    .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+                    .single()
+            })
             .unwrap_or_else(|| end - Duration::days(30))
     };
-    
-    let interval = query.interval.as_deref().unwrap_or("1d");
-    
-    match yahoo_client.get_historical_bars(&symbol, start, end, interval).await {
+
+    let interval = normalize_history_interval(query.interval.as_deref());
+
+    if is_hk_symbol(&normalized_symbol) {
+        if let Ok(history) = fetch_market_history_from_script(
+            &normalized_symbol,
+            query.interval.as_deref().unwrap_or(interval),
+            &query.start,
+            &query.end,
+        )
+        .await
+        {
+            return Ok(Json(history));
+        }
+    }
+
+    match yahoo_client
+        .get_historical_bars(&normalized_symbol, start, end, interval)
+        .await
+    {
         Ok(bars) => {
-            let data: Vec<Value> = bars.iter().map(|bar| {
-                json!({
-                    "timestamp": bar.timestamp,
-                    "open": bar.open_price.and_then(|p| p.to_f64()),
-                    "high": bar.high_price.and_then(|p| p.to_f64()),
-                    "low": bar.low_price.and_then(|p| p.to_f64()),
-                    "close": bar.price.to_f64(),
-                    "volume": bar.volume,
+            let data: Vec<Value> = bars
+                .iter()
+                .map(|bar| {
+                    json!({
+                        "timestamp": bar.timestamp,
+                        "open": bar.open_price.and_then(|p| p.to_f64()),
+                        "high": bar.high_price.and_then(|p| p.to_f64()),
+                        "low": bar.low_price.and_then(|p| p.to_f64()),
+                        "close": bar.price.to_f64(),
+                        "price": bar.price.to_f64(),
+                        "volume": bar.volume,
+                        "data_source": "yahoo",
+                        "degraded": false,
+                    })
                 })
-            }).collect();
-            
-            Ok(Json(json!(data)))
-        },
-        Err(e) => {
-            Err(AppError::market_data(format!(
-                "Failed to fetch historical data for {}: {}",
-                symbol, e
+                .collect();
+
+            if data.is_empty() {
+                return Ok(Json(market_history_response(
+                    &symbol,
+                    &normalized_symbol,
+                    data,
+                    "yahoo",
+                    false,
+                    Some("No historical data returned".to_string()),
+                    interval,
+                )));
+            }
+
+            Ok(Json(market_history_response(
+                &symbol,
+                &normalized_symbol,
+                data,
+                "yahoo",
+                false,
+                None,
+                interval,
             )))
         }
+        Err(e) => Ok(Json(market_history_response(
+            &symbol,
+            &normalized_symbol,
+            Vec::new(),
+            "yahoo",
+            false,
+            Some(format!(
+                "Failed to fetch historical data for {}: {}",
+                normalized_symbol, e
+            )),
+            interval,
+        ))),
     }
 }
 
@@ -419,19 +622,50 @@ async fn search_symbols(
         .arg("--search")
         .arg(&query.query)
         .output()
-        .await
-        .map_err(|e| AppError::market_data(format!("Failed to run search script: {}", e)))?;
+        .await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            info!(
+                "Search script execution failed for query '{}': {}. Returning fallback response.",
+                query.query, e
+            );
+            return Ok(Json(json!({
+                "success": false,
+                "data": [],
+                "error": format!("search unavailable: {}", e),
+                "source": "fallback"
+            })));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::market_data(format!(
-            "Search script failed: {}",
-            stderr
-        )));
+        info!(
+            "Search script failed for query '{}': {}. Returning fallback response.",
+            query.query, stderr
+        );
+        return Ok(Json(json!({
+            "success": false,
+            "data": [],
+            "error": format!("search unavailable: {}", stderr),
+            "source": "fallback"
+        })));
     }
 
-    let data: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| AppError::market_data(format!("Invalid search response: {}", e)))?;
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        info!(
+            "Search response parse failed for query '{}': {}. Returning fallback response.",
+            query.query, e
+        );
+        json!({
+            "success": false,
+            "data": [],
+            "error": format!("invalid search response: {}", e),
+            "source": "fallback"
+        })
+    });
 
     Ok(Json(data))
 }
@@ -459,21 +693,53 @@ async fn list_market_symbols(
         cmd.arg("--type").arg(itype);
     }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| AppError::market_data(format!("Failed to run list market script: {}", e)))?;
+    let output = cmd.output().await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            info!(
+                "List market script execution failed: {}. Returning fallback response.",
+                e
+            );
+            return Ok(Json(json!({
+                "success": false,
+                "count": 0,
+                "data": [],
+                "error": format!("market list unavailable: {}", e),
+                "source": "fallback"
+            })));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::market_data(format!(
-            "List market script failed: {}",
+        info!(
+            "List market script failed: {}. Returning fallback response.",
             stderr
-        )));
+        );
+        return Ok(Json(json!({
+            "success": false,
+            "count": 0,
+            "data": [],
+            "error": format!("market list unavailable: {}", stderr),
+            "source": "fallback"
+        })));
     }
 
-    let data: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| AppError::market_data(format!("Invalid list market response: {}", e)))?;
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        info!(
+            "List market response parse failed: {}. Returning fallback response.",
+            e
+        );
+        json!({
+            "success": false,
+            "count": 0,
+            "data": [],
+            "error": format!("invalid market list response: {}", e),
+            "source": "fallback"
+        })
+    });
 
     Ok(Json(data))
 }
@@ -531,6 +797,28 @@ async fn list_risk_alerts(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!(output)))
 }
 
+async fn get_portfolio_pnl_history(
+    State(state): State<AppState>,
+    Query(query): Query<PortfolioPnlHistoryQuery>,
+) -> Result<Json<Value>, AppError> {
+    let portfolio_id = state.config.trading.default_portfolio_id.clone();
+    let days = query.days.unwrap_or(30);
+    let history = state
+        .portfolio_service
+        .get_pnl_history(&portfolio_id, days)
+        .await?;
+
+    Ok(Json(json!(history
+        .into_iter()
+        .map(|point| json!({
+            "date": point.date.to_string(),
+            "total_pnl": point.total_pnl.to_f64().unwrap_or(0.0),
+            "realized_pnl": point.realized_pnl.to_f64().unwrap_or(0.0),
+            "unrealized_pnl": point.unrealized_pnl.to_f64().unwrap_or(0.0),
+        }))
+        .collect::<Vec<_>>())))
+}
+
 async fn update_strategy(
     State(state): State<AppState>,
     Path(strategy_id): Path<String>,
@@ -543,6 +831,9 @@ async fn update_strategy(
 
     if let Some(name) = req.name {
         config.name = name;
+    }
+    if let Some(display_name) = req.display_name {
+        config.display_name = Some(display_name);
     }
     if let Some(description) = req.description {
         config.description = Some(description);
@@ -573,10 +864,7 @@ async fn delete_strategy(
     State(state): State<AppState>,
     Path(strategy_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .strategy_service
-        .deactivate_strategy(&strategy_id)
-        .await?;
+    state.strategy_service.delete_strategy(&strategy_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -594,34 +882,426 @@ async fn run_backtest(
     Ok(Json(backtest_to_json(result)))
 }
 
+async fn list_backtests(
+    State(state): State<AppState>,
+    Query(query): Query<BacktestListQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let results = state
+        .strategy_service
+        .list_backtest_runs_filtered(limit, query.strategy_id.as_deref(), query.symbol.as_deref())
+        .await?;
+    Ok(Json(json!(results
+        .into_iter()
+        .map(backtest_to_json)
+        .collect::<Vec<_>>())))
+}
+
 async fn fetch_market_data_value(symbol: &str) -> Result<Value, AppError> {
     use crate::market_data::yahoo_finance::YahooFinanceClient;
-    
+
+    let normalized_symbol = normalize_market_symbol(symbol);
+
+    if is_hk_symbol(&normalized_symbol) {
+        return fetch_market_data_from_script(&normalized_symbol).await;
+    }
+
     // Try Yahoo Finance first (free, no API key needed)
     let yahoo_client = YahooFinanceClient::new();
-    
-    match yahoo_client.get_quote(symbol).await {
+
+    match yahoo_client.get_quote(&normalized_symbol).await {
         Ok(data) => {
             let change = data.price_change();
             let change_percent = data.price_change_percent();
-            
-            Ok(json!({
-                "symbol": data.symbol,
-                "price": data.price.to_f64().unwrap_or(0.0),
-                "volume": data.volume,
-                "timestamp": data.timestamp,
-                "previous_close": data.previous_close.and_then(|p| p.to_f64()),
-                "change": change.and_then(|c| c.to_f64()),
-                "change_percent": change_percent,
-                "data_source": "Yahoo Finance",
-                "exchange": data.exchange.unwrap_or_else(|| "N/A".to_string()),
-            }))
-        },
-        Err(e) => {
-            info!("Yahoo Finance failed for {}: {}. Using mock data.", symbol, e);
-            Ok(get_mock_market_data(symbol))
+
+            Ok(market_quote_response(
+                symbol,
+                &normalized_symbol,
+                json!({
+                    "symbol": data.symbol,
+                    "price": data.price.to_f64().unwrap_or(0.0),
+                    "volume": data.volume,
+                    "timestamp": data.timestamp,
+                    "currency": market_currency_for_symbol(&data.symbol),
+                    "previous_close": data.previous_close.and_then(|p| p.to_f64()),
+                    "change": change.and_then(|c| c.to_f64()),
+                    "change_percent": change_percent,
+                    "data_source": "Yahoo Finance",
+                    "exchange": data.exchange.unwrap_or_else(|| "N/A".to_string()),
+                }),
+                "yahoo",
+                false,
+                None,
+            ))
         }
+        Err(e) => Err(AppError::market_data(format!(
+            "Failed to fetch real-time market data for {}: {}",
+            normalized_symbol, e
+        ))),
     }
+}
+
+fn broadcast_market_data_update(state: &AppState, market_data: &Value) {
+    let Some(symbol) = market_data
+        .get("data")
+        .and_then(|data| data.get("symbol"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+
+    let price = market_data
+        .get("data")
+        .and_then(|data| data.get("price"))
+        .and_then(Value::as_f64)
+        .unwrap_or_default()
+        .to_string();
+    let volume = market_data
+        .get("data")
+        .and_then(|data| data.get("volume"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let exchange = market_data
+        .get("data")
+        .and_then(|data| data.get("exchange"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let currency = market_data
+        .get("data")
+        .and_then(|data| data.get("currency"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| Some(market_currency_for_symbol(symbol).to_string()));
+    let timestamp = market_data
+        .get("data")
+        .and_then(|data| data.get("timestamp"))
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+
+    let message = WSMessage::MarketData(MarketDataUpdate {
+        symbol: symbol.to_string(),
+        price,
+        volume,
+        exchange,
+        currency,
+        timestamp,
+    });
+
+    let _ = state.ws_manager.broadcast(message);
+}
+
+async fn fetch_market_data_from_script(symbol: &str) -> Result<Value, AppError> {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("market_data.py");
+
+    let output = Command::new("python3")
+        .arg(script_path)
+        .arg("--symbol")
+        .arg(symbol)
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::market_data(format!(
+                "Failed to run market data provider for {}: {}",
+                symbol, e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::market_data(format!(
+            "Market data provider failed for {}: {}",
+            symbol, stderr
+        )));
+    }
+
+    let response: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        AppError::market_data(format!(
+            "Invalid market data response for {}: {}",
+            symbol, e
+        ))
+    })?;
+
+    let success = response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !success {
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown market data provider error");
+        return Err(AppError::market_data(format!(
+            "Market data provider error for {}: {}",
+            symbol, message
+        )));
+    }
+
+    let data = response
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::market_data(format!("Missing data payload for {}", symbol)))?;
+
+    let price = data.get("price").and_then(Value::as_f64).unwrap_or(0.0);
+    let previous_close = data.get("previous_close").and_then(Value::as_f64);
+    let change = previous_close.map(|prev| price - prev);
+    let change_percent = previous_close.and_then(|prev| {
+        if prev.abs() > f64::EPSILON {
+            Some(((price - prev) / prev) * 100.0)
+        } else {
+            None
+        }
+    });
+
+    let source = response
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("provider");
+    let degraded = response
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let note = response
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+    Ok(market_quote_response(
+        symbol,
+        symbol,
+        json!({
+            "symbol": response.get("symbol").and_then(Value::as_str).unwrap_or(symbol),
+            "price": price,
+            "volume": data.get("volume").and_then(Value::as_i64).unwrap_or(0),
+            "timestamp": response.get("timestamp").cloned().unwrap_or_else(|| json!(Utc::now())),
+            "currency": "HKD",
+            "previous_close": previous_close,
+            "open": data.get("open").and_then(Value::as_f64),
+            "high": data.get("high").and_then(Value::as_f64),
+            "low": data.get("low").and_then(Value::as_f64),
+            "change": change,
+            "change_percent": change_percent,
+            "data_source": source,
+            "exchange": "HKEX",
+        }),
+        source,
+        degraded,
+        note,
+    ))
+}
+
+async fn fetch_market_history_from_script(
+    symbol: &str,
+    interval: &str,
+    start: &str,
+    end: &str,
+) -> Result<Value, AppError> {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("market_data.py");
+
+    let mut cmd = Command::new("python3");
+    cmd.arg(script_path)
+        .arg("--symbol")
+        .arg(symbol)
+        .arg("--history")
+        .arg("--interval")
+        .arg(interval);
+
+    if !start.is_empty() {
+        cmd.arg("--start").arg(start);
+    }
+    if !end.is_empty() {
+        cmd.arg("--end").arg(end);
+    }
+
+    let output = cmd.output().await.map_err(|e| {
+        AppError::market_data(format!(
+            "Failed to run historical data provider for {}: {}",
+            symbol, e
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::market_data(format!(
+            "Historical data provider failed for {}: {}",
+            symbol, stderr
+        )));
+    }
+
+    let response: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        AppError::market_data(format!(
+            "Invalid historical data response for {}: {}",
+            symbol, e
+        ))
+    })?;
+
+    let success = response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !success {
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown historical data provider error");
+        return Err(AppError::market_data(format!(
+            "Historical data provider error for {}: {}",
+            symbol, message
+        )));
+    }
+
+    let values = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::market_data(format!("Missing historical data payload for {}", symbol))
+        })?;
+
+    let normalized = values
+        .iter()
+        .filter_map(|item| {
+            let timestamp = item.get("timestamp")?.clone();
+            let close = item
+                .get("close")
+                .and_then(Value::as_f64)
+                .or_else(|| item.get("price").and_then(Value::as_f64))?;
+            Some(json!({
+                "timestamp": timestamp,
+                "open": item.get("open").cloned().unwrap_or(Value::Null),
+                "high": item.get("high").cloned().unwrap_or(Value::Null),
+                "low": item.get("low").cloned().unwrap_or(Value::Null),
+                "close": close,
+                "volume": item.get("volume").cloned().unwrap_or_else(|| json!(0)),
+                "data_source": response.get("source").cloned().unwrap_or_else(|| json!("provider")),
+                "degraded": false,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    if normalized.is_empty() {
+        return Err(AppError::market_data(format!(
+            "No historical data returned for {}",
+            symbol
+        )));
+    }
+
+    let source = response
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("provider");
+    let degraded = response
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let note = response
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok(market_history_response(
+        symbol,
+        symbol,
+        normalized,
+        source,
+        degraded,
+        note,
+        normalize_history_interval(Some(interval)),
+    ))
+}
+
+fn market_quote_response(
+    requested_symbol: &str,
+    normalized_symbol: &str,
+    data: Value,
+    source: &str,
+    degraded: bool,
+    error_message: Option<String>,
+) -> Value {
+    let has_error = error_message.is_some() && !degraded;
+    let error_value = if has_error {
+        error_message.clone()
+    } else {
+        None
+    };
+    json!({
+        "success": !has_error,
+        "data": data,
+        "meta": {
+            "status": market_status_label(degraded, has_error),
+            "source": source,
+            "fallback_used": degraded,
+            "is_stale": degraded,
+            "degraded": degraded,
+            "requested_symbol": requested_symbol,
+            "normalized_symbol": normalized_symbol,
+            "message": error_message,
+        },
+        "error": error_value,
+    })
+}
+
+fn market_history_response(
+    requested_symbol: &str,
+    normalized_symbol: &str,
+    data: Vec<Value>,
+    source: &str,
+    degraded: bool,
+    error_message: Option<String>,
+    interval: &str,
+) -> Value {
+    let has_error = error_message.is_some() && !degraded;
+    let error_value = if has_error {
+        error_message.clone()
+    } else {
+        None
+    };
+    json!({
+        "success": !has_error,
+        "data": data,
+        "meta": {
+            "status": market_status_label(degraded, has_error),
+            "source": source,
+            "fallback_used": degraded,
+            "is_stale": degraded,
+            "degraded": degraded,
+            "requested_symbol": requested_symbol,
+            "normalized_symbol": normalized_symbol,
+            "interval": interval,
+            "message": error_message,
+        },
+        "error": error_value,
+    })
+}
+
+fn market_error_response(
+    requested_symbol: &str,
+    normalized_symbol: &str,
+    source: &str,
+    message: &str,
+) -> Value {
+    market_quote_response(
+        requested_symbol,
+        normalized_symbol,
+        json!({
+            "symbol": normalized_symbol,
+            "timestamp": Utc::now().to_rfc3339(),
+            "currency": market_currency_for_symbol(normalized_symbol),
+        }),
+        source,
+        false,
+        Some(message.to_string()),
+    )
 }
 
 fn parse_datetime(input: &str) -> Result<DateTime<Utc>, AppError> {
@@ -641,7 +1321,28 @@ fn parse_datetime(input: &str) -> Result<DateTime<Utc>, AppError> {
 
 fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
     json!({
+        "run_id": result.run_id.map(|id| id.to_string()),
         "strategy_id": result.strategy_id,
+        "strategy_name": result.strategy_name,
+        "symbol": result.symbol,
+        "timeframe": result.timeframe,
+        "parameters": result.parameters,
+        "trades": result.trades.map(|trades| trades.into_iter().map(|trade| json!({
+            "timestamp": trade.timestamp.to_rfc3339(),
+            "side": trade.side,
+            "quantity": trade.quantity,
+            "signal_price": trade.signal_price.to_f64().unwrap_or(0.0),
+            "execution_price": trade.execution_price.to_f64().unwrap_or(0.0),
+            "fees": trade.fees.to_f64().unwrap_or(0.0),
+            "pnl": trade.pnl.and_then(|value| value.to_f64()),
+        })).collect::<Vec<_>>()),
+        "equity_curve": result.equity_curve.map(|points| points.into_iter().map(|point| json!({
+            "timestamp": point.timestamp.to_rfc3339(),
+            "equity": point.equity.to_f64().unwrap_or(0.0),
+            "cash": point.cash.to_f64().unwrap_or(0.0),
+            "position_quantity": point.position_quantity,
+            "market_price": point.market_price.to_f64().unwrap_or(0.0),
+        })).collect::<Vec<_>>()),
         "start_date": result.start_date.to_rfc3339(),
         "end_date": result.end_date.to_rfc3339(),
         "initial_capital": result.initial_capital.to_f64().unwrap_or(0.0),
@@ -652,6 +1353,7 @@ fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
         "max_drawdown": result.max_drawdown,
         "win_rate": result.win_rate,
         "total_trades": result.total_trades,
+        "created_at": result.created_at.map(|dt| dt.to_rfc3339()),
         "performance_metrics": {
             "total_pnl": result.performance_metrics.total_pnl.to_f64().unwrap_or(0.0),
             "realized_pnl": result.performance_metrics.realized_pnl.to_f64().unwrap_or(0.0),
@@ -683,6 +1385,7 @@ async fn create_strategy(
     let config = StrategyConfig {
         id: Uuid::new_v4().to_string(),
         name: req.name,
+        display_name: req.display_name,
         description: req.description,
         parameters: req
             .parameters
@@ -704,7 +1407,7 @@ async fn create_strategy(
 async fn create_order(
     State(state): State<AppState>,
     Json(req): Json<CreateOrderRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let side = match req.side.to_lowercase().as_str() {
         "buy" => OrderSide::Buy,
         "sell" => OrderSide::Sell,
@@ -727,20 +1430,18 @@ async fn create_order(
         order = order.with_price(price);
     }
 
-    // Handle advanced order fields
     if let Some(stop_price) = req.stop_price {
-        // In a real implementation, we would set this on the order
-        info!("Order {} has stop price: {}", order.id, stop_price);
+        let stop_price = rust_decimal::Decimal::from_f64(stop_price)
+            .ok_or_else(|| AppError::validation("Invalid stop price"))?;
+        order = order.with_stop_price(stop_price);
     }
 
     if let Some(tif) = &req.time_in_force {
-        info!("Order {} time in force: {}", order.id, tif);
+        order = order.with_time_in_force(tif.clone());
     }
 
     if let Some(ext) = req.extended_hours {
-        if ext {
-            info!("Order {} enabled for extended hours", order.id);
-        }
+        order = order.with_extended_hours(ext);
     }
 
     if let Some(strategy_id) = req.strategy_id {
@@ -749,16 +1450,56 @@ async fn create_order(
 
     if state.config.trading.risk_check_enabled {
         let check_result = state.risk_service.check_pre_trade_risk(&order).await?;
-        if let RiskCheckResult::Rejected { reason, .. } = check_result {
-            return Err(AppError::risk(reason));
+        if let RiskCheckResult::Rejected { .. } = &check_result {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "accepted": false,
+                    "order_preview": order_to_json(order),
+                    "risk_check": risk_check_to_json(&check_result),
+                })),
+            ));
         }
+
+        let mut created = state.execution_service.create_order_direct(order).await?;
+        created = if state.config.trading.paper_trading {
+            state
+                .execution_service
+                .submit_paper_order(created.id)
+                .await?
+        } else {
+            state.execution_service.submit_order(created.id).await?
+        };
+
+        info!(
+            "Created order: {} - {:?} {} {} {:?} @ {:?}",
+            created.id,
+            created.side,
+            created.quantity,
+            created.symbol,
+            created.order_type,
+            created.price
+        );
+
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "accepted": true,
+                "order": order_to_json(created),
+                "risk_check": risk_check_to_json(&check_result),
+            })),
+        ));
     }
 
     let mut created = state.execution_service.create_order_direct(order).await?;
-    if !state.config.trading.paper_trading {
-        state.execution_service.submit_order(created.id).await?;
-        created = state.execution_service.get_order(created.id).await?;
-    }
+    created = if state.config.trading.paper_trading {
+        state
+            .execution_service
+            .submit_paper_order(created.id)
+            .await?
+    } else {
+        state.execution_service.submit_order(created.id).await?
+    };
 
     info!(
         "Created order: {} - {:?} {} {} {:?} @ {:?}",
@@ -770,7 +1511,13 @@ async fn create_order(
         created.price
     );
 
-    Ok(Json(order_to_json(created)))
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "accepted": true,
+            "order": order_to_json(created),
+        })),
+    ))
 }
 
 async fn list_orders(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -779,6 +1526,60 @@ async fn list_orders(State(state): State<AppState>) -> Result<Json<Value>, AppEr
         .into_iter()
         .map(order_to_json)
         .collect::<Vec<_>>())))
+}
+
+async fn list_trades(
+    State(state): State<AppState>,
+    Query(query): Query<TradeListQuery>,
+) -> Result<Json<Value>, AppError> {
+    let trades = state
+        .portfolio_service
+        .list_trades(
+            query.strategy_id.as_deref(),
+            query.symbol.as_deref(),
+            query.limit.unwrap_or(200),
+        )
+        .await?;
+
+    Ok(Json(json!(trades
+        .into_iter()
+        .map(execution_trade_to_json)
+        .collect::<Vec<_>>())))
+}
+
+async fn run_paper_matching(
+    State(state): State<AppState>,
+    Query(query): Query<PaperSimulationQuery>,
+) -> Result<Json<Value>, AppError> {
+    if !state.config.trading.paper_trading {
+        return Err(AppError::validation(
+            "Paper matching is only available when PAPER_TRADING=true",
+        ));
+    }
+
+    let summary = state
+        .execution_service
+        .run_paper_matching(query.limit.unwrap_or(100))
+        .await?;
+
+    Ok(Json(json!({
+        "processed": summary.processed,
+        "filled": summary.filled,
+        "partially_filled": summary.partially_filled,
+        "submitted": summary.submitted,
+        "untouched": summary.untouched,
+        "unsupported": summary.unsupported,
+        "results": summary.results.into_iter().map(|result| json!({
+            "order_id": result.order_id.to_string(),
+            "symbol": result.symbol,
+            "status_before": result.status_before,
+            "status_after": result.status_after,
+            "action": result.action,
+            "detail": result.detail,
+            "market_price": result.market_price.and_then(|value| value.to_f64()),
+            "fill_price": result.fill_price.and_then(|value| value.to_f64()),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 async fn cancel_order(
@@ -790,6 +1591,35 @@ async fn cancel_order(
     state.execution_service.cancel_order(order_id).await?;
     info!("Cancelled order: {}", order_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_order_audit(
+    State(state): State<AppState>,
+    axum::extract::Path(order_id): axum::extract::Path<String>,
+    Query(query): Query<OrderAuditQuery>,
+) -> Result<Json<Value>, AppError> {
+    let order_id =
+        Uuid::parse_str(&order_id).map_err(|_| AppError::validation("Invalid order id"))?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    let entries = state
+        .execution_service
+        .list_order_audit(order_id, limit, offset)
+        .await?;
+
+    Ok(Json(json!({
+        "order_id": order_id.to_string(),
+        "entries": entries.into_iter().map(|entry| json!({
+            "id": entry.id,
+            "user_id": entry.user_id,
+            "action": entry.action,
+            "resource_type": entry.resource_type,
+            "resource_id": entry.resource_id,
+            "details": entry.details,
+            "created_at": entry.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 async fn get_portfolio(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -829,6 +1659,7 @@ async fn get_risk_metrics(State(state): State<AppState>) -> Result<Json<Value>, 
         .await?;
 
     Ok(Json(json!({
+        "base_currency": portfolio_display_currency(&portfolio),
         "portfolio_value": metrics.portfolio_value.to_f64().unwrap_or(0.0),
         "total_exposure": metrics.total_exposure.to_f64().unwrap_or(0.0),
         "leverage": metrics.leverage,
@@ -836,6 +1667,20 @@ async fn get_risk_metrics(State(state): State<AppState>) -> Result<Json<Value>, 
         "max_drawdown": metrics.max_drawdown,
         "sharpe_ratio": metrics.sharpe_ratio,
         "calculated_at": metrics.calculated_at.to_rfc3339(),
+    })))
+}
+
+async fn get_risk_limits(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let limits = state.risk_service.get_risk_limits().await?;
+
+    Ok(Json(json!({
+        "max_order_size": limits.max_order_size,
+        "max_leverage": limits.max_leverage,
+        "max_daily_loss": limits.max_daily_loss.and_then(|v| v.to_f64()),
+        "max_portfolio_exposure": limits.max_portfolio_exposure.and_then(|v| v.to_f64()),
+        "max_single_stock_weight": limits.max_single_stock_weight,
+        "risk_check_enabled": limits.risk_check_enabled,
+        "paper_trading": limits.paper_trading,
     })))
 }
 
@@ -852,6 +1697,7 @@ fn strategy_config_to_json(config: StrategyConfig) -> Value {
     json!({
         "id": config.id,
         "name": config.name,
+        "display_name": config.display_name,
         "description": config.description,
         "parameters": config.parameters,
         "risk_limits": risk_limits_to_json(&config.risk_limits),
@@ -889,7 +1735,10 @@ fn order_to_json(order: crate::types::Order) -> Value {
         "side": side,
         "quantity": order.quantity,
         "price": order.price.and_then(|v| v.to_f64()),
+        "stop_price": order.stop_price.and_then(|v| v.to_f64()),
         "order_type": order_type,
+        "time_in_force": order.time_in_force,
+        "extended_hours": order.extended_hours,
         "status": status,
         "strategy_id": order.strategy_id,
         "created_at": order.created_at.to_rfc3339(),
@@ -899,14 +1748,52 @@ fn order_to_json(order: crate::types::Order) -> Value {
     })
 }
 
-fn position_to_json(position: crate::types::Position) -> Value {
-    let market_value = position.average_cost * rust_decimal::Decimal::from(position.quantity.abs());
+fn execution_trade_to_json(trade: ExecutionTrade) -> Value {
+    json!({
+        "id": trade.id,
+        "order_id": trade.order_id.to_string(),
+        "symbol": trade.symbol,
+        "side": trade.side,
+        "quantity": trade.quantity,
+        "price": trade.price.to_f64().unwrap_or(0.0),
+        "executed_at": trade.executed_at.to_rfc3339(),
+        "portfolio_id": trade.portfolio_id,
+        "strategy_id": trade.strategy_id,
+    })
+}
+
+fn risk_check_to_json(result: &RiskCheckResult) -> Value {
+    let (status, message) = result.summary();
+    let checks = match result {
+        RiskCheckResult::Passed { checks }
+        | RiskCheckResult::Warning { checks, .. }
+        | RiskCheckResult::Rejected { checks, .. } => checks,
+    };
 
     json!({
+        "status": status,
+        "message": message,
+        "checks": checks.iter().map(|check| {
+            json!({
+                "rule_code": check.rule_code,
+                "check_type": check.check_type,
+                "passed": check.passed,
+                "message": check.message,
+                "severity": format!("{:?}", check.severity).to_lowercase(),
+                "actual_value": check.actual_value,
+                "threshold_value": check.threshold_value,
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn position_to_json(position: crate::types::Position) -> Value {
+    json!({
         "symbol": position.symbol,
+        "currency": market_currency_for_symbol(&position.symbol),
         "quantity": position.quantity,
         "average_cost": position.average_cost.to_f64().unwrap_or(0.0),
-        "market_value": market_value.to_f64().unwrap_or(0.0),
+        "market_value": position.market_value.to_f64().unwrap_or(0.0),
         "unrealized_pnl": position.unrealized_pnl.to_f64().unwrap_or(0.0),
         "realized_pnl": position.realized_pnl.to_f64().unwrap_or(0.0),
         "last_updated": position.last_updated.to_rfc3339(),
@@ -914,11 +1801,8 @@ fn position_to_json(position: crate::types::Position) -> Value {
 }
 
 fn portfolio_to_json(mut portfolio: crate::types::Portfolio) -> Value {
-    for position in portfolio.positions.values_mut() {
-        let current_price = position.average_cost;
-        position.update_market_value(current_price);
-    }
     portfolio.calculate_total_value();
+    let base_currency = portfolio_display_currency(&portfolio);
 
     let positions = portfolio
         .positions
@@ -929,6 +1813,7 @@ fn portfolio_to_json(mut portfolio: crate::types::Portfolio) -> Value {
     json!({
         "id": portfolio.id,
         "name": portfolio.name,
+        "base_currency": base_currency,
         "positions": positions,
         "cash_balance": portfolio.cash_balance.to_f64().unwrap_or(0.0),
         "total_value": portfolio.total_value.to_f64().unwrap_or(0.0),
@@ -936,6 +1821,102 @@ fn portfolio_to_json(mut portfolio: crate::types::Portfolio) -> Value {
         "realized_pnl": portfolio.realized_pnl.to_f64().unwrap_or(0.0),
         "last_updated": portfolio.last_updated.to_rfc3339(),
     })
+}
+
+async fn get_lifecycle_settings(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let settings = state
+        .lifecycle_manager
+        .read()
+        .await
+        .get_retention_settings();
+
+    Ok(Json(json!({
+        "market_data_retention_days": settings.market_data_retention_days,
+        "order_retention_days": settings.order_retention_days,
+        "position_retention_days": settings.position_retention_days,
+        "market_data_archive_days": settings.market_data_archive_days,
+        "order_archive_days": settings.order_archive_days,
+    })))
+}
+
+async fn update_lifecycle_settings(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, AppError> {
+    let mut manager = state.lifecycle_manager.write().await;
+
+    if let Some(days) = req
+        .get("market_data_retention_days")
+        .and_then(|v| v.as_i64())
+    {
+        manager.set_market_data_retention_days(days);
+    }
+    if let Some(days) = req.get("order_retention_days").and_then(|v| v.as_i64()) {
+        manager.set_order_retention_days(days);
+    }
+    if let Some(days) = req.get("position_retention_days").and_then(|v| v.as_i64()) {
+        manager.set_position_retention_days(days);
+    }
+    if let Some(days) = req.get("market_data_archive_days").and_then(|v| v.as_i64()) {
+        manager.set_market_data_archive_days(days);
+    }
+    if let Some(days) = req.get("order_archive_days").and_then(|v| v.as_i64()) {
+        manager.set_order_archive_days(days);
+    }
+
+    let settings = manager.get_retention_settings();
+
+    Ok(Json(json!({
+        "success": true,
+        "settings": settings
+    })))
+}
+
+async fn run_cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    info!("Running data cleanup operations");
+
+    let results = state.lifecycle_manager.read().await.run_cleanup().await?;
+
+    let output: Vec<Value> = results
+        .into_iter()
+        .map(|r| {
+            json!({
+                "table": r.table,
+                "deleted_count": r.deleted_count,
+                "cutoff_date": r.cutoff_date.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "results": output,
+        "executed_at": Utc::now().to_rfc3339(),
+    })))
+}
+
+async fn run_archival(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    info!("Running data archival operations");
+
+    let results = state.lifecycle_manager.read().await.run_archival().await?;
+
+    let output: Vec<Value> = results
+        .into_iter()
+        .map(|r| {
+            json!({
+                "table": r.table,
+                "archived_count": r.archived_count,
+                "cutoff_date": r.cutoff_date.to_rfc3339(),
+                "archived_data_count": r.archived_details.len(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "results": output,
+        "executed_at": Utc::now().to_rfc3339(),
+    })))
 }
 
 #[cfg(test)]
@@ -947,6 +1928,43 @@ mod http_e2e_tests {
     use serde_json::Value;
     use std::env;
     use tower::ServiceExt;
+
+    #[test]
+    fn test_interval_normalization() {
+        assert_eq!(normalize_history_interval(None), "1d");
+        assert_eq!(normalize_history_interval(Some("15min")), "15m");
+        assert_eq!(normalize_history_interval(Some("1week")), "1wk");
+        assert_eq!(normalize_history_interval(Some("1month")), "1mo");
+        assert_eq!(normalize_history_interval(Some("invalid")), "1d");
+    }
+
+    #[test]
+    fn quote_response_marks_degraded_without_failing() {
+        let response = market_quote_response(
+            "0700.HK",
+            "0700.HK",
+            json!({
+                "symbol": "0700.HK",
+                "price": 320.5,
+            }),
+            "mock_fallback",
+            true,
+            Some("Using demo fallback".to_string()),
+        );
+
+        assert_eq!(response["success"], json!(true));
+        assert_eq!(response["meta"]["status"], json!("degraded"));
+        assert_eq!(response["meta"]["fallback_used"], json!(true));
+        assert_eq!(response["error"], Value::Null);
+    }
+
+    #[test]
+    fn quote_response_marks_error_when_not_degraded() {
+        let response = market_error_response("AAPL", "AAPL", "backend", "upstream timeout");
+        assert_eq!(response["success"], json!(false));
+        assert_eq!(response["meta"]["status"], json!("error"));
+        assert_eq!(response["error"], json!("upstream timeout"));
+    }
 
     #[tokio::test]
     async fn e2e_api_smoke() {
@@ -1008,6 +2026,8 @@ mod http_e2e_tests {
             portfolio_service,
             risk_service,
             event_bus,
+            ws_manager: Arc::new(WSManager::new(128)),
+            lifecycle_manager: Arc::new(RwLock::new(DataLifecycleManager::new(db_pool.clone()))),
         };
 
         let app = create_router(state);
@@ -1019,6 +2039,25 @@ mod http_e2e_tests {
             "risk_limits": {},
             "is_active": true
         });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/portfolio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let portfolio_before: Value = serde_json::from_slice(&bytes).unwrap();
+        let aapl_before = portfolio_before["positions"]["AAPL"]["quantity"]
+            .as_i64()
+            .unwrap_or(0);
+        let cash_before = portfolio_before["cash_balance"].as_f64().unwrap_or(0.0);
 
         let response = app
             .clone()
@@ -1066,7 +2105,9 @@ mod http_e2e_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let created_order: Value = serde_json::from_slice(&bytes).unwrap();
-        let order_id = created_order["id"].as_str().unwrap().to_string();
+        assert_eq!(created_order["accepted"], json!(true));
+        assert_eq!(created_order["order"]["status"], json!("Filled"));
+        let order_id = created_order["order"]["id"].as_str().unwrap().to_string();
 
         let response = app
             .clone()
@@ -1080,6 +2121,14 @@ mod http_e2e_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let portfolio_after: Value = serde_json::from_slice(&bytes).unwrap();
+        let aapl_after = portfolio_after["positions"]["AAPL"]["quantity"]
+            .as_i64()
+            .unwrap_or(0);
+        let cash_after = portfolio_after["cash_balance"].as_f64().unwrap_or(0.0);
+        assert_eq!(aapl_after, aapl_before + 1);
+        assert!(cash_after < cash_before);
 
         let response = app
             .clone()

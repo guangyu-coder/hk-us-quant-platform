@@ -49,20 +49,23 @@
 ## 🚀 启动方式
 
 ```bash
-# 启动数据库和缓存
-docker-compose up -d postgres redis
-
-# 启动后端
-cargo run
-
-# 启动前端
-cd frontend && npm run dev
+# 启动完整容器栈
+./scripts/deploy.sh up --build
 ```
 
 ## 📱 访问地址
-- 前端: http://localhost:3000
-- 后端API: http://localhost:8080
-- 健康检查: http://localhost:8080/health
+- 前端: http://localhost:3002
+- 健康检查: http://localhost:3002/health
+
+## 🛑 停止方式
+
+```bash
+# 停止容器，保留数据卷
+./scripts/deploy.sh down
+
+# 停止容器并删除数据卷
+./scripts/deploy.sh destroy
+```
 
 ## 🎯 下一步计划
 

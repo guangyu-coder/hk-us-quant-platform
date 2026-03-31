@@ -1,6 +1,10 @@
 use crate::error::{AppError, AppResult};
-use crate::events::{EventBus, PlatformEvent};
-use crate::types::{Portfolio, Position};
+use crate::events::{EventBus, EventHandler, PlatformEvent};
+use crate::execution::ExecutionService;
+use crate::types::{ExecutionTrade, Order, OrderSide, Portfolio, Position};
+use async_trait::async_trait;
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -121,11 +125,22 @@ impl PortfolioService {
         let mut portfolio = self.get_portfolio(portfolio_id).await?;
 
         // Get all positions
-        let positions = self.get_all_positions(portfolio_id).await?;
+        let mut positions = self.get_all_positions(portfolio_id).await?;
+        let symbols: Vec<String> = positions
+            .iter()
+            .map(|position| position.symbol.clone())
+            .collect();
+        let latest_prices = self.load_latest_market_prices(&symbols).await?;
 
         // Update portfolio with current positions
         portfolio.positions.clear();
-        for position in positions {
+        for mut position in positions.drain(..) {
+            let current_price = latest_prices
+                .get(&position.symbol)
+                .copied()
+                .unwrap_or(position.average_cost);
+            position.update_market_value(current_price);
+
             portfolio
                 .positions
                 .insert(position.symbol.clone(), position);
@@ -139,6 +154,120 @@ impl PortfolioService {
 
     pub async fn list_positions(&self, portfolio_id: &str) -> AppResult<Vec<Position>> {
         self.get_all_positions(portfolio_id).await
+    }
+
+    pub async fn list_trades(
+        &self,
+        strategy_id: Option<&str>,
+        symbol: Option<&str>,
+        limit: i64,
+    ) -> AppResult<Vec<ExecutionTrade>> {
+        let safe_limit = limit.clamp(1, 500);
+
+        let mut query = String::from(
+            "SELECT id, order_id, symbol, side, quantity, price, executed_at, portfolio_id, strategy_id \
+             FROM trades",
+        );
+        let mut where_clauses = Vec::new();
+        let mut bind_index = 1;
+
+        if strategy_id.filter(|value| !value.trim().is_empty()).is_some() {
+            where_clauses.push(format!("strategy_id = ${bind_index}"));
+            bind_index += 1;
+        }
+
+        if symbol.filter(|value| !value.trim().is_empty()).is_some() {
+            where_clauses.push(format!("symbol = ${bind_index}"));
+        }
+
+        if !where_clauses.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&where_clauses.join(" AND "));
+        }
+
+        query.push_str(" ORDER BY executed_at DESC LIMIT ");
+        query.push_str(&safe_limit.to_string());
+
+        let mut sql = sqlx::query_as::<_, ExecutionTradeRow>(&query);
+
+        if let Some(strategy_id) = strategy_id.filter(|value| !value.trim().is_empty()) {
+            sql = sql.bind(strategy_id.trim());
+        }
+
+        if let Some(symbol) = symbol.filter(|value| !value.trim().is_empty()) {
+            sql = sql.bind(symbol.trim());
+        }
+
+        let rows = sql.fetch_all(&self.db_pool).await.map_err(AppError::Database)?;
+        Ok(rows.into_iter().map(ExecutionTrade::from).collect())
+    }
+
+    pub async fn apply_order_fill(
+        &self,
+        portfolio_id: &str,
+        order: &Order,
+        filled_quantity: i64,
+        fill_price: Decimal,
+    ) -> AppResult<Position> {
+        if filled_quantity <= 0 {
+            return Err(AppError::validation("Filled quantity must be positive"));
+        }
+
+        let signed_quantity = match order.side {
+            OrderSide::Buy => filled_quantity,
+            OrderSide::Sell => -filled_quantity,
+        };
+
+        let existing_position = self
+            .get_position(portfolio_id, &order.symbol)
+            .await
+            .unwrap_or_else(|_| Position::new(order.symbol.clone(), 0, Decimal::ZERO));
+
+        let realized_pnl_delta =
+            self.calculate_realized_pnl_delta(&existing_position, signed_quantity, fill_price);
+        let cash_delta = Decimal::from(-signed_quantity) * fill_price;
+
+        self.store_trade_fill(portfolio_id, order, filled_quantity, fill_price)
+            .await?;
+        self.update_portfolio_ledger(portfolio_id, cash_delta, realized_pnl_delta)
+            .await?;
+
+        let mut position = self
+            .update_position(portfolio_id, &order.symbol, signed_quantity, fill_price)
+            .await?;
+        position.update_market_value(fill_price);
+
+        Ok(position)
+    }
+
+    pub async fn get_pnl_history(
+        &self,
+        portfolio_id: &str,
+        days: i64,
+    ) -> AppResult<Vec<PortfolioPnlPoint>> {
+        let safe_days = days.clamp(1, 365);
+
+        let query = r#"
+            SELECT
+                date,
+                SUM(total_pnl) AS total_pnl,
+                SUM(realized_pnl) AS realized_pnl,
+                SUM(unrealized_pnl) AS unrealized_pnl
+            FROM performance_metrics
+            WHERE portfolio_id = $1
+              AND date >= CURRENT_DATE - ($2::int - 1)
+            GROUP BY date
+            ORDER BY date ASC
+        "#;
+
+        let rows = sqlx::query_as::<_, PortfolioPnlPointRow>(query)
+            .bind(portfolio_id)
+            .bind(safe_days as i32)
+            .fetch_all(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(rows.into_iter().map(PortfolioPnlPoint::from).collect())
     }
 
     /// Generate daily report
@@ -211,6 +340,113 @@ impl PortfolioService {
         Ok(positions)
     }
 
+    async fn load_latest_market_prices(
+        &self,
+        symbols: &[String],
+    ) -> AppResult<std::collections::HashMap<String, Decimal>> {
+        if symbols.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let query = r#"
+            SELECT DISTINCT ON (symbol) symbol, price
+            FROM market_data
+            WHERE symbol = ANY($1)
+            ORDER BY symbol, timestamp DESC
+        "#;
+
+        let rows = sqlx::query_as::<_, LatestPriceRow>(query)
+            .bind(symbols)
+            .fetch_all(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.symbol, row.price))
+            .collect())
+    }
+
+    async fn update_portfolio_ledger(
+        &self,
+        portfolio_id: &str,
+        cash_delta: Decimal,
+        realized_pnl_delta: Decimal,
+    ) -> AppResult<()> {
+        let query = r#"
+            UPDATE portfolios
+            SET cash_balance = cash_balance + $1,
+                realized_pnl = realized_pnl + $2,
+                last_updated = NOW()
+            WHERE id = $3
+        "#;
+
+        sqlx::query(query)
+            .bind(cash_delta)
+            .bind(realized_pnl_delta)
+            .bind(portfolio_id)
+            .execute(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(())
+    }
+
+    async fn store_trade_fill(
+        &self,
+        portfolio_id: &str,
+        order: &Order,
+        filled_quantity: i64,
+        fill_price: Decimal,
+    ) -> AppResult<()> {
+        let side = match order.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+
+        let query = r#"
+            INSERT INTO trades (order_id, symbol, side, quantity, price, portfolio_id, strategy_id, executed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        "#;
+
+        sqlx::query(query)
+            .bind(order.id)
+            .bind(&order.symbol)
+            .bind(side)
+            .bind(filled_quantity)
+            .bind(fill_price)
+            .bind(portfolio_id)
+            .bind(&order.strategy_id)
+            .execute(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(())
+    }
+
+    fn calculate_realized_pnl_delta(
+        &self,
+        existing_position: &Position,
+        signed_quantity: i64,
+        fill_price: Decimal,
+    ) -> Decimal {
+        if existing_position.quantity == 0 || signed_quantity == 0 {
+            return Decimal::ZERO;
+        }
+
+        if existing_position.quantity > 0 && signed_quantity < 0 {
+            let closed_quantity = existing_position.quantity.min(signed_quantity.abs());
+            return (fill_price - existing_position.average_cost) * Decimal::from(closed_quantity);
+        }
+
+        if existing_position.quantity < 0 && signed_quantity > 0 {
+            let closed_quantity = existing_position.quantity.abs().min(signed_quantity);
+            return (existing_position.average_cost - fill_price) * Decimal::from(closed_quantity);
+        }
+
+        Decimal::ZERO
+    }
+
     /// Store position in database
     async fn store_position(&self, portfolio_id: &str, position: &Position) -> AppResult<()> {
         let query = r#"
@@ -267,6 +503,19 @@ struct PositionRow {
     last_updated: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ExecutionTradeRow {
+    id: i64,
+    order_id: uuid::Uuid,
+    symbol: String,
+    side: String,
+    quantity: i64,
+    price: Decimal,
+    executed_at: chrono::DateTime<chrono::Utc>,
+    portfolio_id: Option<String>,
+    strategy_id: Option<String>,
+}
+
 impl From<PositionRow> for Position {
     fn from(row: PositionRow) -> Self {
         Position {
@@ -277,6 +526,22 @@ impl From<PositionRow> for Position {
             unrealized_pnl: rust_decimal::Decimal::ZERO,
             realized_pnl: rust_decimal::Decimal::ZERO,
             last_updated: row.last_updated,
+        }
+    }
+}
+
+impl From<ExecutionTradeRow> for ExecutionTrade {
+    fn from(row: ExecutionTradeRow) -> Self {
+        Self {
+            id: row.id,
+            order_id: row.order_id,
+            symbol: row.symbol,
+            side: row.side,
+            quantity: row.quantity,
+            price: row.price,
+            executed_at: row.executed_at,
+            portfolio_id: row.portfolio_id,
+            strategy_id: row.strategy_id,
         }
     }
 }
@@ -305,5 +570,82 @@ impl From<PortfolioRow> for Portfolio {
             realized_pnl: row.realized_pnl,
             last_updated: row.last_updated,
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LatestPriceRow {
+    symbol: String,
+    price: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortfolioPnlPoint {
+    pub date: NaiveDate,
+    pub total_pnl: Decimal,
+    pub realized_pnl: Decimal,
+    pub unrealized_pnl: Decimal,
+}
+
+#[derive(sqlx::FromRow)]
+struct PortfolioPnlPointRow {
+    date: NaiveDate,
+    total_pnl: Decimal,
+    realized_pnl: Decimal,
+    unrealized_pnl: Decimal,
+}
+
+impl From<PortfolioPnlPointRow> for PortfolioPnlPoint {
+    fn from(row: PortfolioPnlPointRow) -> Self {
+        Self {
+            date: row.date,
+            total_pnl: row.total_pnl,
+            realized_pnl: row.realized_pnl,
+            unrealized_pnl: row.unrealized_pnl,
+        }
+    }
+}
+
+pub struct PortfolioExecutionHandler {
+    portfolio_service: Arc<PortfolioService>,
+    execution_service: Arc<ExecutionService>,
+    portfolio_id: String,
+}
+
+impl PortfolioExecutionHandler {
+    pub fn new(
+        portfolio_service: Arc<PortfolioService>,
+        execution_service: Arc<ExecutionService>,
+        portfolio_id: String,
+    ) -> Self {
+        Self {
+            portfolio_service,
+            execution_service,
+            portfolio_id,
+        }
+    }
+}
+
+#[async_trait]
+impl EventHandler for PortfolioExecutionHandler {
+    async fn handle_event(&self, event: &PlatformEvent) -> AppResult<()> {
+        match event {
+            PlatformEvent::OrderFilled {
+                order_id,
+                filled_quantity,
+                fill_price,
+            } => {
+                let order = self.execution_service.get_order(*order_id).await?;
+                self.portfolio_service
+                    .apply_order_fill(&self.portfolio_id, &order, *filled_quantity, *fill_price)
+                    .await?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn interested_events(&self) -> Vec<&'static str> {
+        vec!["order_filled"]
     }
 }

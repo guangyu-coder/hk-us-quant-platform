@@ -110,34 +110,21 @@
 
 ## 🚀 快速开始
 
-### 后端启动
+### 容器化启动
 ```bash
-# 安装Rust依赖并编译
-cargo build
+# 启动完整容器栈
+./scripts/deploy.sh up --build
 
-# 运行后端服务
-cargo run
+# 查看状态
+./scripts/deploy.sh status
 
 # 运行测试
 cargo test
 ```
 
-### 前端启动
-```bash
-# 进入前端目录
-cd frontend
-
-# 安装依赖
-npm install
-
-# 启动开发服务器
-npm run dev
-```
-
 ### 访问应用
-- 前端界面: http://localhost:3000
-- 后端API: http://localhost:8080
-- 健康检查: http://localhost:8080/health
+- 前端界面: http://localhost:3002
+- 健康检查: http://localhost:3002/health
 
 ## 🎯 功能特性
 
@@ -305,46 +292,35 @@ npm run dev
 
 ## 🚀 快速启动
 
-### 开发环境
+### 容器环境
 ```bash
-# 启动开发环境（前后端同时启动，支持热重载）
-./dev.sh
+# 启动完整容器栈
+./scripts/deploy.sh up --build
 
-# 停止开发环境
-./stop-dev.sh
+# 查看状态
+./scripts/deploy.sh status
+
+# 停止容器栈
+./scripts/deploy.sh down
+
+# 停止并删除数据卷
+./scripts/deploy.sh destroy
 ```
 
-### 生产环境
+### 容器生命周期
+
 ```bash
-# 启动生产环境
-./start.sh
+# 启动
+./scripts/deploy.sh up --build
 
-# 停止生产环境
-./stop.sh
-```
+# 停止
+./scripts/deploy.sh down
 
-### 单独启动
+# 删除服务和数据卷
+./scripts/deploy.sh destroy
 
-#### 后端服务
-```bash
-# 开发模式
-cargo run
-
-# 生产模式
-cargo build --release
-cargo run --release
-```
-
-#### 前端服务
-```bash
-cd frontend
-
-# 开发模式
-npm run dev
-
-# 生产模式
-npm run build
-npm start
+# 查看日志
+./scripts/deploy.sh logs
 ```
 
 ## 📱 界面预览
@@ -378,23 +354,13 @@ npm start
 ### 环境变量配置
 ```bash
 # 后端配置 (.env)
-DATABASE_URL=postgresql://postgres:password@localhost:5432/quant_platform
-REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgresql://postgres:password@postgres:5432/quant_platform
+REDIS_URL=redis://redis:6379
 SERVER_PORT=8080
 LOG_LEVEL=info
 
-# 前端配置 (frontend/.env.local)
-NEXT_PUBLIC_API_URL=http://localhost:8080
-NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws
-```
-
-### 数据库设置
-```bash
-# 创建数据库
-createdb quant_platform
-
-# 运行迁移
-psql -d quant_platform -f migrations/001_initial_schema.sql
+# 外部访问入口
+PUBLIC_URL=http://localhost:3002
 ```
 
 ## 🧪 测试

@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::events::{EventBus, PlatformEvent};
 use crate::types::{Order, Portfolio, RiskMetrics};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -36,6 +37,7 @@ impl RiskService {
         // Check order size limits
         if order.quantity > self.max_order_size {
             checks.push(RiskCheck {
+                rule_code: "MAX_ORDER_SIZE".to_string(),
                 check_type: "order_size".to_string(),
                 passed: false,
                 message: format!(
@@ -43,42 +45,57 @@ impl RiskService {
                     order.quantity, self.max_order_size
                 ),
                 severity: RiskSeverity::High,
+                actual_value: Some(order.quantity.to_string()),
+                threshold_value: Some(self.max_order_size.to_string()),
             });
         } else {
             checks.push(RiskCheck {
+                rule_code: "MAX_ORDER_SIZE".to_string(),
                 check_type: "order_size".to_string(),
                 passed: true,
                 message: "Order size within limits".to_string(),
                 severity: RiskSeverity::Low,
+                actual_value: Some(order.quantity.to_string()),
+                threshold_value: Some(self.max_order_size.to_string()),
             });
         }
 
         // Check symbol validity
         if self.is_valid_trading_symbol(&order.symbol).await? {
             checks.push(RiskCheck {
+                rule_code: "TRADABLE_SYMBOL".to_string(),
                 check_type: "symbol_validity".to_string(),
                 passed: true,
                 message: "Symbol is valid for trading".to_string(),
                 severity: RiskSeverity::Low,
+                actual_value: Some(order.symbol.clone()),
+                threshold_value: Some("listed symbol".to_string()),
             });
         } else {
             checks.push(RiskCheck {
+                rule_code: "TRADABLE_SYMBOL".to_string(),
                 check_type: "symbol_validity".to_string(),
                 passed: false,
                 message: format!("Symbol {} is not valid for trading", order.symbol),
                 severity: RiskSeverity::Critical,
+                actual_value: Some(order.symbol.clone()),
+                threshold_value: Some("listed symbol".to_string()),
             });
         }
 
         // Check market hours (placeholder)
         checks.push(RiskCheck {
+            rule_code: "MARKET_HOURS".to_string(),
             check_type: "market_hours".to_string(),
             passed: true,
             message: "Market is open".to_string(),
             severity: RiskSeverity::Low,
+            actual_value: Some("open".to_string()),
+            threshold_value: Some("open session required".to_string()),
         });
 
         // Determine overall result
+        let audit_checks = checks.clone();
         let failed_checks: Vec<&RiskCheck> = checks.iter().filter(|c| !c.passed).collect();
         let has_critical_failures = failed_checks
             .iter()
@@ -112,6 +129,18 @@ impl RiskService {
         if let Err(e) = self.event_bus.publish(event).await {
             warn!("Failed to publish risk check event: {}", e);
         }
+
+        self.store_audit_log(
+            "risk_check_completed",
+            "order",
+            &order.id.to_string(),
+            json!({
+                "status": result.summary().0,
+                "message": result.summary().1,
+                "checks": audit_checks,
+            }),
+        )
+        .await?;
 
         debug!("Risk check completed for order {}: {:?}", order.id, result);
         Ok(result)
@@ -148,6 +177,22 @@ impl RiskService {
             if let Err(e) = self.event_bus.publish(event).await {
                 warn!("Failed to publish risk alert event: {}", e);
             }
+
+            self.store_audit_log(
+                "risk_alert_triggered",
+                "portfolio",
+                &portfolio.id,
+                json!({
+                    "alert_type": "leverage_exceeded",
+                    "message": format!(
+                        "Portfolio leverage {} exceeds limit 3.0",
+                        risk_metrics.leverage
+                    ),
+                    "severity": "HIGH",
+                    "leverage": risk_metrics.leverage,
+                }),
+            )
+            .await?;
         }
 
         Ok(risk_metrics)
@@ -196,6 +241,17 @@ impl RiskService {
 
         // Store alert in database for audit trail
         self.store_risk_alert(alert_type, message, severity).await?;
+        self.store_audit_log(
+            "risk_alert_triggered",
+            "risk",
+            alert_type,
+            json!({
+                "alert_type": alert_type,
+                "message": message,
+                "severity": severity,
+            }),
+        )
+        .await?;
 
         Ok(())
     }
@@ -239,6 +295,85 @@ impl RiskService {
         Ok(())
     }
 
+    async fn store_audit_log(
+        &self,
+        action: &str,
+        resource_type: &str,
+        resource_id: &str,
+        details: serde_json::Value,
+    ) -> AppResult<()> {
+        let query = r#"
+            INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        "#;
+
+        sqlx::query(query)
+            .bind(None::<String>)
+            .bind(action)
+            .bind(resource_type)
+            .bind(resource_id)
+            .bind(details)
+            .bind(chrono::Utc::now())
+            .execute(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(())
+    }
+
+    pub async fn get_risk_limits(&self) -> AppResult<RiskLimitsSnapshot> {
+        let max_leverage = self
+            .load_system_config_decimal("max_leverage")
+            .await?
+            .and_then(|value| value.as_f64())
+            .unwrap_or(3.0);
+        let risk_check_enabled = self
+            .load_system_config_bool("risk_check_enabled")
+            .await?
+            .unwrap_or(true);
+        let paper_trading = self
+            .load_system_config_bool("paper_trading")
+            .await?
+            .unwrap_or(true);
+
+        Ok(RiskLimitsSnapshot {
+            max_order_size: self.max_order_size,
+            max_leverage,
+            max_daily_loss: None,
+            max_portfolio_exposure: None,
+            max_single_stock_weight: None,
+            risk_check_enabled,
+            paper_trading,
+        })
+    }
+
+    async fn load_system_config_value(&self, key: &str) -> AppResult<Option<serde_json::Value>> {
+        let query = r#"
+            SELECT value
+            FROM system_config
+            WHERE key = $1
+        "#;
+
+        let value = sqlx::query_scalar::<_, serde_json::Value>(query)
+            .bind(key)
+            .fetch_optional(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        Ok(value)
+    }
+
+    async fn load_system_config_bool(&self, key: &str) -> AppResult<Option<bool>> {
+        Ok(self
+            .load_system_config_value(key)
+            .await?
+            .and_then(|value| value.as_bool()))
+    }
+
+    async fn load_system_config_decimal(&self, key: &str) -> AppResult<Option<serde_json::Value>> {
+        self.load_system_config_value(key).await
+    }
+
     pub async fn list_alerts(&self, limit: i64, offset: i64) -> AppResult<Vec<RiskAlert>> {
         let query = r#"
             SELECT id, alert_type, message, severity, created_at
@@ -268,8 +403,19 @@ pub struct RiskAlert {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskLimitsSnapshot {
+    pub max_order_size: i64,
+    pub max_leverage: f64,
+    pub max_daily_loss: Option<rust_decimal::Decimal>,
+    pub max_portfolio_exposure: Option<rust_decimal::Decimal>,
+    pub max_single_stock_weight: Option<f64>,
+    pub risk_check_enabled: bool,
+    pub paper_trading: bool,
+}
+
 /// Risk check result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RiskCheckResult {
     Passed {
         checks: Vec<RiskCheck>,
@@ -295,19 +441,30 @@ impl RiskCheckResult {
     pub fn is_rejected(&self) -> bool {
         matches!(self, RiskCheckResult::Rejected { .. })
     }
+
+    pub fn summary(&self) -> (&'static str, Option<&str>) {
+        match self {
+            RiskCheckResult::Passed { .. } => ("passed", None),
+            RiskCheckResult::Warning { message, .. } => ("warning", Some(message.as_str())),
+            RiskCheckResult::Rejected { reason, .. } => ("rejected", Some(reason.as_str())),
+        }
+    }
 }
 
 /// Individual risk check
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskCheck {
+    pub rule_code: String,
     pub check_type: String,
     pub passed: bool,
     pub message: String,
     pub severity: RiskSeverity,
+    pub actual_value: Option<String>,
+    pub threshold_value: Option<String>,
 }
 
 /// Risk severity levels
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RiskSeverity {
     Low,
     Medium,
@@ -322,4 +479,37 @@ pub struct VaRResult {
     pub var_1d: rust_decimal::Decimal,
     pub var_10d: rust_decimal::Decimal,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn risk_check_summary_preserves_structured_fields() {
+        let check = RiskCheck {
+            rule_code: "MAX_ORDER_SIZE".to_string(),
+            check_type: "order_size".to_string(),
+            passed: false,
+            message: "Order size 200 exceeds maximum 100".to_string(),
+            severity: RiskSeverity::High,
+            actual_value: Some("200".to_string()),
+            threshold_value: Some("100".to_string()),
+        };
+
+        let result = RiskCheckResult::Warning {
+            message: "Some risk checks failed but order can proceed".to_string(),
+            checks: vec![check.clone()],
+        };
+
+        let (status, message) = result.summary();
+        assert_eq!(status, "warning");
+        assert_eq!(
+            message,
+            Some("Some risk checks failed but order can proceed")
+        );
+        assert_eq!(check.rule_code, "MAX_ORDER_SIZE");
+        assert_eq!(check.actual_value.as_deref(), Some("200"));
+        assert_eq!(check.threshold_value.as_deref(), Some("100"));
+    }
 }

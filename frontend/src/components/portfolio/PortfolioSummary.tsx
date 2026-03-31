@@ -2,6 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { portfolioApi } from '@/lib/api';
+import { formatMarketPrice, formatPortfolioAmount, formatSignedMarketPrice } from '@/lib/market';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884D8'];
@@ -13,16 +14,10 @@ export function PortfolioSummary() {
     refetchInterval: 10000, // 每10秒刷新一次
   });
 
-  // 模拟持仓数据
-  const mockPositions = {
-    'AAPL': { symbol: 'AAPL', quantity: 100, market_value: 15000, unrealized_pnl: 500 },
-    'GOOGL': { symbol: 'GOOGL', quantity: 50, market_value: 12000, unrealized_pnl: -200 },
-    'MSFT': { symbol: 'MSFT', quantity: 80, market_value: 10000, unrealized_pnl: 300 },
-    'TSLA': { symbol: 'TSLA', quantity: 30, market_value: 8000, unrealized_pnl: -100 },
-  };
-
-  const positions = error ? mockPositions : (portfolio?.positions || {});
+  const positions = portfolio?.positions || {};
   const positionArray = Object.values(positions);
+  const baseCurrency = portfolio?.base_currency ?? 'USD';
+  const isMixedCurrency = baseCurrency === 'MIXED';
 
   // 准备饼图数据
   const pieData = positionArray.map((position, index) => ({
@@ -50,6 +45,11 @@ export function PortfolioSummary() {
   return (
     <div className="bg-white p-6 rounded-lg shadow">
       <h3 className="text-lg font-medium text-gray-900 mb-4">投资组合</h3>
+      {isMixedCurrency && (
+        <div className="mb-4 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          当前组合包含多币种持仓，未做汇率折算，以下金额仅作原币种展示。
+        </div>
+      )}
       
       {positionArray.length > 0 ? (
         <>
@@ -70,7 +70,7 @@ export function PortfolioSummary() {
                     <Cell key={`cell-${index}`} fill={entry.color} />
                   ))}
                 </Pie>
-                <Tooltip formatter={(value) => [`¥${Number(value).toLocaleString()}`, '市值']} />
+                <Tooltip formatter={(value) => [formatPortfolioAmount(Number(value), { currency: baseCurrency }), '市值']} />
               </PieChart>
             </ResponsiveContainer>
           </div>
@@ -86,13 +86,12 @@ export function PortfolioSummary() {
                 </div>
                 <div className="text-right">
                   <div className="font-medium text-gray-900">
-                    ¥{position.market_value.toLocaleString()}
+                    {formatPortfolioAmount(position.market_value, { currency: baseCurrency })}
                   </div>
                   <div className={`text-sm ${
                     position.unrealized_pnl >= 0 ? 'text-green-600' : 'text-red-600'
                   }`}>
-                    {position.unrealized_pnl >= 0 ? '+' : ''}
-                    ¥{position.unrealized_pnl.toLocaleString()}
+                    {formatSignedMarketPrice(position.unrealized_pnl, { symbol: position.symbol, currency: baseCurrency })}
                   </div>
                 </div>
               </div>
@@ -106,8 +105,8 @@ export function PortfolioSummary() {
       )}
 
       {error && (
-        <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded text-sm text-yellow-800">
-          连接服务器失败，显示模拟数据
+        <div className="mt-4 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          组合数据暂时不可用，当前不再回退模拟持仓，请检查后端服务或数据库连接。
         </div>
       )}
     </div>

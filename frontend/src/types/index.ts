@@ -2,8 +2,10 @@
 export interface MarketData {
   symbol: string;
   timestamp: string;
-  price: number;
-  volume: number;
+  price?: number;
+  volume?: number;
+  currency?: string;
+  exchange?: string;
   change?: number;
   change_percent?: number;
   previous_close?: number;
@@ -14,6 +16,45 @@ export interface MarketData {
   ask_price?: number;
   bid_size?: number;
   ask_size?: number;
+  data_source?: string;
+}
+
+export interface MarketDataMeta {
+  status: 'live' | 'degraded' | 'error';
+  source: string;
+  fallback_used: boolean;
+  is_stale: boolean;
+  degraded: boolean;
+  requested_symbol: string;
+  normalized_symbol: string;
+  interval?: string;
+  message?: string | null;
+}
+
+export interface MarketQuoteResult {
+  success: boolean;
+  data: Partial<MarketData> | null;
+  meta: MarketDataMeta;
+  error?: string | null;
+}
+
+export interface MarketHistoryBar {
+  timestamp: string;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  price?: number;
+  volume?: number;
+  data_source?: string;
+  degraded?: boolean;
+}
+
+export interface MarketHistoryResult {
+  success: boolean;
+  data: MarketHistoryBar[];
+  meta: MarketDataMeta;
+  error?: string | null;
 }
 
 // 交易信号类型
@@ -53,7 +94,10 @@ export interface Order {
   side: OrderSide;
   quantity: number;
   price?: number;
+  stop_price?: number;
   order_type: OrderType;
+  time_in_force?: string;
+  extended_hours?: boolean;
   status: OrderStatus;
   strategy_id?: string;
   created_at: string;
@@ -62,9 +106,81 @@ export interface Order {
   average_fill_price?: number;
 }
 
+export interface ExecutionTrade {
+  id: number;
+  order_id: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  price: number;
+  executed_at: string;
+  portfolio_id?: string | null;
+  strategy_id?: string | null;
+}
+
+export interface RiskCheckItem {
+  rule_code: string;
+  check_type: string;
+  passed: boolean;
+  message: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  actual_value?: string | null;
+  threshold_value?: string | null;
+}
+
+export interface OrderRiskCheckResult {
+  status: 'passed' | 'warning' | 'rejected';
+  message?: string | null;
+  checks: RiskCheckItem[];
+}
+
+export interface CreateOrderResult {
+  accepted: boolean;
+  order?: Order;
+  order_preview?: Partial<Order>;
+  risk_check?: OrderRiskCheckResult;
+}
+
+export interface PaperSimulationItem {
+  order_id: string;
+  symbol: string;
+  status_before: string;
+  status_after: string;
+  action: 'filled' | 'partially_filled' | 'submitted' | 'unchanged' | 'unsupported';
+  detail: string;
+  market_price?: number | null;
+  fill_price?: number | null;
+}
+
+export interface PaperSimulationResult {
+  processed: number;
+  filled: number;
+  partially_filled: number;
+  submitted: number;
+  untouched: number;
+  unsupported: number;
+  results: PaperSimulationItem[];
+}
+
+export interface OrderAuditEntry {
+  id: number;
+  user_id?: string | null;
+  action: string;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  details: Record<string, any>;
+  created_at: string;
+}
+
+export interface OrderAuditTrail {
+  order_id: string;
+  entries: OrderAuditEntry[];
+}
+
 // 持仓类型
 export interface Position {
   symbol: string;
+  currency?: string;
   quantity: number;
   average_cost: number;
   market_value: number;
@@ -77,6 +193,7 @@ export interface Position {
 export interface Portfolio {
   id: string;
   name: string;
+  base_currency?: string;
   positions: Record<string, Position>;
   cash_balance: number;
   total_value: number;
@@ -85,10 +202,28 @@ export interface Portfolio {
   last_updated: string;
 }
 
+export interface PortfolioPnLPoint {
+  date: string;
+  total_pnl: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+}
+
+export interface PortfolioPnLReport {
+  portfolio_id: string;
+  date: string;
+  total_value: number;
+  cash_balance: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  generated_at: string;
+}
+
 // 策略配置类型
 export interface StrategyConfig {
   id: string;
   name: string;
+  display_name?: string;
   description?: string;
   parameters: Record<string, any>;
   risk_limits: RiskLimits;
@@ -106,6 +241,7 @@ export interface RiskLimits {
 
 // 风险指标类型
 export interface RiskMetrics {
+  base_currency?: string;
   portfolio_value: number;
   total_exposure: number;
   leverage: number;
@@ -115,9 +251,34 @@ export interface RiskMetrics {
   calculated_at: string;
 }
 
+export interface RiskLimitsSnapshot {
+  max_order_size: number;
+  max_leverage: number;
+  max_daily_loss?: number | null;
+  max_portfolio_exposure?: number | null;
+  max_single_stock_weight?: number | null;
+  risk_check_enabled: boolean;
+  paper_trading: boolean;
+}
+
+export interface RiskAlert {
+  id: number;
+  alert_type: string;
+  message: string;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  created_at: string;
+}
+
 // 回测结果类型
 export interface BacktestResult {
+  run_id?: string;
   strategy_id: string;
+  strategy_name?: string;
+  symbol?: string;
+  timeframe?: string;
+  parameters?: Record<string, any>;
+  trades?: BacktestTrade[];
+  equity_curve?: BacktestEquityPoint[];
   start_date: string;
   end_date: string;
   initial_capital: number;
@@ -129,6 +290,25 @@ export interface BacktestResult {
   win_rate: number;
   total_trades: number;
   performance_metrics: PerformanceMetrics;
+  created_at?: string;
+}
+
+export interface BacktestTrade {
+  timestamp: string;
+  side: string;
+  quantity: number;
+  signal_price: number;
+  execution_price: number;
+  fees: number;
+  pnl?: number | null;
+}
+
+export interface BacktestEquityPoint {
+  timestamp: string;
+  equity: number;
+  cash: number;
+  position_quantity: number;
+  market_price: number;
 }
 
 export interface PerformanceMetrics {
