@@ -203,10 +203,13 @@ impl StrategyService {
             .await?;
 
         if historical_data.len() < 20 {
-            return Err(AppError::strategy(format!(
-                "Not enough historical data to run backtest for {}",
-                strategy_id
-            )));
+            return Err(build_historical_data_insufficient_error(
+                &symbol,
+                &timeframe,
+                start,
+                end,
+                historical_data.len(),
+            ));
         }
 
         let result = simulate_backtest(strategy_id, &config, historical_data, initial_capital)?;
@@ -386,9 +389,24 @@ impl StrategyService {
         }
 
         let yahoo_client = crate::market_data::yahoo_finance::YahooFinanceClient::new();
-        yahoo_client
+        let bars = yahoo_client
             .get_historical_bars(symbol, start, end, timeframe)
             .await
+            .map_err(|error| {
+                classify_backtest_data_load_error(symbol, timeframe, start, end, error)
+            })?;
+
+        if bars.len() < 20 {
+            return Err(build_historical_data_insufficient_error(
+                symbol,
+                timeframe,
+                start,
+                end,
+                bars.len(),
+            ));
+        }
+
+        Ok(bars)
     }
 
     async fn store_backtest_run(
@@ -952,6 +970,45 @@ fn attach_strategy_context_to_backtest_result(
     result.parameters = Some(config.parameters.clone());
     result.created_at = Some(Utc::now());
     result
+}
+
+fn build_historical_data_insufficient_error(
+    symbol: &str,
+    timeframe: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    points: usize,
+) -> AppError {
+    AppError::historical_data_insufficient(format!(
+        "Historical data insufficient for {symbol} ({timeframe}) between {} and {}. Need at least 20 bars, found {points}.",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d"),
+    ))
+}
+
+fn classify_backtest_data_load_error(
+    symbol: &str,
+    timeframe: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    error: AppError,
+) -> AppError {
+    let message = error.to_string();
+    let lowercase = message.to_ascii_lowercase();
+
+    if lowercase.contains("no data")
+        || lowercase.contains("no timestamps")
+        || lowercase.contains("no quote data")
+        || lowercase.contains("yahoo finance error: no data")
+    {
+        return build_historical_data_insufficient_error(symbol, timeframe, start, end, 0);
+    }
+
+    AppError::data_source_failure(format!(
+        "Failed to load backtest data for {symbol} ({timeframe}) between {} and {}: {message}",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d"),
+    ))
 }
 
 fn normalize_display_name(
@@ -1930,5 +1987,41 @@ mod tests {
 
         assert_eq!(snapshot.symbol.as_deref(), Some("AAPL"));
         assert_eq!(snapshot.timeframe.as_deref(), Some("1d"));
+    }
+
+    #[test]
+    fn classify_backtest_data_load_error_marks_missing_history_as_insufficient() {
+        let start = Utc::now() - chrono::Duration::days(30);
+        let end = Utc::now();
+
+        let error = classify_backtest_data_load_error(
+            "AAPL",
+            "1d",
+            start,
+            end,
+            AppError::BrokerApi("No data from Yahoo Finance".to_string()),
+        );
+
+        assert!(matches!(error, AppError::HistoricalDataInsufficient { .. }));
+        assert!(error.to_string().contains("Need at least 20 bars, found 0"));
+    }
+
+    #[test]
+    fn classify_backtest_data_load_error_marks_transport_failure_as_data_source_failure() {
+        let start = Utc::now() - chrono::Duration::days(30);
+        let end = Utc::now();
+
+        let error = classify_backtest_data_load_error(
+            "AAPL",
+            "1d",
+            start,
+            end,
+            AppError::BrokerApi("Yahoo Finance request failed: timeout".to_string()),
+        );
+
+        assert!(matches!(error, AppError::DataSourceFailure { .. }));
+        assert!(error
+            .to_string()
+            .contains("Failed to load backtest data for AAPL (1d)"));
     }
 }

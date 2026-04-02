@@ -877,8 +877,9 @@ async fn run_backtest(
     Path(strategy_id): Path<String>,
     Json(req): Json<BacktestRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let start = parse_datetime(&req.start_date)?;
-    let end = parse_datetime(&req.end_date)?;
+    let start = parse_backtest_datetime(&req.start_date)?;
+    let end = parse_backtest_datetime(&req.end_date)?;
+    validate_backtest_date_range(start, end)?;
     let result = state
         .strategy_service
         .run_backtest(&strategy_id, start, end)
@@ -1321,6 +1322,24 @@ fn parse_datetime(input: &str) -> Result<DateTime<Utc>, AppError> {
     }
 
     Err(AppError::validation("Invalid datetime format"))
+}
+
+fn parse_backtest_datetime(input: &str) -> Result<DateTime<Utc>, AppError> {
+    parse_datetime(input).map_err(|_| {
+        AppError::invalid_backtest_parameters(
+            "Invalid backtest date format. Use YYYY-MM-DD or RFC3339.",
+        )
+    })
+}
+
+fn validate_backtest_date_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<(), AppError> {
+    if end < start {
+        return Err(AppError::invalid_backtest_parameters(
+            "Invalid backtest date range: end_date must be on or after start_date.",
+        ));
+    }
+
+    Ok(())
 }
 
 fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
@@ -1936,8 +1955,8 @@ mod http_e2e_tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use http_body_util::BodyExt;
-    use sqlx::PgPool;
     use serde_json::Value;
+    use sqlx::PgPool;
     use std::env;
     use tower::ServiceExt;
 
@@ -1948,6 +1967,39 @@ mod http_e2e_tests {
         assert_eq!(normalize_history_interval(Some("1week")), "1wk");
         assert_eq!(normalize_history_interval(Some("1month")), "1mo");
         assert_eq!(normalize_history_interval(Some("invalid")), "1d");
+    }
+
+    #[test]
+    fn parse_datetime_keeps_generic_validation_message() {
+        let error = parse_datetime("2026/04/01").expect_err("invalid date format should fail");
+        assert_eq!(
+            error.to_string(),
+            "Validation error: Invalid datetime format"
+        );
+    }
+
+    #[test]
+    fn parse_backtest_datetime_uses_backtest_specific_validation_message() {
+        let error =
+            parse_backtest_datetime("2026/04/01").expect_err("invalid backtest date should fail");
+        assert_eq!(
+            error.to_string(),
+            "Invalid backtest date format. Use YYYY-MM-DD or RFC3339."
+        );
+    }
+
+    #[test]
+    fn validate_backtest_date_range_rejects_end_before_start() {
+        let start = parse_backtest_datetime("2026-04-02").expect("start date should parse");
+        let end = parse_backtest_datetime("2026-04-01").expect("end date should parse");
+
+        let error = validate_backtest_date_range(start, end)
+            .expect_err("backtest date range should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid backtest date range: end_date must be on or after start_date."
+        );
     }
 
     #[test]

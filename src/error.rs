@@ -24,6 +24,9 @@ pub enum AppError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    #[error("{message}")]
+    InvalidBacktestParameters { message: String },
+
     #[error("Not found: {resource}")]
     NotFound { resource: String },
 
@@ -44,6 +47,12 @@ pub enum AppError {
 
     #[error("Market data error: {message}")]
     MarketData { message: String },
+
+    #[error("{message}")]
+    HistoricalDataInsufficient { message: String },
+
+    #[error("{message}")]
+    DataSourceFailure { message: String },
 
     #[error("Strategy error: {message}")]
     Strategy { message: String },
@@ -90,6 +99,13 @@ impl AppError {
         }
     }
 
+    /// Create an invalid backtest parameter error
+    pub fn invalid_backtest_parameters(message: impl Into<String>) -> Self {
+        Self::InvalidBacktestParameters {
+            message: message.into(),
+        }
+    }
+
     /// Create an internal error
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
@@ -107,6 +123,20 @@ impl AppError {
     /// Create a market data error
     pub fn market_data(message: impl Into<String>) -> Self {
         Self::MarketData {
+            message: message.into(),
+        }
+    }
+
+    /// Create a historical data insufficient error
+    pub fn historical_data_insufficient(message: impl Into<String>) -> Self {
+        Self::HistoricalDataInsufficient {
+            message: message.into(),
+        }
+    }
+
+    /// Create a data source failure error
+    pub fn data_source_failure(message: impl Into<String>) -> Self {
+        Self::DataSourceFailure {
             message: message.into(),
         }
     }
@@ -154,6 +184,7 @@ impl AppError {
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Serialization(_) => StatusCode::BAD_REQUEST,
             AppError::Validation { .. } => StatusCode::BAD_REQUEST,
+            AppError::InvalidBacktestParameters { .. } => StatusCode::BAD_REQUEST,
             AppError::NotFound { .. } => StatusCode::NOT_FOUND,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden => StatusCode::FORBIDDEN,
@@ -161,6 +192,8 @@ impl AppError {
             AppError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             AppError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             AppError::MarketData { .. } => StatusCode::BAD_GATEWAY,
+            AppError::HistoricalDataInsufficient { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            AppError::DataSourceFailure { .. } => StatusCode::BAD_GATEWAY,
             AppError::Strategy { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Execution { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Portfolio { .. } => StatusCode::UNPROCESSABLE_ENTITY,
@@ -179,6 +212,7 @@ impl AppError {
             AppError::Config(_) => "configuration",
             AppError::Serialization(_) => "serialization",
             AppError::Validation { .. } => "validation",
+            AppError::InvalidBacktestParameters { .. } => "invalid_parameters",
             AppError::NotFound { .. } => "not_found",
             AppError::Unauthorized => "unauthorized",
             AppError::Forbidden => "forbidden",
@@ -186,6 +220,8 @@ impl AppError {
             AppError::ServiceUnavailable { .. } => "service_unavailable",
             AppError::RateLimitExceeded => "rate_limit",
             AppError::MarketData { .. } => "market_data",
+            AppError::HistoricalDataInsufficient { .. } => "historical_data_insufficient",
+            AppError::DataSourceFailure { .. } => "data_source_failure",
             AppError::Strategy { .. } => "strategy",
             AppError::Execution { .. } => "execution",
             AppError::Portfolio { .. } => "portfolio",
@@ -274,5 +310,28 @@ impl ValidationResult {
                 reasons.clone()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backtest_error_variants_have_expected_status_and_category() {
+        let invalid = AppError::invalid_backtest_parameters(
+            "Invalid backtest date range: end_date must be on or after start_date.",
+        );
+        assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.category(), "invalid_parameters");
+
+        let insufficient =
+            AppError::historical_data_insufficient("Historical data insufficient for AAPL.");
+        assert_eq!(insufficient.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(insufficient.category(), "historical_data_insufficient");
+
+        let data_source = AppError::data_source_failure("Failed to fetch market data.");
+        assert_eq!(data_source.status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(data_source.category(), "data_source_failure");
     }
 }

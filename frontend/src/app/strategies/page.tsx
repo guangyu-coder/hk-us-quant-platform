@@ -216,6 +216,18 @@ const getPresetFields = (name: string) => {
   return [...COMMON_FIELDS, ...(STRATEGY_FIELDS[presetName] ?? [])];
 };
 
+const formatBacktestSummaryValue = (value: unknown, suffix = '') => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `${value.toLocaleString('zh-CN')}${suffix}`;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    return `${value}${suffix}`;
+  }
+
+  return '-';
+};
+
 export default function StrategiesPage() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [showEditForm, setShowEditForm] = useState(false);
@@ -1174,7 +1186,7 @@ export default function StrategiesPage() {
 
       {showBacktestModal && selectedStrategy && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white p-6 rounded-lg shadow-lg w-full max-w-md">
+          <div className="bg-white p-6 rounded-lg shadow-lg w-full max-w-lg">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-medium">运行回测</h3>
               <button
@@ -1197,8 +1209,55 @@ export default function StrategiesPage() {
                 </p>
               </div>
 
+              <div className="rounded-md border border-gray-200 bg-gray-50 px-4 py-3">
+                <p className="text-sm font-medium text-gray-900">提交前确认</p>
+                <p className="mt-1 text-xs text-gray-500">
+                  请先核对本次研究条件，确认无误后再运行回测。
+                </p>
+                <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+                  <div>
+                    <dt className="text-xs text-gray-500">策略展示名称</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {getStrategyDisplayName(selectedStrategy)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">标的</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {formatBacktestSummaryValue(selectedStrategy.parameters?.symbol)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">周期</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {formatBacktestSummaryValue(selectedStrategy.parameters?.timeframe)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">初始资金</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {formatBacktestSummaryValue(selectedStrategy.parameters?.initial_capital)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">手续费 / 滑点</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {formatBacktestSummaryValue(selectedStrategy.parameters?.fee_bps, ' bps')}
+                      {' / '}
+                      {formatBacktestSummaryValue(selectedStrategy.parameters?.slippage_bps, ' bps')}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs text-gray-500">回测区间</dt>
+                    <dd className="mt-1 text-sm font-medium text-gray-900">
+                      {backtestParams.start_date || '待填写'} - {backtestParams.end_date || '待填写'}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+
               {backtestError && (
-                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm leading-6 text-red-700 whitespace-pre-wrap">
                   {backtestError}
                 </div>
               )}
