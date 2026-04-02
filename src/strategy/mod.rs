@@ -1862,7 +1862,7 @@ mod tests {
         let result = BacktestResult {
             run_id: None,
             strategy_id: config.id.clone(),
-            strategy_name: None,
+            strategy_name: Some("simple_moving_average".to_string()),
             symbol: None,
             timeframe: None,
             parameters: None,

@@ -3,7 +3,16 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { strategyApi, tradeApi } from '@/lib/api';
-import type { BacktestResult, ExecutionTrade, StrategyConfig } from '@/types';
+import type { BacktestResult, StrategyConfig } from '@/types';
+import {
+  buildBacktestFilterSummary,
+  buildParameterSnapshotSummary,
+  deriveBacktestStrategyName,
+  deriveRunSnapshotName,
+  getNextExpandedRunId,
+  getReferenceTradesForBacktestWindow,
+  hasActiveBacktestFilters,
+} from './report-helpers';
 import { BarChart3, TrendingUp, TrendingDown, Target, Clock, Database } from 'lucide-react';
 import {
   BarChart,
@@ -82,6 +91,23 @@ export default function BacktestPage() {
     [strategies]
   );
 
+  const selectedStrategyName =
+    selectedStrategyId === 'all'
+      ? undefined
+      : strategyOptions.find((option) => option.id === selectedStrategyId)?.name;
+
+  const activeFilterSummary = buildBacktestFilterSummary({
+    selectedStrategyName,
+    strategyNameKeyword: strategyNameFilter,
+    symbol: symbolFilter,
+  });
+
+  const canResetFilters = hasActiveBacktestFilters({
+    selectedStrategyId,
+    strategyNameKeyword: strategyNameFilter,
+    symbol: symbolFilter,
+  });
+
   const getRunKey = (result: BacktestResult, index: number) =>
     result.run_id ??
     `${result.strategy_id}-${result.start_date}-${result.end_date}-${result.created_at ?? index}`;
@@ -113,7 +139,7 @@ export default function BacktestPage() {
   };
 
   const expandRun = (runKey: string) => {
-    setExpandedRunId(runKey);
+    setExpandedRunId((current) => getNextExpandedRunId(current, runKey));
   };
 
   const collapseRun = (runKey: string) => {
@@ -132,39 +158,26 @@ export default function BacktestPage() {
   };
 
   const getBacktestStrategyName = (result: BacktestResult) =>
-    strategyNameById.get(result.strategy_id) ?? result.strategy_name ?? result.strategy_id;
+    deriveBacktestStrategyName(result, strategiesById.get(result.strategy_id));
 
   const getBacktestStrategyType = (result: BacktestResult) =>
     strategiesById.get(result.strategy_id)?.name ?? '-';
 
-  const getRealTradesForRun = (result: BacktestResult) =>
-    executionTrades.filter((trade: ExecutionTrade) => {
-      const strategy = strategiesById.get(result.strategy_id);
-      const candidateIds = new Set(
-        [
-          result.strategy_id,
-          result.strategy_name,
-          strategy?.id,
-          strategy?.name,
-          strategy?.display_name,
-        ]
-          .filter((value): value is string => Boolean(value))
-          .map((value) => value.toLowerCase())
-      );
+  const getRunSnapshotName = (result: BacktestResult) =>
+    deriveRunSnapshotName(result, strategiesById.get(result.strategy_id));
 
-      if (!trade.strategy_id || !candidateIds.has(trade.strategy_id.toLowerCase())) {
-        return false;
-      }
+  const getReferenceTradesForRun = (result: BacktestResult) =>
+    getReferenceTradesForBacktestWindow(
+      result,
+      executionTrades,
+      strategiesById.get(result.strategy_id)
+    );
 
-      if (result.symbol && trade.symbol !== result.symbol) {
-        return false;
-      }
-
-      const executedAt = new Date(trade.executed_at).getTime();
-      const start = new Date(result.start_date).getTime();
-      const end = new Date(result.end_date).getTime();
-      return executedAt >= start && executedAt <= end;
-    });
+  const resetFilters = () => {
+    setSelectedStrategyId('all');
+    setStrategyNameFilter('');
+    setSymbolFilter('');
+  };
 
   return (
     <div className="p-6 space-y-6">
@@ -220,10 +233,24 @@ export default function BacktestPage() {
           />
         </div>
         <div className="flex items-end">
-          <div className="w-full rounded-md bg-gray-50 px-3 py-2 text-sm text-gray-600">
-            当前结果 {filteredBacktestResults.length} 条
+          <div className="flex w-full items-center gap-2">
+            <div className="flex-1 rounded-md bg-gray-50 px-3 py-2 text-sm text-gray-600">
+              当前结果 {filteredBacktestResults.length} 条
+            </div>
+            <button
+              type="button"
+              onClick={resetFilters}
+              disabled={!canResetFilters}
+              className="rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              重置全部筛选
+            </button>
           </div>
         </div>
+      </div>
+
+      <div className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600">
+        <span className="font-medium text-gray-900">当前筛选:</span> {activeFilterSummary}
       </div>
 
       {resultsLoading ? (
@@ -289,9 +316,7 @@ export default function BacktestPage() {
                 <div className="flex justify-end">
                   <button
                     type="button"
-                    onClick={() =>
-                      expandedRunId === runKey ? collapseRun(runKey) : expandRun(runKey)
-                    }
+                    onClick={() => (expandedRunId === runKey ? collapseRun(runKey) : expandRun(runKey))}
                     className="rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
                     aria-expanded={expandedRunId === runKey}
                   >
@@ -455,6 +480,14 @@ export default function BacktestPage() {
                               {getBacktestStrategyName(result)}
                             </span>
                           </div>
+                          {getRunSnapshotName(result) && (
+                            <div className="flex items-center justify-between rounded bg-amber-50 p-3">
+                              <span className="text-sm text-amber-800">运行时名称</span>
+                              <span className="text-sm font-medium text-amber-900">
+                                {getRunSnapshotName(result)}
+                              </span>
+                            </div>
+                          )}
                           <div className="flex items-center justify-between rounded bg-gray-50 p-3">
                             <span className="text-sm text-gray-700">策略类型</span>
                             <span className="font-mono text-sm text-gray-900">
@@ -471,11 +504,46 @@ export default function BacktestPage() {
                               {result.created_at ? new Date(result.created_at).toLocaleString('zh-CN') : '-'}
                             </span>
                           </div>
+                          <div className="flex items-center justify-between rounded bg-gray-50 p-3">
+                            <span className="text-sm text-gray-700">回测区间</span>
+                            <span className="text-sm font-medium text-gray-900">
+                              {new Date(result.start_date).toLocaleDateString('zh-CN')} -{' '}
+                              {new Date(result.end_date).toLocaleDateString('zh-CN')}
+                            </span>
+                          </div>
+                          <div className="rounded bg-blue-50 p-3 text-sm text-blue-900">
+                            <p className="font-medium">数据来源说明</p>
+                            <p className="mt-1">
+                              本卡片的收益指标与参数来自已持久化的回测记录；下方“模拟成交明细”来自该次回测生成的
+                              虚拟成交；“参考执行成交”按策略、标的和时间区间匹配真实执行记录，仅用于对照，不代表与该回测运行一一绑定。
+                            </p>
+                          </div>
                         </div>
                       </div>
 
                       <div>
                         <h4 className="mb-3 text-base font-medium text-gray-900">参数快照</h4>
+                        {(() => {
+                          const parameterSummary = buildParameterSnapshotSummary(result.parameters);
+
+                          return (
+                            <div className="mb-3 flex flex-wrap gap-2">
+                              {parameterSummary.map((item) => (
+                                <span
+                                  key={item}
+                                  className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-700"
+                                >
+                                  {item}
+                                </span>
+                              ))}
+                              {parameterSummary.length === 0 && (
+                                <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-500">
+                                  暂无参数摘要
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
                         <pre className="overflow-x-auto rounded bg-gray-950 p-4 text-xs text-gray-100">
                           {JSON.stringify(result.parameters ?? {}, null, 2)}
                         </pre>
@@ -556,13 +624,13 @@ export default function BacktestPage() {
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-4">
                       <div className="mb-3 flex items-center justify-between">
                         <div>
-                          <h4 className="text-base font-medium text-gray-900">真实成交明细</h4>
+                          <h4 className="text-base font-medium text-gray-900">参考执行成交</h4>
                           <p className="mt-1 text-sm text-gray-600">
-                            来自实盘或模拟盘执行记录 `trades` 表，不等同于回测模拟成交。
+                            来自 `trades` 表中按策略、标的和回测区间匹配到的执行记录，用于和回测模拟成交做参考对照。
                           </p>
                         </div>
                         <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
-                          {getRealTradesForRun(result).length} 笔
+                          {getReferenceTradesForRun(result).length} 笔
                         </span>
                       </div>
                       <div className="max-h-72 overflow-auto rounded-lg bg-white">
@@ -578,7 +646,7 @@ export default function BacktestPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {getRealTradesForRun(result).map((trade) => (
+                            {getReferenceTradesForRun(result).map((trade) => (
                               <tr key={trade.id} className="border-t border-emerald-100">
                                 <td className="px-3 py-2 text-gray-600">
                                   {new Date(trade.executed_at).toLocaleString('zh-CN')}
@@ -598,10 +666,12 @@ export default function BacktestPage() {
                                 </td>
                               </tr>
                             ))}
-                            {getRealTradesForRun(result).length === 0 && (
+                            {getReferenceTradesForRun(result).length === 0 && (
                               <tr>
                                 <td colSpan={6} className="px-3 py-6 text-center text-gray-500">
-                                  当前回测区间内暂无真实成交记录
+                                  当前策略、标的与回测区间内没有匹配到参考执行成交。
+                                  <br />
+                                  这通常表示该策略尚未产生可参考的执行记录，或现有执行记录不在该标的与时间范围内。
                                 </td>
                               </tr>
                             )}
