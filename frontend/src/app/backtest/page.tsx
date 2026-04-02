@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { strategyApi, tradeApi } from '@/lib/api';
 import type { BacktestResult, StrategyConfig } from '@/types';
@@ -13,7 +13,24 @@ import {
   getReferenceTradesForBacktestWindow,
   hasActiveBacktestFilters,
 } from './report-helpers';
-import { BarChart3, TrendingUp, TrendingDown, Target, Clock, Database } from 'lucide-react';
+import {
+  buildBacktestExportRows,
+  getBacktestResultKey,
+  serializeBacktestExportRowsToCsv,
+  serializeBacktestExportRowsToJson,
+} from './backtest-efficiency';
+import {
+  BarChart3,
+  CheckSquare,
+  Download,
+  Square,
+  TrendingUp,
+  TrendingDown,
+  Target,
+  Clock,
+  Database,
+  X,
+} from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -32,6 +49,7 @@ export default function BacktestPage() {
   const [strategyNameFilter, setStrategyNameFilter] = useState('');
   const [symbolFilter, setSymbolFilter] = useState('');
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+  const [compareSelection, setCompareSelection] = useState<string[]>([]);
 
   const { data: strategies = [] } = useQuery({
     queryKey: ['strategies'],
@@ -108,10 +126,6 @@ export default function BacktestPage() {
     symbol: symbolFilter,
   });
 
-  const getRunKey = (result: BacktestResult, index: number) =>
-    result.run_id ??
-    `${result.strategy_id}-${result.start_date}-${result.end_date}-${result.created_at ?? index}`;
-
   const filteredBacktestResults = useMemo(() => {
     const keyword = strategyNameFilter.trim().toLowerCase();
     if (!keyword) {
@@ -124,6 +138,38 @@ export default function BacktestPage() {
         .includes(keyword)
     );
   }, [backtestResults, strategyNameById, strategyNameFilter]);
+
+  const filteredResultsByKey = useMemo(
+    () => new Map(filteredBacktestResults.map((result) => [getBacktestResultKey(result), result])),
+    [filteredBacktestResults]
+  );
+
+  const selectedComparisonResults = useMemo(
+    () =>
+      compareSelection
+        .map((runKey) => filteredResultsByKey.get(runKey))
+        .filter((result): result is BacktestResult => Boolean(result)),
+    [compareSelection, filteredResultsByKey]
+  );
+
+  const comparisonStrategyId = selectedComparisonResults[0]?.strategy_id ?? null;
+
+  const comparisonExportRows = useMemo(
+    () =>
+      buildBacktestExportRows(selectedComparisonResults, (result) =>
+        deriveBacktestStrategyName(result, strategiesById.get(result.strategy_id))
+      ),
+    [selectedComparisonResults, strategiesById]
+  );
+
+  useEffect(() => {
+    setCompareSelection((current) => {
+      const next = current.filter((runKey) => filteredResultsByKey.has(runKey));
+      return next.length === current.length && next.every((runKey, index) => runKey === current[index])
+        ? current
+        : next;
+    });
+  }, [filteredResultsByKey]);
 
   const scrollToRunCard = (runKey: string) => {
     if (typeof window === 'undefined') {
@@ -145,6 +191,70 @@ export default function BacktestPage() {
   const collapseRun = (runKey: string) => {
     setExpandedRunId(null);
     scrollToRunCard(runKey);
+  };
+
+  const toggleCompareSelection = (result: BacktestResult) => {
+    const runKey = getBacktestResultKey(result);
+
+    setCompareSelection((current) => {
+      if (current.includes(runKey)) {
+        return current.filter((item) => item !== runKey);
+      }
+
+      const currentStrategyId =
+        current
+          .map((item) => filteredResultsByKey.get(item)?.strategy_id)
+          .find((strategyId): strategyId is string => Boolean(strategyId)) ?? null;
+
+      if (currentStrategyId && currentStrategyId !== result.strategy_id) {
+        return [runKey];
+      }
+
+      return [...current, runKey];
+    });
+  };
+
+  const clearCompareSelection = () => {
+    setCompareSelection([]);
+  };
+
+  const downloadTextFile = (filename: string, content: string, mimeType: string) => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const exportBacktests = (format: 'json' | 'csv', results: BacktestResult[], scope: string) => {
+    const rows = buildBacktestExportRows(results, (result) =>
+      deriveBacktestStrategyName(result, strategiesById.get(result.strategy_id))
+    );
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filenameBase = `backtest-${scope}-${timestamp}`;
+
+    if (format === 'json') {
+      downloadTextFile(
+        `${filenameBase}.json`,
+        serializeBacktestExportRowsToJson(rows),
+        'application/json'
+      );
+      return;
+    }
+
+    downloadTextFile(
+      `${filenameBase}.csv`,
+      serializeBacktestExportRowsToCsv(rows),
+      'text/csv'
+    );
   };
 
   const getReturnColor = (value: number) => {
@@ -253,6 +363,175 @@ export default function BacktestPage() {
         <span className="font-medium text-gray-900">当前筛选:</span> {activeFilterSummary}
       </div>
 
+      <div className="rounded-lg border border-dashed border-sky-200 bg-sky-50/60 p-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-medium text-sky-900">
+              <Target className="h-4 w-4" />
+              研究效率工具
+            </div>
+            <p className="mt-1 text-sm text-sky-800">
+              勾选同一策略的多个回测结果进行对比；切换到其他策略时会自动重置为新的对比集合。
+            </p>
+            <p className="mt-1 text-xs text-sky-700">
+              {selectedComparisonResults.length > 0
+                ? `已选择 ${selectedComparisonResults.length} 条回测结果${comparisonStrategyId ? ` · 策略 ID ${comparisonStrategyId}` : ''}`
+                : '当前没有选中的对比结果。'}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => exportBacktests('json', filteredBacktestResults, 'filtered')}
+              disabled={filteredBacktestResults.length === 0}
+              className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              导出筛选 JSON
+            </button>
+            <button
+              type="button"
+              onClick={() => exportBacktests('csv', filteredBacktestResults, 'filtered')}
+              disabled={filteredBacktestResults.length === 0}
+              className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              导出筛选 CSV
+            </button>
+            <button
+              type="button"
+              onClick={clearCompareSelection}
+              disabled={compareSelection.length === 0}
+              className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <X className="h-4 w-4" />
+              清空对比
+            </button>
+          </div>
+        </div>
+
+        {selectedComparisonResults.length > 0 && comparisonStrategyId && (
+          <div className="mt-4 overflow-x-auto rounded-lg border border-sky-100 bg-white">
+            <table className="min-w-full text-sm">
+              <thead className="bg-sky-50 text-left text-slate-600">
+                <tr>
+                  <th className="sticky left-0 z-10 bg-sky-50 px-4 py-3">指标</th>
+                  {selectedComparisonResults.map((result) => {
+                    const runKey = getBacktestResultKey(result);
+                    return (
+                      <th key={runKey} className="min-w-56 px-4 py-3 align-top">
+                        <div className="space-y-1">
+                          <div className="font-medium text-slate-900">{getBacktestStrategyName(result)}</div>
+                          <div className="text-xs text-slate-500">
+                            {result.symbol || '-'} · {result.timeframe || '-'}
+                          </div>
+                          <div className="text-xs text-slate-500">
+                            {new Date(result.start_date).toLocaleDateString('zh-CN')} -{' '}
+                            {new Date(result.end_date).toLocaleDateString('zh-CN')}
+                          </div>
+                          <div className="font-mono text-xs text-slate-400">
+                            {result.run_id?.slice(0, 8) ?? runKey.slice(0, 12)}
+                          </div>
+                        </div>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  {
+                    label: '总收益率',
+                    format: (value: number) => `${(value * 100).toFixed(2)}%`,
+                    getValue: (result: BacktestResult) => result.total_return,
+                  },
+                  {
+                    label: '年化收益率',
+                    format: (value: number) => `${(value * 100).toFixed(2)}%`,
+                    getValue: (result: BacktestResult) => result.annualized_return,
+                  },
+                  {
+                    label: '最大回撤',
+                    format: (value: number) => `${(value * 100).toFixed(2)}%`,
+                    getValue: (result: BacktestResult) => result.max_drawdown,
+                  },
+                  {
+                    label: 'Sharpe',
+                    format: (value: number) => value.toFixed(2),
+                    getValue: (result: BacktestResult) => result.sharpe_ratio,
+                  },
+                  {
+                    label: '胜率',
+                    format: (value: number) => `${(value * 100).toFixed(1)}%`,
+                    getValue: (result: BacktestResult) => result.win_rate,
+                  },
+                ].map((metric) => {
+                  const values = selectedComparisonResults.map((result) => metric.getValue(result));
+                  const bestValue =
+                    metric.label === '最大回撤' ? Math.min(...values) : Math.max(...values);
+
+                  return (
+                    <tr key={metric.label} className="border-t border-sky-100">
+                      <th className="sticky left-0 z-10 bg-white px-4 py-3 text-left font-medium text-slate-700">
+                        {metric.label}
+                      </th>
+                      {selectedComparisonResults.map((result) => {
+                        const value = metric.getValue(result);
+                        const isBest = value === bestValue;
+                        return (
+                          <td
+                            key={`${metric.label}-${getBacktestResultKey(result)}`}
+                            className={`px-4 py-3 font-medium ${isBest ? 'bg-emerald-50 text-emerald-700' : 'text-slate-900'}`}
+                          >
+                            {metric.format(value)}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-sky-100 px-4 py-3 text-xs text-slate-500">
+              <span>对比结果仅保留同一策略下的回测记录，便于快速比较不同时间段或参数快照。</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadTextFile(
+                      `backtest-comparison-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+                      serializeBacktestExportRowsToJson(comparisonExportRows),
+                      'application/json'
+                    )
+                  }
+                  disabled={comparisonExportRows.length === 0}
+                  className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Download className="h-4 w-4" />
+                  导出对比 JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadTextFile(
+                      `backtest-comparison-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`,
+                      serializeBacktestExportRowsToCsv(comparisonExportRows),
+                      'text/csv'
+                    )
+                  }
+                  disabled={comparisonExportRows.length === 0}
+                  className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Download className="h-4 w-4" />
+                  导出对比 CSV
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {resultsLoading ? (
         <div className="bg-white p-12 rounded-lg shadow">
           <div className="animate-pulse space-y-6">
@@ -263,13 +542,14 @@ export default function BacktestPage() {
         </div>
       ) : (
         <div className="space-y-6">
-          {filteredBacktestResults.map((result: BacktestResult, index) => {
-            const runKey = getRunKey(result, index);
+          {filteredBacktestResults.map((result: BacktestResult) => {
+            const runKey = getBacktestResultKey(result);
+            const isCompareSelected = compareSelection.includes(runKey);
 
             return (
             <div id={`backtest-run-${runKey}`} key={runKey} className="bg-white rounded-lg shadow">
               <div className="px-6 py-4 border-b border-gray-200">
-                <div className="flex items-center justify-between">
+                <div className="flex items-start justify-between gap-4">
                   <div>
                     <h3 className="text-lg font-medium text-gray-900">
                       {getBacktestStrategyName(result)}
@@ -313,7 +593,20 @@ export default function BacktestPage() {
               </div>
 
               <div className="p-6 space-y-6">
-                <div className="flex justify-end">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => toggleCompareSelection(result)}
+                    className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${
+                      isCompareSelected
+                        ? 'border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100'
+                        : 'border-gray-300 text-gray-700 hover:bg-gray-50'
+                    }`}
+                    aria-pressed={isCompareSelected}
+                  >
+                    {isCompareSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                    {isCompareSelected ? '已加入对比' : '加入对比'}
+                  </button>
                   <button
                     type="button"
                     onClick={() => (expandedRunId === runKey ? collapseRun(runKey) : expandRun(runKey))}

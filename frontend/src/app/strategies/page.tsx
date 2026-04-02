@@ -14,6 +14,14 @@ import {
 } from '@/lib/strategy-form';
 import type { RiskLimits, StrategyConfig } from '@/types';
 import { Plus, Play, Trash2, BarChart, Edit, Search, Loader2, RotateCcw } from 'lucide-react';
+import {
+  COMMON_SYMBOL_SHORTCUTS,
+  STRATEGY_TEMPLATE_SHORTCUTS,
+  loadRecentSymbols,
+  normalizeSymbolShortcut,
+  saveRecentSymbols,
+  upsertRecentSymbol,
+} from './strategy-workflow';
 
 type StrategyFieldType = 'text' | 'number' | 'select';
 
@@ -252,9 +260,18 @@ export default function StrategiesPage() {
   const [symbolSearchResults, setSymbolSearchResults] = useState<SearchResult[]>([]);
   const [showSymbolResults, setShowSymbolResults] = useState(false);
   const [symbolSearchLoading, setSymbolSearchLoading] = useState(false);
+  const [recentSymbols, setRecentSymbols] = useState<string[]>([]);
   const symbolSearchRef = useRef<HTMLDivElement | null>(null);
 
   const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    setRecentSymbols(loadRecentSymbols(window.localStorage));
+  }, []);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -313,11 +330,21 @@ export default function StrategiesPage() {
 
   const createStrategyMutation = useMutation({
     mutationFn: strategyApi.createStrategy,
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['strategies'] });
       setShowCreateForm(false);
       setFormError(null);
       setDeleteError(null);
+      const nextSymbol = normalizeSymbolShortcut(String(variables.parameters?.symbol ?? ''));
+      if (nextSymbol) {
+        setRecentSymbols((current) => {
+          const next = upsertRecentSymbol(current, nextSymbol);
+          if (typeof window !== 'undefined') {
+            saveRecentSymbols(window.localStorage, next);
+          }
+          return next;
+        });
+      }
       setStrategyForm(createStrategyFormState());
     },
     onError: (error) => {
@@ -328,11 +355,21 @@ export default function StrategiesPage() {
   const updateStrategyMutation = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Partial<StrategyConfig> }) =>
       strategyApi.updateStrategy(id, data),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['strategies'] });
       setShowEditForm(false);
       setSelectedStrategy(null);
       setFormError(null);
+      const nextSymbol = normalizeSymbolShortcut(String(variables.data.parameters?.symbol ?? ''));
+      if (nextSymbol) {
+        setRecentSymbols((current) => {
+          const next = upsertRecentSymbol(current, nextSymbol);
+          if (typeof window !== 'undefined') {
+            saveRecentSymbols(window.localStorage, next);
+          }
+          return next;
+        });
+      }
       setStrategyForm(createStrategyFormState());
     },
     onError: (error) => {
@@ -390,6 +427,21 @@ export default function StrategiesPage() {
       ...strategyForm,
       name: strategyForm.name,
       display_name: strategyForm.display_name.trim(),
+    });
+  };
+
+  const rememberSymbolShortcut = (symbol: string) => {
+    const normalized = normalizeSymbolShortcut(symbol);
+    if (!normalized) {
+      return;
+    }
+
+    setRecentSymbols((current) => {
+      const next = upsertRecentSymbol(current, normalized);
+      if (typeof window !== 'undefined') {
+        saveRecentSymbols(window.localStorage, next);
+      }
+      return next;
     });
   };
 
@@ -512,11 +564,11 @@ export default function StrategiesPage() {
     setBacktestParams({ start_date: '', end_date: '' });
   };
 
-  const openCreateStrategyForm = () => {
+  const openCreateStrategyForm = (presetName: StrategyPresetKey = 'simple_moving_average') => {
     setFormError(null);
     setDeleteError(null);
     setBacktestError(null);
-    setStrategyForm(createStrategyFormState());
+    setStrategyForm(createStrategyFormState(presetName));
     setShowCreateForm(true);
   };
 
@@ -546,6 +598,28 @@ export default function StrategiesPage() {
       : String(rawValue ?? '');
 
     if (field.key === 'symbol') {
+      const recentShortcutSymbols = recentSymbols.filter((symbol) => symbol !== String(rawValue ?? '').trim().toUpperCase());
+      const commonShortcutSymbols = COMMON_SYMBOL_SHORTCUTS.filter(
+        (symbol) =>
+          symbol !== String(rawValue ?? '').trim().toUpperCase() &&
+          !recentShortcutSymbols.includes(symbol)
+      );
+
+      const applySymbol = (nextSymbol: string) => {
+        const normalizedSymbol = normalizeSymbolShortcut(nextSymbol);
+        setFormError(null);
+        setStrategyForm({
+          ...strategyForm,
+          parameters: {
+            ...strategyForm.parameters,
+            symbol: normalizedSymbol,
+          },
+        });
+        setSymbolSearchQuery(normalizedSymbol);
+        setShowSymbolResults(false);
+        rememberSymbolShortcut(normalizedSymbol);
+      };
+
       return (
         <div key={field.key} ref={symbolSearchRef} className="relative">
           <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -586,6 +660,48 @@ export default function StrategiesPage() {
             {field.helpText ?? '支持输入股票代码或名称搜索，未命中时也可手动输入自定义代码。'}
           </p>
 
+          <div className="mt-3 space-y-3">
+            <div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">
+                最近使用
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {recentShortcutSymbols.length > 0 ? (
+                  recentShortcutSymbols.slice(0, 4).map((symbol) => (
+                    <button
+                      key={symbol}
+                      type="button"
+                      onClick={() => applySymbol(symbol)}
+                      className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-medium text-blue-700 transition hover:border-blue-300 hover:bg-blue-100"
+                    >
+                      {symbol}
+                    </button>
+                  ))
+                ) : (
+                  <span className="text-xs text-gray-400">保存成功后会出现在这里</span>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">
+                常用标的
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {commonShortcutSymbols.slice(0, 6).map((symbol) => (
+                  <button
+                    key={symbol}
+                    type="button"
+                    onClick={() => applySymbol(symbol)}
+                    className="inline-flex items-center rounded-full border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-700 transition hover:border-blue-300 hover:bg-blue-50"
+                  >
+                    {symbol}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           {showSymbolResults && (
             <div className="absolute z-20 mt-2 max-h-72 w-full overflow-auto rounded-lg border border-gray-200 bg-white shadow-lg">
               {symbolSearchResults.length > 0 ? (
@@ -596,15 +712,7 @@ export default function StrategiesPage() {
                       key={`${result.symbol}-${result.exchange}-${result.country}`}
                       type="button"
                       onClick={() => {
-                        setStrategyForm({
-                          ...strategyForm,
-                          parameters: {
-                            ...strategyForm.parameters,
-                            symbol: normalizedSymbol,
-                          },
-                        });
-                        setSymbolSearchQuery(normalizedSymbol);
-                        setShowSymbolResults(false);
+                        applySymbol(normalizedSymbol);
                       }}
                       className="block w-full border-b border-gray-100 px-4 py-3 text-left last:border-b-0 hover:bg-blue-50"
                     >
@@ -706,7 +814,7 @@ export default function StrategiesPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold tracking-tight">策略管理</h1>
         <button
-          onClick={openCreateStrategyForm}
+          onClick={() => openCreateStrategyForm()}
           className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
         >
           <Plus className="h-4 w-4 mr-2" />
@@ -859,7 +967,7 @@ export default function StrategiesPage() {
             <h3 className="text-lg font-medium text-gray-900 mb-4">快速操作</h3>
             <div className="space-y-3">
               <button
-                onClick={openCreateStrategyForm}
+                onClick={() => openCreateStrategyForm()}
                 className="w-full flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
               >
                 <Plus className="h-4 w-4 mr-2" />
@@ -869,6 +977,31 @@ export default function StrategiesPage() {
                 <BarChart className="h-4 w-4 mr-2" />
                 批量回测
               </button>
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-lg shadow">
+            <h3 className="text-lg font-medium text-gray-900 mb-2">模板起步</h3>
+            <p className="mb-4 text-sm text-gray-500">
+              从当前内置 preset 直接开题，适合做研究对比或快速试错。
+            </p>
+            <div className="space-y-3">
+              {STRATEGY_TEMPLATE_SHORTCUTS.map((template) => (
+                <button
+                  key={template.key}
+                  type="button"
+                  onClick={() => openCreateStrategyForm(template.key)}
+                  className="w-full rounded-lg border border-gray-200 bg-gradient-to-r from-white to-slate-50 px-4 py-3 text-left transition hover:border-blue-300 hover:shadow-sm"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-medium text-gray-900">{template.label}</span>
+                    <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-semibold text-blue-700">
+                      立即开始
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-gray-500">{template.description}</p>
+                </button>
+              ))}
             </div>
           </div>
         </div>
