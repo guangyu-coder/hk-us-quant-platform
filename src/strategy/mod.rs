@@ -209,17 +209,8 @@ impl StrategyService {
             )));
         }
 
-        let mut result = simulate_backtest(strategy_id, &config, historical_data, initial_capital)?;
-        result.strategy_name = Some(
-            config
-                .display_name
-                .clone()
-                .unwrap_or_else(|| config.name.clone()),
-        );
-        result.symbol = Some(symbol.clone());
-        result.timeframe = Some(timeframe.clone());
-        result.parameters = Some(config.parameters.clone());
-        result.created_at = Some(Utc::now());
+        let result = simulate_backtest(strategy_id, &config, historical_data, initial_capital)?;
+        let mut result = attach_strategy_context_to_backtest_result(result, &config);
 
         let run_id = self.store_backtest_run(&config, &result).await?;
         result.run_id = Some(run_id);
@@ -562,41 +553,14 @@ impl StrategyService {
     pub async fn delete_strategy(&self, strategy_id: &str) -> AppResult<()> {
         let mut tx = self.db_pool.begin().await.map_err(AppError::Database)?;
 
-        sqlx::query("DELETE FROM trades_archive WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-        sqlx::query("DELETE FROM orders_archive WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-        sqlx::query("DELETE FROM backtest_runs WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-        sqlx::query("DELETE FROM performance_metrics WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-        sqlx::query("DELETE FROM trades WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
-
-        sqlx::query("DELETE FROM orders WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+        for table in strategy_related_cleanup_tables() {
+            let query = format!("DELETE FROM {table} WHERE strategy_id = $1");
+            sqlx::query(&query)
+                .bind(strategy_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+        }
 
         let rows_affected = sqlx::query("DELETE FROM strategies WHERE strategy_id = $1")
             .bind(strategy_id)
@@ -616,6 +580,17 @@ impl StrategyService {
 
         Ok(())
     }
+}
+
+fn strategy_related_cleanup_tables() -> &'static [&'static str] {
+    &[
+        "trades_archive",
+        "orders_archive",
+        "backtest_runs",
+        "performance_metrics",
+        "trades",
+        "orders",
+    ]
 }
 
 #[derive(sqlx::FromRow)]
@@ -950,6 +925,33 @@ fn validate_and_normalize_strategy_config(mut config: StrategyConfig) -> AppResu
     }
 
     Ok(config)
+}
+
+fn attach_strategy_context_to_backtest_result(
+    mut result: BacktestResult,
+    config: &StrategyConfig,
+) -> BacktestResult {
+    result.strategy_name = Some(
+        config
+            .display_name
+            .clone()
+            .unwrap_or_else(|| config.name.clone()),
+    );
+    result.symbol = config
+        .parameters
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| Some("AAPL".to_string()));
+    result.timeframe = config
+        .parameters
+        .get("timeframe")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| Some("1d".to_string()));
+    result.parameters = Some(config.parameters.clone());
+    result.created_at = Some(Utc::now());
+    result
 }
 
 fn normalize_display_name(
@@ -1738,6 +1740,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_strategy_config_preserves_custom_display_name() {
+        let mut config = StrategyConfig::new(
+            "strategy-1".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        config.display_name = Some("My SMA".to_string());
+
+        let validated = validate_and_normalize_strategy_config(config)
+            .expect("custom display name should be accepted");
+
+        assert_eq!(validated.display_name.as_deref(), Some("My SMA"));
+    }
+
+    #[test]
     fn validate_strategy_config_rejects_invalid_period_order() {
         let mut config = StrategyConfig::new(
             "strategy-2".to_string(),
@@ -1810,5 +1826,109 @@ mod tests {
                 .expect("cost-aware backtest should succeed");
 
         assert!(with_costs.final_capital < frictionless.final_capital);
+    }
+
+    #[test]
+    fn strategy_related_cleanup_tables_cover_all_associations() {
+        let tables = strategy_related_cleanup_tables();
+        assert!(tables.contains(&"trades_archive"));
+        assert!(tables.contains(&"orders_archive"));
+        assert!(tables.contains(&"backtest_runs"));
+        assert!(tables.contains(&"performance_metrics"));
+        assert!(tables.contains(&"trades"));
+        assert!(tables.contains(&"orders"));
+    }
+
+    #[test]
+    fn attach_strategy_context_to_backtest_result_uses_current_snapshot() {
+        let mut config = StrategyConfig::new(
+            "strategy-4".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        config.display_name = Some("SMA Alpha".to_string());
+        config
+            .parameters
+            .insert("symbol".to_string(), json!("0700.HK"));
+        config
+            .parameters
+            .insert("timeframe".to_string(), json!("1h"));
+        config
+            .parameters
+            .insert("short_period".to_string(), json!(8));
+        config
+            .parameters
+            .insert("long_period".to_string(), json!(21));
+
+        let result = BacktestResult {
+            run_id: None,
+            strategy_id: config.id.clone(),
+            strategy_name: None,
+            symbol: None,
+            timeframe: None,
+            parameters: None,
+            trades: None,
+            equity_curve: None,
+            start_date: Utc::now(),
+            end_date: Utc::now(),
+            initial_capital: Decimal::new(100000, 0),
+            final_capital: Decimal::new(100000, 0),
+            total_return: 0.0,
+            annualized_return: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            win_rate: 0.0,
+            total_trades: 0,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            created_at: None,
+        };
+
+        let snapshot = attach_strategy_context_to_backtest_result(result, &config);
+
+        assert_eq!(snapshot.strategy_name.as_deref(), Some("SMA Alpha"));
+        assert_eq!(snapshot.symbol.as_deref(), Some("0700.HK"));
+        assert_eq!(snapshot.timeframe.as_deref(), Some("1h"));
+        assert_eq!(
+            snapshot
+                .parameters
+                .as_ref()
+                .and_then(|params| params.get("short_period"))
+                .and_then(|value| value.as_i64()),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn attach_strategy_context_to_backtest_result_falls_back_to_defaults() {
+        let config = StrategyConfig::new(
+            "strategy-5".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        let result = BacktestResult {
+            run_id: None,
+            strategy_id: config.id.clone(),
+            strategy_name: None,
+            symbol: None,
+            timeframe: None,
+            parameters: None,
+            trades: None,
+            equity_curve: None,
+            start_date: Utc::now(),
+            end_date: Utc::now(),
+            initial_capital: Decimal::new(100000, 0),
+            final_capital: Decimal::new(100000, 0),
+            total_return: 0.0,
+            annualized_return: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            win_rate: 0.0,
+            total_trades: 0,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            created_at: None,
+        };
+
+        let snapshot = attach_strategy_context_to_backtest_result(result, &config);
+
+        assert_eq!(snapshot.symbol.as_deref(), Some("AAPL"));
+        assert_eq!(snapshot.timeframe.as_deref(), Some("1d"));
     }
 }

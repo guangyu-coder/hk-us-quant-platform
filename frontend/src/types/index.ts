@@ -350,6 +350,18 @@ export interface ApiResponse<T> {
   };
 }
 
+export interface ApiErrorBody {
+  message: string;
+  category: string;
+  status: number;
+  timestamp: string;
+}
+
+export interface ApiErrorResponse {
+  error?: ApiErrorBody | null;
+  message?: string | null;
+}
+
 // 图表数据类型
 export interface ChartDataPoint {
   timestamp: string;

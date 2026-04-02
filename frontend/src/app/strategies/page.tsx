@@ -2,10 +2,18 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import axios from 'axios';
-import { marketDataApi, strategyApi } from '@/lib/api';
+import { getApiErrorMessage, marketDataApi, strategyApi } from '@/lib/api';
+import {
+  STRATEGY_PRESETS,
+  buildStrategyFormStateFromStrategy,
+  createStrategyFormState,
+  getStrategyDisplayName,
+  normalizeSearchSymbol,
+  updateStrategyFormPreset,
+  validateStrategyForm,
+} from '@/lib/strategy-form';
 import type { RiskLimits, StrategyConfig } from '@/types';
-import { Plus, Play, Trash2, BarChart, Edit, Search, Loader2 } from 'lucide-react';
+import { Plus, Play, Trash2, BarChart, Edit, Search, Loader2, RotateCcw } from 'lucide-react';
 
 type StrategyFieldType = 'text' | 'number' | 'select';
 
@@ -13,6 +21,7 @@ type StrategyField = {
   key: string;
   label: string;
   type: StrategyFieldType;
+  helpText?: string;
   options?: Array<{ label: string; value: string }>;
   min?: number;
   max?: number;
@@ -30,40 +39,19 @@ type SearchResult = {
   instrument_type: string;
 };
 
-const STRATEGY_PRESETS = {
-  simple_moving_average: {
-    label: 'SMA 双均线',
-    description: '短均线上穿长均线买入，下穿卖出。',
-    parameters: { symbol: 'AAPL', timeframe: '1d', initial_capital: 100000, fee_bps: 5, slippage_bps: 2, max_position_fraction: 1, short_period: 5, long_period: 20 },
-  },
-  rsi: {
-    label: 'RSI 反转',
-    description: '超卖买入，超买卖出。',
-    parameters: { symbol: 'AAPL', timeframe: '1d', initial_capital: 100000, fee_bps: 5, slippage_bps: 2, max_position_fraction: 1, period: 14, oversold: 30, overbought: 70 },
-  },
-  macd: {
-    label: 'MACD 趋势',
-    description: '柱状图穿越零轴触发交易。',
-    parameters: { symbol: 'AAPL', timeframe: '1d', initial_capital: 100000, fee_bps: 5, slippage_bps: 2, max_position_fraction: 1, fast_period: 12, slow_period: 26, signal_period: 9 },
-  },
-  bollinger_bands: {
-    label: '布林带均值回归',
-    description: '价格触碰下轨买入，上轨卖出。',
-    parameters: { symbol: 'AAPL', timeframe: '1d', initial_capital: 100000, fee_bps: 5, slippage_bps: 2, max_position_fraction: 1, period: 20, std_dev: 2.0 },
-  },
-  mean_reversion: {
-    label: '均值回归',
-    description: '基于 z-score 偏离度的回归策略。',
-    parameters: { symbol: 'AAPL', timeframe: '1d', initial_capital: 100000, fee_bps: 5, slippage_bps: 2, max_position_fraction: 1, lookback_period: 20, threshold: 2.0 },
-  },
-} as const;
-
 const COMMON_FIELDS: StrategyField[] = [
-  { key: 'symbol', label: '交易标的', type: 'text', placeholder: 'AAPL' },
+  {
+    key: 'symbol',
+    label: '交易标的',
+    type: 'text',
+    placeholder: 'AAPL',
+    helpText: '写入 parameters.symbol，回测和报告都会使用这个标的。',
+  },
   {
     key: 'timeframe',
     label: '周期',
     type: 'select',
+    helpText: '写入 parameters.timeframe，决定历史数据粒度和回测周期。',
     options: [
       { label: '1 分钟', value: '1m' },
       { label: '5 分钟', value: '5m' },
@@ -75,189 +63,158 @@ const COMMON_FIELDS: StrategyField[] = [
       { label: '1 月', value: '1mo' },
     ],
   },
-  { key: 'initial_capital', label: '初始资金', type: 'number', min: 100, step: 1000 },
-  { key: 'fee_bps', label: '手续费(bps)', type: 'number', min: 0, max: 1000, step: 1 },
-  { key: 'slippage_bps', label: '滑点(bps)', type: 'number', min: 0, max: 1000, step: 1 },
-  { key: 'max_position_fraction', label: '最大仓位占比', type: 'number', min: 0.01, max: 1, step: 0.05 },
+  {
+    key: 'initial_capital',
+    label: '初始资金',
+    type: 'number',
+    min: 100,
+    step: 1000,
+    helpText: '回测起始资金，必须大于等于 100。',
+  },
+  {
+    key: 'fee_bps',
+    label: '手续费(bps)',
+    type: 'number',
+    min: 0,
+    max: 1000,
+    step: 1,
+    helpText: '单边手续费，单位 bps，越高越保守。',
+  },
+  {
+    key: 'slippage_bps',
+    label: '滑点(bps)',
+    type: 'number',
+    min: 0,
+    max: 1000,
+    step: 1,
+    helpText: '单边滑点，单位 bps，用于模拟成交偏差。',
+  },
+  {
+    key: 'max_position_fraction',
+    label: '最大仓位占比',
+    type: 'number',
+    min: 0.01,
+    max: 1,
+    step: 0.05,
+    helpText: '单次允许投入的最大资金比例，1 表示可满仓。',
+  },
 ];
 
 const STRATEGY_FIELDS: Record<keyof typeof STRATEGY_PRESETS, StrategyField[]> = {
   simple_moving_average: [
-    { key: 'short_period', label: '短周期', type: 'number', min: 1, step: 1 },
-    { key: 'long_period', label: '长周期', type: 'number', min: 2, step: 1 },
+    {
+      key: 'short_period',
+      label: '短周期',
+      type: 'number',
+      min: 1,
+      step: 1,
+      helpText: '短周期均线长度，必须小于长周期。',
+    },
+    {
+      key: 'long_period',
+      label: '长周期',
+      type: 'number',
+      min: 2,
+      step: 1,
+      helpText: '长周期均线长度，用于与短周期做交叉判断。',
+    },
   ],
   rsi: [
-    { key: 'period', label: 'RSI 周期', type: 'number', min: 2, step: 1 },
-    { key: 'oversold', label: '超卖阈值', type: 'number', min: 0, max: 100, step: 1 },
-    { key: 'overbought', label: '超买阈值', type: 'number', min: 0, max: 100, step: 1 },
+    {
+      key: 'period',
+      label: 'RSI 周期',
+      type: 'number',
+      min: 2,
+      step: 1,
+      helpText: 'RSI 计算窗口，必须大于等于 2。',
+    },
+    {
+      key: 'oversold',
+      label: '超卖阈值',
+      type: 'number',
+      min: 0,
+      max: 100,
+      step: 1,
+      helpText: '低于该值时视为超卖。',
+    },
+    {
+      key: 'overbought',
+      label: '超买阈值',
+      type: 'number',
+      min: 0,
+      max: 100,
+      step: 1,
+      helpText: '高于该值时视为超买。',
+    },
   ],
   macd: [
-    { key: 'fast_period', label: '快线周期', type: 'number', min: 1, step: 1 },
-    { key: 'slow_period', label: '慢线周期', type: 'number', min: 2, step: 1 },
-    { key: 'signal_period', label: '信号线周期', type: 'number', min: 1, step: 1 },
+    {
+      key: 'fast_period',
+      label: '快线周期',
+      type: 'number',
+      min: 1,
+      step: 1,
+      helpText: 'MACD 快线长度，必须小于慢线周期。',
+    },
+    {
+      key: 'slow_period',
+      label: '慢线周期',
+      type: 'number',
+      min: 2,
+      step: 1,
+      helpText: 'MACD 慢线长度。',
+    },
+    {
+      key: 'signal_period',
+      label: '信号线周期',
+      type: 'number',
+      min: 1,
+      step: 1,
+      helpText: 'MACD 信号线长度，必须小于慢线周期。',
+    },
   ],
   bollinger_bands: [
-    { key: 'period', label: '布林周期', type: 'number', min: 2, step: 1 },
-    { key: 'std_dev', label: '标准差倍数', type: 'number', min: 0.1, step: 0.1 },
+    {
+      key: 'period',
+      label: '布林周期',
+      type: 'number',
+      min: 2,
+      step: 1,
+      helpText: '布林带计算窗口，必须大于等于 2。',
+    },
+    {
+      key: 'std_dev',
+      label: '标准差倍数',
+      type: 'number',
+      min: 0.1,
+      step: 0.1,
+      helpText: '标准差倍率，越大越宽松。',
+    },
   ],
   mean_reversion: [
-    { key: 'lookback_period', label: '回看周期', type: 'number', min: 2, step: 1 },
-    { key: 'threshold', label: '偏离阈值', type: 'number', min: 0.1, step: 0.1 },
+    {
+      key: 'lookback_period',
+      label: '回看周期',
+      type: 'number',
+      min: 2,
+      step: 1,
+      helpText: '回看窗口，必须大于等于 2。',
+    },
+    {
+      key: 'threshold',
+      label: '偏离阈值',
+      type: 'number',
+      min: 0.1,
+      step: 0.1,
+      helpText: 'z-score 偏离阈值，越大触发越少。',
+    },
   ],
 };
-
-const DEFAULT_STRATEGY_TYPE: StrategyPresetKey = 'simple_moving_average';
-
-const formatStrategyType = (name: string) =>
-  STRATEGY_PRESETS[name as StrategyPresetKey]?.label ?? name;
-
-const normalizeSearchSymbol = (result: SearchResult): string => {
-  const rawSymbol = result.symbol.trim().toUpperCase();
-  const exchange = result.exchange.trim().toUpperCase();
-  const country = result.country.trim().toUpperCase();
-
-  if (rawSymbol.endsWith('.HK')) {
-    return rawSymbol;
-  }
-
-  const isHongKong =
-    country.includes('HONG KONG') ||
-    exchange.includes('HK') ||
-    exchange.includes('HONG KONG');
-
-  if (isHongKong && /^\d+$/.test(rawSymbol)) {
-    const normalizedCode = rawSymbol.length >= 4 ? rawSymbol : rawSymbol.padStart(4, '0');
-    return `${normalizedCode}.HK`;
-  }
-
-  return rawSymbol;
-};
-
-const getStrategyDisplayName = (strategy: Pick<StrategyConfig, 'name' | 'display_name'>) =>
-  strategy.display_name?.trim() || formatStrategyType(strategy.name);
 
 const getPresetFields = (name: string) => {
   const presetName = name as StrategyPresetKey;
   return [...COMMON_FIELDS, ...(STRATEGY_FIELDS[presetName] ?? [])];
 };
-
-const inferStrategyPreset = (
-  strategy: Pick<StrategyConfig, 'name' | 'parameters'>
-): StrategyPresetKey => {
-  const normalizedName = strategy.name.trim().toLowerCase().replace(/[-\s]+/g, '_');
-  if (normalizedName in STRATEGY_PRESETS) {
-    return normalizedName as StrategyPresetKey;
-  }
-
-  const parameters = strategy.parameters ?? {};
-  if ('short_period' in parameters && 'long_period' in parameters) {
-    return 'simple_moving_average';
-  }
-  if ('oversold' in parameters && 'overbought' in parameters) {
-    return 'rsi';
-  }
-  if ('fast_period' in parameters && 'slow_period' in parameters && 'signal_period' in parameters) {
-    return 'macd';
-  }
-  if ('std_dev' in parameters) {
-    return 'bollinger_bands';
-  }
-  if ('lookback_period' in parameters && 'threshold' in parameters) {
-    return 'mean_reversion';
-  }
-
-  return DEFAULT_STRATEGY_TYPE;
-};
-
-const validateStrategyForm = (
-  name: StrategyPresetKey,
-  parameters: Record<string, unknown>
-) => {
-  const symbol = String(parameters.symbol ?? '').trim();
-  const timeframe = String(parameters.timeframe ?? '').trim();
-  const initialCapital = Number(parameters.initial_capital ?? 0);
-
-  if (!symbol) {
-    return '交易标的不能为空';
-  }
-  if (!['1m', '5m', '15m', '30m', '1h', '1d', '1wk', '1mo'].includes(timeframe)) {
-    return '周期必须是 1m / 5m / 15m / 30m / 1h / 1d / 1wk / 1mo';
-  }
-  if (!Number.isFinite(initialCapital) || initialCapital < 100) {
-    return '初始资金必须大于等于 100';
-  }
-  const feeBps = Number(parameters.fee_bps ?? 0);
-  const slippageBps = Number(parameters.slippage_bps ?? 0);
-  const maxPositionFraction = Number(parameters.max_position_fraction ?? 0);
-  if (feeBps < 0 || feeBps > 1000 || slippageBps < 0 || slippageBps > 1000) {
-    return '手续费和滑点必须在 0 到 1000 bps 之间';
-  }
-  if (!Number.isFinite(maxPositionFraction) || maxPositionFraction <= 0 || maxPositionFraction > 1) {
-    return '最大仓位占比必须在 0 到 1 之间';
-  }
-
-  switch (name) {
-    case 'simple_moving_average': {
-      const shortPeriod = Number(parameters.short_period ?? 0);
-      const longPeriod = Number(parameters.long_period ?? 0);
-      if (shortPeriod < 1 || longPeriod < 2 || shortPeriod >= longPeriod) {
-        return '短周期必须小于长周期，且二者都必须大于 0';
-      }
-      return null;
-    }
-    case 'rsi': {
-      const period = Number(parameters.period ?? 0);
-      const oversold = Number(parameters.oversold ?? 0);
-      const overbought = Number(parameters.overbought ?? 0);
-      if (period < 2) {
-        return 'RSI 周期必须大于等于 2';
-      }
-      if (oversold < 0 || overbought > 100 || oversold >= overbought) {
-        return 'RSI 超卖阈值必须小于超买阈值，且范围在 0 到 100 之间';
-      }
-      return null;
-    }
-    case 'macd': {
-      const fastPeriod = Number(parameters.fast_period ?? 0);
-      const slowPeriod = Number(parameters.slow_period ?? 0);
-      const signalPeriod = Number(parameters.signal_period ?? 0);
-      if (fastPeriod < 1 || slowPeriod < 2 || fastPeriod >= slowPeriod) {
-        return 'MACD 快线周期必须小于慢线周期';
-      }
-      if (signalPeriod < 1 || signalPeriod >= slowPeriod) {
-        return 'MACD 信号线周期必须小于慢线周期';
-      }
-      return null;
-    }
-    case 'bollinger_bands': {
-      const period = Number(parameters.period ?? 0);
-      const stdDev = Number(parameters.std_dev ?? 0);
-      if (period < 2 || stdDev <= 0) {
-        return '布林带周期必须大于等于 2，标准差倍数必须大于 0';
-      }
-      return null;
-    }
-    case 'mean_reversion': {
-      const lookback = Number(parameters.lookback_period ?? 0);
-      const threshold = Number(parameters.threshold ?? 0);
-      if (lookback < 2 || threshold <= 0) {
-        return '均值回归回看周期必须大于等于 2，阈值必须大于 0';
-      }
-      return null;
-    }
-  }
-};
-
-const createStrategyFormState = (
-  presetName: StrategyPresetKey = DEFAULT_STRATEGY_TYPE
-) => ({
-  name: presetName,
-  display_name: STRATEGY_PRESETS[presetName].label,
-  description: STRATEGY_PRESETS[presetName].description,
-  parameters: { ...STRATEGY_PRESETS[presetName].parameters },
-  risk_limits: {},
-  is_active: true,
-});
 
 export default function StrategiesPage() {
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -265,6 +222,8 @@ export default function StrategiesPage() {
   const [showBacktestModal, setShowBacktestModal] = useState(false);
   const [selectedStrategy, setSelectedStrategy] = useState<StrategyConfig | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [backtestError, setBacktestError] = useState<string | null>(null);
   const [strategyForm, setStrategyForm] = useState<{
     name: StrategyPresetKey;
     display_name: string;
@@ -346,14 +305,11 @@ export default function StrategiesPage() {
       queryClient.invalidateQueries({ queryKey: ['strategies'] });
       setShowCreateForm(false);
       setFormError(null);
+      setDeleteError(null);
       setStrategyForm(createStrategyFormState());
     },
     onError: (error) => {
-      if (axios.isAxiosError(error)) {
-        setFormError(error.response?.data?.error?.message ?? '创建策略失败');
-        return;
-      }
-      setFormError('创建策略失败');
+      setFormError(getApiErrorMessage(error, '创建策略失败'));
     },
   });
 
@@ -368,11 +324,7 @@ export default function StrategiesPage() {
       setStrategyForm(createStrategyFormState());
     },
     onError: (error) => {
-      if (axios.isAxiosError(error)) {
-        setFormError(error.response?.data?.error?.message ?? '更新策略失败');
-        return;
-      }
-      setFormError('更新策略失败');
+      setFormError(getApiErrorMessage(error, '更新策略失败'));
     },
   });
 
@@ -380,6 +332,10 @@ export default function StrategiesPage() {
     mutationFn: strategyApi.deleteStrategy,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['strategies'] });
+      setDeleteError(null);
+    },
+    onError: (error) => {
+      setDeleteError(getApiErrorMessage(error, '删除策略失败'));
     },
   });
 
@@ -389,12 +345,19 @@ export default function StrategiesPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['backtest-history'] });
       setShowBacktestModal(false);
+      resetBacktestForm();
       alert('回测已完成，结果已写入历史记录');
+    },
+    onError: (error) => {
+      setBacktestError(getApiErrorMessage(error, '回测运行失败'));
     },
   });
 
   const handleCreateStrategy = (e: React.FormEvent) => {
     e.preventDefault();
+    if (createStrategyMutation.isPending) {
+      return;
+    }
 
     const validationError = validateStrategyForm(
       strategyForm.name as keyof typeof STRATEGY_PRESETS,
@@ -419,17 +382,26 @@ export default function StrategiesPage() {
   };
 
   const handleDeleteStrategy = (strategy: StrategyConfig) => {
+    if (deleteStrategyMutation.isPending) {
+      return;
+    }
+
     const strategyName = getStrategyDisplayName(strategy);
     const confirmed = confirm(
       `确定要删除策略“${strategyName}”吗？\n\n此操作会同时删除该策略关联的订单、成交、回测记录和绩效数据，且无法恢复。`
     );
 
     if (confirmed) {
+      setDeleteError(null);
       deleteStrategyMutation.mutate(strategy.id);
     }
   };
 
   const handleToggleStrategy = (strategy: StrategyConfig) => {
+    if (updateStrategyMutation.isPending) {
+      return;
+    }
+
     updateStrategyMutation.mutate({
       id: strategy.id,
       data: { is_active: !strategy.is_active },
@@ -439,26 +411,16 @@ export default function StrategiesPage() {
   const handleEditStrategy = (strategy: StrategyConfig) => {
     setSelectedStrategy(strategy);
     setFormError(null);
-    const presetName = inferStrategyPreset(strategy);
-    const presetParameters = STRATEGY_PRESETS[presetName].parameters;
-
-    setStrategyForm({
-      name: presetName,
-      display_name: strategy.display_name || '',
-      description: strategy.description || '',
-      parameters: {
-        ...presetParameters,
-        ...(strategy.parameters || {}),
-      },
-      risk_limits: strategy.risk_limits || {},
-      is_active: strategy.is_active,
-    });
+    setStrategyForm(buildStrategyFormStateFromStrategy(strategy));
 
     setShowEditForm(true);
   };
 
   const handleUpdateStrategy = (e: React.FormEvent) => {
     e.preventDefault();
+    if (updateStrategyMutation.isPending) {
+      return;
+    }
 
     const validationError = validateStrategyForm(
       strategyForm.name as keyof typeof STRATEGY_PRESETS,
@@ -494,19 +456,56 @@ export default function StrategiesPage() {
   };
 
   const handleRunBacktest = (strategy: StrategyConfig) => {
+    if (runBacktestMutation.isPending) {
+      return;
+    }
+
+    resetBacktestForm();
     setSelectedStrategy(strategy);
     setShowBacktestModal(true);
   };
 
   const handleSubmitBacktest = (e: React.FormEvent) => {
     e.preventDefault();
+    if (runBacktestMutation.isPending) {
+      return;
+    }
+
     if (selectedStrategy) {
+      setBacktestError(null);
       runBacktestMutation.mutate({
         strategyId: selectedStrategy.id,
         startDate: backtestParams.start_date,
         endDate: backtestParams.end_date,
       });
     }
+  };
+
+  const handleResetCreateForm = () => {
+    setFormError(null);
+    setStrategyForm(createStrategyFormState(strategyForm.name));
+  };
+
+  const handleResetEditForm = () => {
+    if (!selectedStrategy) {
+      return;
+    }
+
+    setFormError(null);
+    setStrategyForm(buildStrategyFormStateFromStrategy(selectedStrategy));
+  };
+
+  const resetBacktestForm = () => {
+    setBacktestError(null);
+    setBacktestParams({ start_date: '', end_date: '' });
+  };
+
+  const openCreateStrategyForm = () => {
+    setFormError(null);
+    setDeleteError(null);
+    setBacktestError(null);
+    setStrategyForm(createStrategyFormState());
+    setShowCreateForm(true);
   };
 
   // 确保strategies是数组
@@ -554,6 +553,7 @@ export default function StrategiesPage() {
               }}
               onChange={(e) => {
                 const nextValue = e.target.value.toUpperCase();
+                setFormError(null);
                 setStrategyForm({
                   ...strategyForm,
                   parameters: {
@@ -571,7 +571,7 @@ export default function StrategiesPage() {
             )}
           </div>
           <p className="mt-1 text-xs text-gray-500">
-            支持输入股票代码或名称搜索，未命中时也可手动输入自定义代码。
+            {field.helpText ?? '支持输入股票代码或名称搜索，未命中时也可手动输入自定义代码。'}
           </p>
 
           {showSymbolResults && (
@@ -638,6 +638,7 @@ export default function StrategiesPage() {
                   [field.key]: e.target.value,
                 },
               });
+              setFormError(null);
             }}
             className="w-full rounded-md border border-gray-300 px-3 py-2"
           >
@@ -647,6 +648,9 @@ export default function StrategiesPage() {
               </option>
             ))}
           </select>
+          {field.helpText && (
+            <p className="mt-1 text-xs text-gray-500">{field.helpText}</p>
+          )}
         </div>
       );
     }
@@ -667,6 +671,7 @@ export default function StrategiesPage() {
             const nextValue = field.type === 'number'
               ? (e.target.value === '' ? '' : Number(e.target.value))
               : e.target.value;
+            setFormError(null);
             setStrategyForm({
               ...strategyForm,
               parameters: {
@@ -677,6 +682,9 @@ export default function StrategiesPage() {
           }}
           className="w-full border border-gray-300 rounded-md px-3 py-2"
         />
+        {field.helpText && (
+          <p className="mt-1 text-xs text-gray-500">{field.helpText}</p>
+        )}
       </div>
     );
   };
@@ -686,17 +694,19 @@ export default function StrategiesPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold tracking-tight">策略管理</h1>
         <button
-          onClick={() => {
-            setFormError(null);
-            setStrategyForm(createStrategyFormState());
-            setShowCreateForm(true);
-          }}
+          onClick={openCreateStrategyForm}
           className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
         >
           <Plus className="h-4 w-4 mr-2" />
           新建策略
         </button>
       </div>
+
+      {deleteError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {deleteError}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-6">
@@ -734,6 +744,16 @@ export default function StrategiesPage() {
                           </p>
                         )}
 
+                        <div className="mt-2 text-xs text-gray-500">
+                          <span className="font-medium text-gray-700">name:</span> {strategy.name}
+                          <span className="mx-2">·</span>
+                          <span className="font-medium text-gray-700">display_name:</span> {getStrategyDisplayName(strategy)}
+                          <span className="mx-2">·</span>
+                          <span className="font-medium text-gray-700">symbol:</span> {String(strategy.parameters?.symbol ?? '-')}
+                          <span className="mx-2">·</span>
+                          <span className="font-medium text-gray-700">timeframe:</span> {String(strategy.parameters?.timeframe ?? '-')}
+                        </div>
+
                         <div className="mt-3 flex items-center space-x-6 text-sm">
                           <div>
                             <span className="text-gray-500">参数数量:</span>
@@ -753,28 +773,32 @@ export default function StrategiesPage() {
                       <div className="flex items-center space-x-2">
                         <button
                           onClick={() => handleToggleStrategy(strategy)}
-                          className="p-2 text-gray-600 hover:bg-gray-100 rounded"
+                          disabled={updateStrategyMutation.isPending}
+                          className="p-2 text-gray-600 hover:bg-gray-100 rounded disabled:cursor-not-allowed disabled:opacity-50"
                           title={strategy.is_active ? '停止策略' : '启动策略'}
                         >
                           <Play className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => handleEditStrategy(strategy)}
-                          className="p-2 text-green-600 hover:bg-green-50 rounded"
+                          disabled={createStrategyMutation.isPending || updateStrategyMutation.isPending}
+                          className="p-2 text-green-600 hover:bg-green-50 rounded disabled:cursor-not-allowed disabled:opacity-50"
                           title="编辑策略"
                         >
                           <Edit className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => handleRunBacktest(strategy)}
-                          className="p-2 text-blue-600 hover:bg-blue-50 rounded"
+                          disabled={runBacktestMutation.isPending}
+                          className="p-2 text-blue-600 hover:bg-blue-50 rounded disabled:cursor-not-allowed disabled:opacity-50"
                           title="运行回测"
                         >
                           <BarChart className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => handleDeleteStrategy(strategy)}
-                          className="p-2 text-red-600 hover:bg-red-50 rounded"
+                          disabled={deleteStrategyMutation.isPending}
+                          className="p-2 text-red-600 hover:bg-red-50 rounded disabled:cursor-not-allowed disabled:opacity-50"
                           title="删除策略"
                         >
                           <Trash2 className="h-4 w-4" />
@@ -823,7 +847,7 @@ export default function StrategiesPage() {
             <h3 className="text-lg font-medium text-gray-900 mb-4">快速操作</h3>
             <div className="space-y-3">
               <button
-                onClick={() => setShowCreateForm(true)}
+                onClick={openCreateStrategyForm}
                 className="w-full flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
               >
                 <Plus className="h-4 w-4 mr-2" />
@@ -854,21 +878,14 @@ export default function StrategiesPage() {
             <form onSubmit={handleCreateStrategy} className="space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  策略类型
+                  策略类型 name
                 </label>
                 <select
                   value={strategyForm.name}
                   onChange={(e) => {
                     const nextType = e.target.value as StrategyPresetKey;
                     setFormError(null);
-                    setStrategyForm({
-                      ...strategyForm,
-                      name: nextType,
-                      display_name:
-                        strategyForm.display_name || STRATEGY_PRESETS[nextType].label,
-                      description: STRATEGY_PRESETS[nextType].description,
-                      parameters: { ...STRATEGY_PRESETS[nextType].parameters },
-                    });
+                    setStrategyForm(updateStrategyFormPreset(strategyForm, nextType, false));
                   }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                 >
@@ -878,21 +895,28 @@ export default function StrategiesPage() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-xs text-gray-500">
+                  这是内部策略类型 key，不是界面展示名称。切换类型会重置该类型的默认参数。
+                </p>
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  策略名称
+                  展示名称 display_name
                 </label>
                 <input
                   type="text"
                   value={strategyForm.display_name}
-                  onChange={(e) =>
-                    setStrategyForm({ ...strategyForm, display_name: e.target.value })
-                  }
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, display_name: e.target.value });
+                  }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                   placeholder="例如：美股双均线趋势策略"
                 />
+                <p className="mt-1 text-xs text-gray-500">
+                  仅用于界面展示与回测报告，内部策略类型请看上面的 name。
+                </p>
               </div>
 
               <div>
@@ -901,11 +925,17 @@ export default function StrategiesPage() {
                 </label>
                 <textarea
                   value={strategyForm.description}
-                  onChange={(e) => setStrategyForm({ ...strategyForm, description: e.target.value })}
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, description: e.target.value });
+                  }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                   rows={3}
                   placeholder="描述策略的原理和使用方法..."
                 />
+                <p className="mt-1 text-xs text-gray-500">
+                  描述会随策略保存，适合写清研究假设和使用限制。
+                </p>
               </div>
 
               <div>
@@ -937,7 +967,10 @@ export default function StrategiesPage() {
                   type="checkbox"
                   id="is_active"
                   checked={strategyForm.is_active}
-                  onChange={(e) => setStrategyForm({ ...strategyForm, is_active: e.target.checked })}
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, is_active: e.target.checked });
+                  }}
                   className="h-4 w-4 text-blue-600 border-gray-300 rounded"
                 />
                 <label htmlFor="is_active" className="ml-2 text-sm text-gray-700">
@@ -948,8 +981,18 @@ export default function StrategiesPage() {
               <div className="flex space-x-3 pt-4">
                 <button
                   type="button"
+                  onClick={handleResetCreateForm}
+                  disabled={createStrategyMutation.isPending}
+                  className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                >
+                  <RotateCcw className="mr-2 h-4 w-4" />
+                  恢复默认值
+                </button>
+                <button
+                  type="button"
                   onClick={() => setShowCreateForm(false)}
-                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                  disabled={createStrategyMutation.isPending}
+                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
                 >
                   取消
                 </button>
@@ -975,6 +1018,9 @@ export default function StrategiesPage() {
                 <p className="mt-1 text-sm text-gray-500">
                   当前策略 ID: {selectedStrategy.id}
                 </p>
+                <p className="mt-1 text-xs text-gray-500">
+                  name 是内部策略类型，display_name 是展示名称，参数里的 symbol/timeframe 才是研究条件。
+                </p>
               </div>
               <button
                 onClick={() => {
@@ -991,28 +1037,14 @@ export default function StrategiesPage() {
             <form onSubmit={handleUpdateStrategy} className="space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  策略类型
+                  策略类型 name
                 </label>
                 <select
                   value={strategyForm.name}
                   onChange={(e) => {
                     const nextType = e.target.value as StrategyPresetKey;
                     setFormError(null);
-                    setStrategyForm({
-                      ...strategyForm,
-                      name: nextType,
-                      display_name:
-                        strategyForm.display_name || STRATEGY_PRESETS[nextType].label,
-                      parameters: {
-                        ...STRATEGY_PRESETS[nextType].parameters,
-                        symbol: strategyForm.parameters.symbol ?? STRATEGY_PRESETS[nextType].parameters.symbol,
-                        timeframe: strategyForm.parameters.timeframe ?? STRATEGY_PRESETS[nextType].parameters.timeframe,
-                        initial_capital: strategyForm.parameters.initial_capital ?? STRATEGY_PRESETS[nextType].parameters.initial_capital,
-                        fee_bps: strategyForm.parameters.fee_bps ?? STRATEGY_PRESETS[nextType].parameters.fee_bps,
-                        slippage_bps: strategyForm.parameters.slippage_bps ?? STRATEGY_PRESETS[nextType].parameters.slippage_bps,
-                        max_position_fraction: strategyForm.parameters.max_position_fraction ?? STRATEGY_PRESETS[nextType].parameters.max_position_fraction,
-                      },
-                    });
+                    setStrategyForm(updateStrategyFormPreset(strategyForm, nextType, true));
                   }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                 >
@@ -1022,21 +1054,28 @@ export default function StrategiesPage() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-xs text-gray-500">
+                  切换类型会重置该类型的专属参数，但会尽量保留标的、周期和资金设置。
+                </p>
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  策略名称
+                  展示名称 display_name
                 </label>
                 <input
                   type="text"
                   value={strategyForm.display_name}
-                  onChange={(e) =>
-                    setStrategyForm({ ...strategyForm, display_name: e.target.value })
-                  }
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, display_name: e.target.value });
+                  }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                   placeholder="例如：美股双均线趋势策略"
                 />
+                <p className="mt-1 text-xs text-gray-500">
+                  仅用于界面展示与回测报告，内部策略类型请看上面的 name。
+                </p>
               </div>
 
               <div>
@@ -1045,11 +1084,17 @@ export default function StrategiesPage() {
                 </label>
                 <textarea
                   value={strategyForm.description}
-                  onChange={(e) => setStrategyForm({ ...strategyForm, description: e.target.value })}
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, description: e.target.value });
+                  }}
                   className="w-full border border-gray-300 rounded-md px-3 py-2"
                   rows={3}
                   placeholder="描述策略的原理和使用方法..."
                 />
+                <p className="mt-1 text-xs text-gray-500">
+                  描述会随策略保存，适合写清研究假设和使用限制。
+                </p>
               </div>
 
               <div>
@@ -1081,7 +1126,10 @@ export default function StrategiesPage() {
                   type="checkbox"
                   id="edit_is_active"
                   checked={strategyForm.is_active}
-                  onChange={(e) => setStrategyForm({ ...strategyForm, is_active: e.target.checked })}
+                  onChange={(e) => {
+                    setFormError(null);
+                    setStrategyForm({ ...strategyForm, is_active: e.target.checked });
+                  }}
                   className="h-4 w-4 text-blue-600 border-gray-300 rounded"
                 />
                 <label htmlFor="edit_is_active" className="ml-2 text-sm text-gray-700">
@@ -1092,12 +1140,22 @@ export default function StrategiesPage() {
               <div className="flex space-x-3 pt-4">
                 <button
                   type="button"
+                  onClick={handleResetEditForm}
+                  disabled={updateStrategyMutation.isPending}
+                  className="flex-1 inline-flex items-center justify-center px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                >
+                  <RotateCcw className="mr-2 h-4 w-4" />
+                  恢复原始配置
+                </button>
+                <button
+                  type="button"
                   onClick={() => {
                     setShowEditForm(false);
                     setSelectedStrategy(null);
                     setFormError(null);
                   }}
-                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                  disabled={updateStrategyMutation.isPending}
+                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
                 >
                   取消
                 </button>
@@ -1120,7 +1178,10 @@ export default function StrategiesPage() {
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-medium">运行回测</h3>
               <button
-                onClick={() => setShowBacktestModal(false)}
+                onClick={() => {
+                  setShowBacktestModal(false);
+                  resetBacktestForm();
+                }}
                 className="text-gray-400 hover:text-gray-600"
               >
                 <Trash2 className="h-5 w-5" />
@@ -1131,7 +1192,16 @@ export default function StrategiesPage() {
               <div>
                 <p className="text-sm text-gray-500 mb-2">策略名称</p>
                 <p className="font-medium text-gray-900">{getStrategyDisplayName(selectedStrategy)}</p>
+                <p className="mt-1 text-xs text-gray-500">
+                  name: {selectedStrategy.name} · 标的: {String(selectedStrategy.parameters?.symbol ?? '-')} · 周期: {String(selectedStrategy.parameters?.timeframe ?? '-')}
+                </p>
               </div>
+
+              {backtestError && (
+                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  {backtestError}
+                </div>
+              )}
 
               <form onSubmit={handleSubmitBacktest} className="space-y-4">
                 <div>
@@ -1141,7 +1211,10 @@ export default function StrategiesPage() {
                   <input
                     type="date"
                     value={backtestParams.start_date}
-                    onChange={(e) => setBacktestParams({ ...backtestParams, start_date: e.target.value })}
+                    onChange={(e) => {
+                      setBacktestError(null);
+                      setBacktestParams({ ...backtestParams, start_date: e.target.value });
+                    }}
                     className="w-full border border-gray-300 rounded-md px-3 py-2"
                     required
                   />
@@ -1154,7 +1227,10 @@ export default function StrategiesPage() {
                   <input
                     type="date"
                     value={backtestParams.end_date}
-                    onChange={(e) => setBacktestParams({ ...backtestParams, end_date: e.target.value })}
+                    onChange={(e) => {
+                      setBacktestError(null);
+                      setBacktestParams({ ...backtestParams, end_date: e.target.value });
+                    }}
                     className="w-full border border-gray-300 rounded-md px-3 py-2"
                     required
                   />
@@ -1163,8 +1239,12 @@ export default function StrategiesPage() {
                 <div className="flex space-x-3 pt-4">
                   <button
                     type="button"
-                    onClick={() => setShowBacktestModal(false)}
-                    className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                    onClick={() => {
+                      setShowBacktestModal(false);
+                      resetBacktestForm();
+                    }}
+                    disabled={runBacktestMutation.isPending}
+                    className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
                   >
                     取消
                   </button>

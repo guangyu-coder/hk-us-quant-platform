@@ -857,7 +857,11 @@ async fn update_strategy(
     config.updated_at = Utc::now();
     state.strategy_service.load_strategy(config.clone()).await?;
 
-    Ok(Json(strategy_config_to_json(config)))
+    let stored_config = state
+        .strategy_service
+        .get_strategy_config(&strategy_id)
+        .await?;
+    Ok(Json(strategy_config_to_json(stored_config)))
 }
 
 async fn delete_strategy(
@@ -1381,27 +1385,15 @@ async fn create_strategy(
     State(state): State<AppState>,
     Json(req): Json<CreateStrategyRequest>,
 ) -> Result<Json<Value>, AppError> {
-    // Create strategy configuration
-    let config = StrategyConfig {
-        id: Uuid::new_v4().to_string(),
-        name: req.name,
-        display_name: req.display_name,
-        description: req.description,
-        parameters: req
-            .parameters
-            .unwrap_or_default()
-            .as_object()
-            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default(),
-        risk_limits: req.risk_limits.unwrap_or_default(),
-        is_active: req.is_active.unwrap_or(true),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let config = build_strategy_config_from_request(req);
 
     state.strategy_service.load_strategy(config.clone()).await?;
     info!("Created strategy: {} ({})", config.name, config.id);
-    Ok(Json(strategy_config_to_json(config)))
+    let stored_config = state
+        .strategy_service
+        .get_strategy_config(&config.id)
+        .await?;
+    Ok(Json(strategy_config_to_json(stored_config)))
 }
 
 async fn create_order(
@@ -1707,6 +1699,25 @@ fn strategy_config_to_json(config: StrategyConfig) -> Value {
     })
 }
 
+fn build_strategy_config_from_request(req: CreateStrategyRequest) -> StrategyConfig {
+    StrategyConfig {
+        id: Uuid::new_v4().to_string(),
+        name: req.name,
+        display_name: req.display_name,
+        description: req.description,
+        parameters: req
+            .parameters
+            .unwrap_or_default()
+            .as_object()
+            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+        risk_limits: req.risk_limits.unwrap_or_default(),
+        is_active: req.is_active.unwrap_or(true),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 fn order_to_json(order: crate::types::Order) -> Value {
     let side = match order.side {
         OrderSide::Buy => "Buy",
@@ -1925,6 +1936,7 @@ mod http_e2e_tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use http_body_util::BodyExt;
+    use sqlx::PgPool;
     use serde_json::Value;
     use std::env;
     use tower::ServiceExt;
@@ -1966,12 +1978,53 @@ mod http_e2e_tests {
         assert_eq!(response["error"], json!("upstream timeout"));
     }
 
-    #[tokio::test]
-    async fn e2e_api_smoke() {
-        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
-            return;
-        }
+    #[test]
+    fn build_strategy_config_from_request_keeps_display_name_and_parameters() {
+        let config = build_strategy_config_from_request(CreateStrategyRequest {
+            name: "simple_moving_average".to_string(),
+            display_name: Some("港股双均线".to_string()),
+            description: Some("demo".to_string()),
+            parameters: Some(json!({
+                "symbol": "0700.HK",
+                "timeframe": "1h",
+                "short_period": 8,
+                "long_period": 21,
+                "initial_capital": 250000,
+                "fee_bps": 5,
+                "slippage_bps": 2,
+                "max_position_fraction": 0.5
+            })),
+            risk_limits: None,
+            is_active: Some(false),
+        });
 
+        assert_eq!(config.name, "simple_moving_average");
+        assert_eq!(config.display_name.as_deref(), Some("港股双均线"));
+        assert_eq!(
+            config
+                .parameters
+                .get("symbol")
+                .and_then(|value| value.as_str()),
+            Some("0700.HK")
+        );
+        assert_eq!(
+            config
+                .parameters
+                .get("timeframe")
+                .and_then(|value| value.as_str()),
+            Some("1h")
+        );
+        assert_eq!(
+            config
+                .parameters
+                .get("short_period")
+                .and_then(|value| value.as_i64()),
+            Some(8)
+        );
+        assert_eq!(config.is_active, false);
+    }
+
+    async fn setup_e2e_app() -> (axum::Router, PgPool) {
         let config = Arc::new(AppConfig::load().unwrap());
         let db_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.database.max_connections)
@@ -2030,7 +2083,281 @@ mod http_e2e_tests {
             lifecycle_manager: Arc::new(RwLock::new(DataLifecycleManager::new(db_pool.clone()))),
         };
 
-        let app = create_router(state);
+        (create_router(state), db_pool)
+    }
+
+    #[tokio::test]
+    async fn create_and_update_strategy_return_normalized_stored_config() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, _) = setup_e2e_app().await;
+        let create_payload = json!({
+            "name": "simple_moving_average",
+            "display_name": "simple_moving_average",
+            "description": "",
+            "parameters": {
+                "short_period": 8,
+                "long_period": 21
+            },
+            "risk_limits": {},
+            "is_active": true
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/strategies")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&create_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: Value = serde_json::from_slice(&bytes).unwrap();
+        let strategy_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["display_name"], json!("SMA 双均线"));
+        assert_eq!(created["parameters"]["symbol"], json!("AAPL"));
+        assert_eq!(created["parameters"]["timeframe"], json!("1d"));
+
+        let update_payload = json!({
+            "display_name": "simple_moving_average",
+            "description": "",
+            "parameters": {
+                "symbol": "0700.HK",
+                "timeframe": "1h",
+                "short_period": 8,
+                "long_period": 21,
+                "initial_capital": 250000,
+                "fee_bps": 5,
+                "slippage_bps": 2,
+                "max_position_fraction": 0.5
+            },
+            "risk_limits": {},
+            "is_active": false
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/strategies/{strategy_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&update_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let updated: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(updated["display_name"], json!("SMA 双均线"));
+        assert_eq!(updated["parameters"]["symbol"], json!("0700.HK"));
+        assert_eq!(updated["parameters"]["timeframe"], json!("1h"));
+        assert_eq!(updated["is_active"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn delete_strategy_clears_related_rows() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, db_pool) = setup_e2e_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/strategies")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "mean_reversion",
+                            "display_name": "Delete Me",
+                            "description": "cleanup test",
+                            "parameters": {
+                                "symbol": "AAPL",
+                                "timeframe": "1d",
+                                "lookback_period": 20,
+                                "threshold": 2.0,
+                                "initial_capital": 100000,
+                                "fee_bps": 5,
+                                "slippage_bps": 2,
+                                "max_position_fraction": 1.0
+                            },
+                            "risk_limits": {},
+                            "is_active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let strategy: Value = serde_json::from_slice(&bytes).unwrap();
+        let strategy_id = strategy["id"].as_str().unwrap().to_string();
+
+        let order_id = Uuid::new_v4();
+        let trade_id = Uuid::new_v4();
+        let backtest_id = Uuid::new_v4();
+        let executed_at = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO orders (order_id, symbol, side, quantity, price, order_type, status, strategy_id, filled_quantity, average_fill_price) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(order_id)
+        .bind("AAPL")
+        .bind("BUY")
+        .bind(10_i64)
+        .bind(Some(rust_decimal::Decimal::new(1000, 2)))
+        .bind("MARKET")
+        .bind("PENDING")
+        .bind(&strategy_id)
+        .bind(0_i64)
+        .bind(Option::<rust_decimal::Decimal>::None)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO trades (order_id, symbol, side, quantity, price, executed_at, portfolio_id, strategy_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(order_id)
+        .bind("AAPL")
+        .bind("BUY")
+        .bind(10_i64)
+        .bind(rust_decimal::Decimal::new(1010, 2))
+        .bind(executed_at)
+        .bind("default")
+        .bind(&strategy_id)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO orders_archive (order_id, symbol, side, quantity, price, order_type, status, strategy_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(order_id.to_string())
+        .bind("AAPL")
+        .bind("BUY")
+        .bind(10_i64)
+        .bind(Some(rust_decimal::Decimal::new(1000, 2)))
+        .bind("MARKET")
+        .bind("PENDING")
+        .bind(&strategy_id)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO trades_archive (trade_id, order_id, symbol, side, quantity, price, executed_at, portfolio_id, strategy_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(trade_id)
+        .bind(order_id)
+        .bind("AAPL")
+        .bind("BUY")
+        .bind(10_i64)
+        .bind(rust_decimal::Decimal::new(1010, 2))
+        .bind(executed_at)
+        .bind("default")
+        .bind(&strategy_id)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO performance_metrics (portfolio_id, strategy_id, date, total_pnl, realized_pnl, unrealized_pnl, total_return, sharpe_ratio, max_drawdown) VALUES ($1, $2, CURRENT_DATE, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind("default")
+        .bind(&strategy_id)
+        .bind(rust_decimal::Decimal::new(100, 2))
+        .bind(rust_decimal::Decimal::new(50, 2))
+        .bind(rust_decimal::Decimal::new(50, 2))
+        .bind(rust_decimal::Decimal::new(120, 2))
+        .bind(rust_decimal::Decimal::new(80, 2))
+        .bind(rust_decimal::Decimal::new(30, 2))
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO backtest_runs (id, strategy_id, strategy_name, symbol, timeframe, parameters, trades, equity_curve, start_date, end_date, initial_capital, final_capital, total_return, annualized_return, sharpe_ratio, max_drawdown, win_rate, total_trades, performance_metrics, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+        )
+        .bind(backtest_id)
+        .bind(&strategy_id)
+        .bind("Delete Me")
+        .bind("AAPL")
+        .bind("1d")
+        .bind(json!({"symbol":"AAPL","timeframe":"1d"}))
+        .bind(json!([]))
+        .bind(json!([]))
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .bind(rust_decimal::Decimal::new(100000, 0))
+        .bind(rust_decimal::Decimal::new(110000, 0))
+        .bind(0.1_f64)
+        .bind(0.1_f64)
+        .bind(1.2_f64)
+        .bind(0.05_f64)
+        .bind(0.6_f64)
+        .bind(1_i32)
+        .bind(json!({"total_pnl":100.0,"realized_pnl":50.0,"unrealized_pnl":50.0}))
+        .bind(Utc::now())
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/strategies/{strategy_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let table_counts = [
+            ("strategies", 0_i64),
+            ("orders", 0_i64),
+            ("trades", 0_i64),
+            ("orders_archive", 0_i64),
+            ("trades_archive", 0_i64),
+            ("performance_metrics", 0_i64),
+            ("backtest_runs", 0_i64),
+        ];
+
+        for (table, expected) in table_counts {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE strategy_id = $1"
+            ))
+            .bind(&strategy_id)
+            .fetch_one(&db_pool)
+            .await
+            .unwrap();
+            assert_eq!(count, expected, "table {table} should be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_api_smoke() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, _) = setup_e2e_app().await;
 
         let create_strategy_payload = json!({
             "name": "mean_reversion",

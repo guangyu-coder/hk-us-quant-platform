@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test:strategy-form": "node --test --experimental-strip-types tests/strategy-form.test.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.3.2",

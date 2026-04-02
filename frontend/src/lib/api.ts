@@ -19,6 +19,7 @@ import type {
   RiskMetrics,
   RiskLimitsSnapshot,
   RiskAlert,
+  ApiErrorResponse,
 } from '@/types';
 
 // 创建axios实例
@@ -53,6 +54,38 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+export const getApiErrorMessage = (error: unknown, fallback: string) => {
+  if (axios.isAxiosError(error)) {
+    const responseData = error.response?.data as ApiErrorResponse | string | undefined;
+    if (typeof responseData === 'string' && responseData.trim()) {
+      return responseData.trim();
+    }
+
+    const responseError = responseData && typeof responseData === 'object' ? responseData.error : undefined;
+    const candidates = [
+      responseError?.message,
+      (responseData as ApiErrorResponse | undefined)?.message,
+      error.message,
+    ];
+
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+  }
+
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+
+  return fallback;
+};
 
 // 系统健康检查
 export const getSystemHealth = async (): Promise<SystemHealth> => {
