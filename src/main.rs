@@ -12,12 +12,13 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 mod broker;
 mod config;
@@ -48,6 +49,8 @@ use crate::websocket::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
+
+static APP_BOOT_AT: OnceLock<String> = OnceLock::new();
 
 /// Request body for creating a strategy
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +249,8 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    APP_BOOT_AT.get_or_init(|| Utc::now().to_rfc3339());
+
     // Load configuration
     let config = Arc::new(AppConfig::load()?);
 
@@ -413,11 +418,30 @@ fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health_check(State(_state): State<AppState>) -> Result<Json<Value>, AppError> {
-    // Check service health
-    let health_status = json!({
-        "status": "healthy",
+async fn health_check(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let (summary, recent_error) = match collect_operational_summary(&state).await {
+        Ok(summary) => (Some(summary), None),
+        Err(error) => {
+            warn!(error = %error, "Failed to collect operational summary");
+            (None, Some(error.to_string()))
+        }
+    };
+
+    Ok(Json(build_health_response(summary, recent_error)))
+}
+
+fn build_health_response(summary: Option<Value>, recent_error: Option<String>) -> Value {
+    let status = if summary.is_some() {
+        "healthy"
+    } else {
+        "warning"
+    };
+
+    json!({
+        "status": status,
         "timestamp": chrono::Utc::now(),
+        "deployed_at": app_deployed_at(),
+        "recent_error": recent_error,
         "services": {
             "database": "connected",
             "redis": "connected",
@@ -426,10 +450,34 @@ async fn health_check(State(_state): State<AppState>) -> Result<Json<Value>, App
             "execution_service": "running",
             "portfolio_service": "running",
             "risk_service": "running"
-        }
-    });
+        },
+        "summary": summary
+    })
+}
 
-    Ok(Json(health_status))
+fn app_deployed_at() -> String {
+    APP_BOOT_AT
+        .get_or_init(|| chrono::Utc::now().to_rfc3339())
+        .clone()
+}
+
+async fn collect_operational_summary(state: &AppState) -> Result<Value, AppError> {
+    let strategies = state.strategy_service.list_strategies().await?;
+    let recent_orders = state.execution_service.list_orders(25, 0).await?;
+    let recent_backtests = state.strategy_service.list_backtest_runs(25).await?;
+    let recent_trades = state.portfolio_service.list_trades(None, None, 25).await?;
+
+    Ok(json!({
+        "strategies_total": strategies.len(),
+        "active_strategies": strategies.iter().filter(|strategy| strategy.is_active).count(),
+        "recent_orders": recent_orders.len(),
+        "recent_backtests": recent_backtests.len(),
+        "recent_trades": recent_trades.len(),
+        "latest_strategy_at": strategies.first().map(|strategy| strategy.updated_at),
+        "latest_order_at": recent_orders.first().map(|order| order.created_at),
+        "latest_backtest_at": recent_backtests.first().and_then(|result| result.created_at),
+        "latest_trade_at": recent_trades.first().map(|trade| trade.executed_at),
+    }))
 }
 
 async fn get_market_data(
@@ -2074,6 +2122,32 @@ mod http_e2e_tests {
             Some(8)
         );
         assert_eq!(config.is_active, false);
+    }
+
+    #[test]
+    fn health_response_includes_optional_operational_summary() {
+        let summary = json!({
+            "strategies_total": 3,
+            "active_strategies": 2,
+            "recent_orders": 4,
+            "recent_backtests": 5,
+            "recent_trades": 6
+        });
+
+        let response = build_health_response(Some(summary.clone()), None);
+        assert_eq!(response["status"], json!("healthy"));
+        assert!(response["deployed_at"].as_str().is_some_and(|value| !value.is_empty()));
+        assert_eq!(response["recent_error"], Value::Null);
+        assert_eq!(response["summary"], summary);
+
+        let response_without_summary =
+            build_health_response(None, Some("summary collection failed".to_string()));
+        assert_eq!(response_without_summary["status"], json!("warning"));
+        assert_eq!(
+            response_without_summary["recent_error"],
+            json!("summary collection failed")
+        );
+        assert_eq!(response_without_summary["summary"], Value::Null);
     }
 
     async fn setup_e2e_app() -> (axum::Router, PgPool) {

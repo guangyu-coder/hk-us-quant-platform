@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getApiErrorMessage, marketDataApi, strategyApi } from '@/lib/api';
 import {
@@ -14,6 +14,13 @@ import {
 } from '@/lib/strategy-form';
 import type { RiskLimits, StrategyConfig } from '@/types';
 import { Plus, Play, Trash2, BarChart, Edit, Search, Loader2, RotateCcw } from 'lucide-react';
+import {
+  buildCreateStrategyPayload,
+  buildDeleteStrategyConfirmation,
+  buildUpdateStrategyPayload,
+  deriveStrategyCounts,
+  normalizeStrategyCollection,
+} from './strategy-page-helpers';
 import {
   COMMON_SYMBOL_SHORTCUTS,
   STRATEGY_TEMPLATE_SHORTCUTS,
@@ -423,11 +430,7 @@ export default function StrategiesPage() {
     }
 
     setFormError(null);
-    createStrategyMutation.mutate({
-      ...strategyForm,
-      name: strategyForm.name,
-      display_name: strategyForm.display_name.trim(),
-    });
+    createStrategyMutation.mutate(buildCreateStrategyPayload(strategyForm));
   };
 
   const rememberSymbolShortcut = (symbol: string) => {
@@ -450,10 +453,7 @@ export default function StrategiesPage() {
       return;
     }
 
-    const strategyName = getStrategyDisplayName(strategy);
-    const confirmed = confirm(
-      `确定要删除策略“${strategyName}”吗？\n\n此操作会同时删除该策略关联的订单、成交、回测记录和绩效数据，且无法恢复。`
-    );
+    const confirmed = confirm(buildDeleteStrategyConfirmation(strategy));
 
     if (confirmed) {
       setDeleteError(null);
@@ -508,14 +508,7 @@ export default function StrategiesPage() {
     setFormError(null);
     updateStrategyMutation.mutate({
       id: selectedStrategy.id,
-      data: {
-        name: strategyForm.name,
-        display_name: strategyForm.display_name.trim(),
-        description: strategyForm.description,
-        parameters: strategyForm.parameters,
-        risk_limits: strategyForm.risk_limits,
-        is_active: strategyForm.is_active,
-      },
+      data: buildUpdateStrategyPayload(strategyForm),
     });
   };
 
@@ -572,14 +565,9 @@ export default function StrategiesPage() {
     setShowCreateForm(true);
   };
 
-  // 确保strategies是数组
-  const strategiesArray = Array.isArray(strategies) ? strategies : 
-                          ((strategies as any)?.strategies ? (strategies as any).strategies : []);
+  const strategiesArray = useMemo(() => normalizeStrategyCollection(strategies), [strategies]);
   
-  // 计算统计数据
-  const totalCount = strategiesArray.length;
-  const activeCount = strategiesArray.filter((s: StrategyConfig) => s.is_active).length;
-  const inactiveCount = totalCount - activeCount;
+  const { totalCount, activeCount, inactiveCount } = deriveStrategyCounts(strategiesArray);
 
   const getStatusColor = (isActive: boolean) => {
     return isActive ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800';

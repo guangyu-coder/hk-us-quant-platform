@@ -50,4 +50,36 @@ Then run the restore command above.
 
 1. Check service status with `./scripts/deploy.sh status`.
 2. Verify the health endpoint with `curl -fsS http://localhost:3002/health`.
-3. Open `http://localhost:3002` and confirm the core research pages load.
+3. Confirm the `summary` block in `/health` is populated with the restored counts you expect.
+4. Open `http://localhost:3002` and confirm the core research pages load.
+
+## Restore Notes
+
+- Restore the tables in one shot when possible; partial restores can leave the health summary looking fine while research pages still show stale history.
+- After a restore, the first `/health` call is a quick sanity check, not a substitute for opening the strategies and backtest pages.
+
+## Temporary Rehearsal Record
+
+Validated on 2026-04-02 14:36 CST with a temporary drill database inside the local Postgres container.
+
+- Backup file: `/tmp/quant-restore-drill/quant_platform_mvp_20260402-restore-drill.sql`
+- Schema file used for the drill: `/tmp/quant-restore-drill/quant_platform_mvp_schema_20260402.sql`
+- Target database: `quant_restore_drill`
+- Pre-restore row counts:
+  - `strategies=1`
+  - `backtest_runs=0`
+  - `orders=0`
+  - `trades=0`
+  - `performance_metrics=0`
+- Post-restore row counts:
+  - `strategies=1`
+  - `backtest_runs=0`
+  - `orders=0`
+  - `trades=0`
+  - `performance_metrics=0`
+
+Notes from the drill:
+
+- The temporary drill restored the selected data set successfully and the restored counts matched the source counts.
+- Importing only the selected table schema into an empty temporary database produced expected foreign-key warnings for `orders` and `trades` because those tables reference `portfolios`. This does not affect the documented in-place restore procedure, where the target schema already exists.
+- When rehearsing into a temporary database, treat schema warnings about omitted dependencies as a sign that you are validating row-level recovery, not a full isolated environment bootstrap.

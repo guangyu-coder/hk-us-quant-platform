@@ -56,6 +56,8 @@ App: http://localhost:3002
 Health: http://localhost:3002/health
 ```
 
+`/health` now includes a lightweight operational summary with recent strategy, order, backtest, and trade counts so you can spot an empty or stale stack quickly. If the summary cannot be collected, the endpoint reports `warning` instead of a false green.
+
 You can change the host port with `./scripts/deploy.sh up --port <port>`, for example `./scripts/deploy.sh up --port 4000`.
 If you only need to rebuild one service, use `./scripts/deploy.sh build backend` or `./scripts/deploy.sh up --build --service frontend`.
 
@@ -82,4 +84,5 @@ The market data API distinguishes `live`, `degraded`, and `error` states, and th
 ## Testing
 ```bash
 RUN_E2E_TESTS=1 cargo test
+cd frontend && npm run test:smoke
 ```

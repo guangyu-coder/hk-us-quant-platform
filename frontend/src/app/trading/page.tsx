@@ -1,11 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { orderApi } from '@/lib/api';
 import { formatMarketPrice, formatMarketTimestamp } from '@/lib/market';
 import { ChevronRight, Clock3, Plus, X } from 'lucide-react';
 import type { CreateOrderResult, Order, OrderAuditEntry, OrderSide, OrderType, PaperSimulationResult } from '@/types';
+import { deriveTradingOrderCounts, normalizeOrdersCollection, selectTradingOrderId } from './trading-helpers';
 
 export default function TradingPage() {
   const [showOrderForm, setShowOrderForm] = useState(false);
@@ -146,21 +147,12 @@ export default function TradingPage() {
     }
   };
 
-  // 确保orders是数组
-  const ordersArray = Array.isArray(orders) ? orders : 
-                     ((orders as any)?.orders ? (orders as any).orders : []);
+  const ordersArray = useMemo(() => normalizeOrdersCollection(orders), [orders]);
 
   useEffect(() => {
-    if (ordersArray.length === 0) {
-      if (selectedOrderId !== null) {
-        setSelectedOrderId(null);
-      }
-      return;
-    }
-
-    const selectedExists = ordersArray.some((order: Order) => order.id === selectedOrderId);
-    if (!selectedExists) {
-      setSelectedOrderId(ordersArray[0].id);
+    const nextSelectedOrderId = selectTradingOrderId(ordersArray, selectedOrderId);
+    if (nextSelectedOrderId !== selectedOrderId) {
+      setSelectedOrderId(nextSelectedOrderId);
     }
   }, [ordersArray, selectedOrderId]);
 
@@ -175,14 +167,8 @@ export default function TradingPage() {
   const filledRatio = selectedOrder && selectedOrder.quantity > 0
     ? Math.min(100, Math.round((selectedOrder.filled_quantity / selectedOrder.quantity) * 100))
     : 0;
-  const openOrdersCount = ordersArray.filter((order: Order) =>
-    order.status === 'Pending' || order.status === 'Submitted' || order.status === 'PartiallyFilled'
-  ).length;
-  const partiallyFilledCount = ordersArray.filter((order: Order) => order.status === 'PartiallyFilled').length;
-  const filledCount = ordersArray.filter((order: Order) => order.status === 'Filled').length;
-  const terminalCount = ordersArray.filter((order: Order) =>
-    order.status === 'Filled' || order.status === 'Cancelled' || order.status === 'Rejected'
-  ).length;
+  const { open: openOrdersCount, partiallyFilled: partiallyFilledCount, filled: filledCount, terminal: terminalCount } =
+    deriveTradingOrderCounts(ordersArray);
 
   const getLifecycleStep = (order: Order): string => {
     switch (order.status) {

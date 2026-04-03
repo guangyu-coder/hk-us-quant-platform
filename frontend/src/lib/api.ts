@@ -94,6 +94,8 @@ export const getSystemHealth = async (): Promise<SystemHealth> => {
   return response.data;
 };
 
+export const getSystemHealthSummary = (health: SystemHealth) => health.summary ?? null;
+
 const createFallbackMeta = (symbol: string, source = 'frontend'): MarketQuoteResult['meta'] => ({
   status: 'error',
   source,

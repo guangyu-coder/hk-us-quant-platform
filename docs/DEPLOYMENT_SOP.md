@@ -111,6 +111,8 @@ After deployment or update, verify:
 curl -fsS http://localhost:3002/health
 ```
 
+The health payload includes a small `summary` block with recent strategy, order, backtest, and trade counts. If those numbers are unexpectedly zero after a deploy, or the endpoint falls back to `warning`, treat it as a signal to inspect the backing data tables before assuming the stack is healthy.
+
 3. Main entrypoint:
 
 Open `http://localhost:3002` in the browser.

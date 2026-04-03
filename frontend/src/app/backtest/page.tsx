@@ -9,7 +9,6 @@ import {
   buildParameterSnapshotSummary,
   deriveBacktestStrategyName,
   deriveRunSnapshotName,
-  getNextExpandedRunId,
   getReferenceTradesForBacktestWindow,
   hasActiveBacktestFilters,
 } from './report-helpers';
@@ -19,6 +18,11 @@ import {
   serializeBacktestExportRowsToCsv,
   serializeBacktestExportRowsToJson,
 } from './backtest-efficiency';
+import {
+  buildBacktestExportFilename,
+  canExportBacktests,
+  toggleExpandedRunId,
+} from './backtest-page-helpers';
 import {
   BarChart3,
   CheckSquare,
@@ -161,6 +165,7 @@ export default function BacktestPage() {
       ),
     [selectedComparisonResults, strategiesById]
   );
+  const canExportComparisonResults = canExportBacktests(comparisonExportRows.length);
 
   useEffect(() => {
     setCompareSelection((current) => {
@@ -185,7 +190,7 @@ export default function BacktestPage() {
   };
 
   const expandRun = (runKey: string) => {
-    setExpandedRunId((current) => getNextExpandedRunId(current, runKey));
+    setExpandedRunId((current) => toggleExpandedRunId(current, runKey));
   };
 
   const collapseRun = (runKey: string) => {
@@ -238,8 +243,7 @@ export default function BacktestPage() {
     const rows = buildBacktestExportRows(results, (result) =>
       deriveBacktestStrategyName(result, strategiesById.get(result.strategy_id))
     );
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filenameBase = `backtest-${scope}-${timestamp}`;
+    const filenameBase = buildBacktestExportFilename(scope);
 
     if (format === 'json') {
       downloadTextFile(
@@ -269,6 +273,8 @@ export default function BacktestPage() {
 
   const getBacktestStrategyName = (result: BacktestResult) =>
     deriveBacktestStrategyName(result, strategiesById.get(result.strategy_id));
+
+  const canExportFilteredResults = canExportBacktests(filteredBacktestResults.length);
 
   const getBacktestStrategyType = (result: BacktestResult) =>
     strategiesById.get(result.strategy_id)?.name ?? '-';
@@ -383,7 +389,7 @@ export default function BacktestPage() {
             <button
               type="button"
               onClick={() => exportBacktests('json', filteredBacktestResults, 'filtered')}
-              disabled={filteredBacktestResults.length === 0}
+              disabled={!canExportFilteredResults}
               className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Download className="h-4 w-4" />
@@ -392,7 +398,7 @@ export default function BacktestPage() {
             <button
               type="button"
               onClick={() => exportBacktests('csv', filteredBacktestResults, 'filtered')}
-              disabled={filteredBacktestResults.length === 0}
+              disabled={!canExportFilteredResults}
               className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Download className="h-4 w-4" />
@@ -500,12 +506,12 @@ export default function BacktestPage() {
                   type="button"
                   onClick={() =>
                     downloadTextFile(
-                      `backtest-comparison-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+                      `${buildBacktestExportFilename('comparison')}.json`,
                       serializeBacktestExportRowsToJson(comparisonExportRows),
                       'application/json'
                     )
                   }
-                  disabled={comparisonExportRows.length === 0}
+                  disabled={!canExportComparisonResults}
                   className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Download className="h-4 w-4" />
@@ -515,12 +521,12 @@ export default function BacktestPage() {
                   type="button"
                   onClick={() =>
                     downloadTextFile(
-                      `backtest-comparison-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`,
+                      `${buildBacktestExportFilename('comparison')}.csv`,
                       serializeBacktestExportRowsToCsv(comparisonExportRows),
                       'text/csv'
                     )
                   }
-                  disabled={comparisonExportRows.length === 0}
+                  disabled={!canExportComparisonResults}
                   className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Download className="h-4 w-4" />

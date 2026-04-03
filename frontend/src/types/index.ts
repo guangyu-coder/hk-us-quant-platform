@@ -328,6 +328,8 @@ export interface PerformanceMetrics {
 export interface SystemHealth {
   status: 'healthy' | 'warning' | 'error';
   timestamp: string;
+  deployed_at?: string | null;
+  recent_error?: string | null;
   services: {
     database: string;
     redis: string;
@@ -337,6 +339,21 @@ export interface SystemHealth {
     portfolio_service: string;
     risk_service: string;
   };
+  summary?: SystemHealthSummary | null;
+}
+
+export interface SystemHealthSummary {
+  strategies_total: number;
+  active_strategies: number;
+  recent_orders: number;
+  recent_backtests: number;
+  recent_trades: number;
+  deployed_at?: string | null;
+  recent_error?: string | null;
+  latest_strategy_at?: string | null;
+  latest_order_at?: string | null;
+  latest_backtest_at?: string | null;
+  latest_trade_at?: string | null;
 }
 
 // API响应类型
