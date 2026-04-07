@@ -669,6 +669,48 @@ pub struct BacktestExperimentMetadata {
     pub parameter_version: Option<String>,
 }
 
+/// Heuristic data continuity gap detected from bar timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BacktestDataGap {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub expected_interval_seconds: i64,
+    pub observed_interval_seconds: i64,
+    pub missing_bars_hint: i64,
+}
+
+/// Backtest data quality summary used by the UI and export payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BacktestDataQuality {
+    pub source_label: String,
+    pub local_data_hit: bool,
+    pub external_data_fallback: bool,
+    pub bar_count: usize,
+    pub minimum_required_bars: usize,
+    pub data_insufficient: bool,
+    pub missing_intervals: Vec<BacktestDataGap>,
+    pub notes: Vec<String>,
+}
+
+/// Stable assumptions snapshot for a backtest run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BacktestAssumptions {
+    pub fee_bps: f64,
+    pub slippage_bps: f64,
+    pub max_position_fraction: f64,
+    pub rebalancing_logic: String,
+    pub data_source: String,
+}
+
+/// Relationship between the backtest and real executions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BacktestExecutionLink {
+    pub status: String,
+    pub reference_scope: String,
+    pub explicit_link_id: Option<Uuid>,
+    pub note: String,
+}
+
 /// Backtest result structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResult {
@@ -695,6 +737,9 @@ pub struct BacktestResult {
     pub win_rate: f64,
     pub total_trades: i32,
     pub performance_metrics: PerformanceMetrics,
+    pub data_quality: Option<BacktestDataQuality>,
+    pub assumptions: Option<BacktestAssumptions>,
+    pub execution_link: Option<BacktestExecutionLink>,
     pub created_at: Option<DateTime<Utc>>,
 }
 

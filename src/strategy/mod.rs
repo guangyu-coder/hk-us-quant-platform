@@ -1,7 +1,8 @@
 use crate::error::{AppError, AppResult};
 use crate::events::{EventBus, PlatformEvent};
 use crate::types::{
-    BacktestEquityPoint, BacktestExperimentMetadata, BacktestResult, BacktestTrade, MarketData,
+    BacktestAssumptions, BacktestDataGap, BacktestDataQuality, BacktestEquityPoint,
+    BacktestExecutionLink, BacktestExperimentMetadata, BacktestResult, BacktestTrade, MarketData,
     Signal, StrategyConfig,
 };
 use async_trait::async_trait;
@@ -16,6 +17,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+const BACKTEST_RUNTIME_METADATA_KEY: &str = "__backtest_metadata";
+
 pub mod indicators;
 pub mod strategies;
 
@@ -25,6 +28,19 @@ pub use strategies::{
 };
 
 use self::indicators::{sma, BollingerBands, MACD, RSI};
+
+#[derive(Debug, Clone)]
+struct BacktestMarketDataBundle {
+    bars: Vec<MarketData>,
+    quality: BacktestDataQuality,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BacktestRuntimeMetadata {
+    data_quality: Option<BacktestDataQuality>,
+    assumptions: Option<BacktestAssumptions>,
+    execution_link: Option<BacktestExecutionLink>,
+}
 
 /// Strategy trait for implementing trading strategies
 #[async_trait]
@@ -328,20 +344,27 @@ impl StrategyService {
             .load_backtest_market_data(&symbol, start, end, &timeframe)
             .await?;
 
-        if historical_data.len() < 20 {
+        if historical_data.quality.data_insufficient {
             return Err(build_historical_data_insufficient_error(
                 &symbol,
                 &timeframe,
                 start,
                 end,
-                historical_data.len(),
+                historical_data.bars.len(),
+                Some(&historical_data.quality),
             ));
         }
 
-        let result = simulate_backtest(strategy_id, &config, historical_data, initial_capital)?;
-        Ok(attach_strategy_context_to_backtest_result(
-            result, config, experiment,
-        ))
+        let result =
+            simulate_backtest(strategy_id, &config, historical_data.bars, initial_capital)?;
+        let mut result = attach_strategy_context_to_backtest_result(result, config, experiment);
+        result.data_quality = Some(historical_data.quality.clone());
+        result.assumptions = Some(build_backtest_assumptions(
+            config,
+            &historical_data.quality.source_label,
+        ));
+        result.execution_link = Some(build_backtest_execution_link());
+        Ok(result)
     }
 
     pub async fn list_backtest_runs(&self, limit: i64) -> AppResult<Vec<BacktestResult>> {
@@ -447,6 +470,8 @@ impl StrategyService {
                         .map_err(AppError::Serialization)?;
                 let parameters: HashMap<String, serde_json::Value> =
                     serde_json::from_value(row.parameters).map_err(AppError::Serialization)?;
+                let (parameters, data_quality, assumptions, execution_link) =
+                    hydrate_backtest_runtime_metadata(parameters)?;
                 let trades: Vec<BacktestTrade> =
                     serde_json::from_value(row.trades).map_err(AppError::Serialization)?;
                 let equity_curve: Vec<BacktestEquityPoint> =
@@ -475,6 +500,9 @@ impl StrategyService {
                     win_rate: row.win_rate,
                     total_trades: row.total_trades,
                     performance_metrics: metrics,
+                    data_quality,
+                    assumptions,
+                    execution_link,
                     created_at: Some(row.created_at),
                 })
             })
@@ -487,7 +515,7 @@ impl StrategyService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         timeframe: &str,
-    ) -> AppResult<Vec<MarketData>> {
+    ) -> AppResult<BacktestMarketDataBundle> {
         let query = r#"
             SELECT symbol, timestamp, price, volume, bid_price, ask_price, bid_size, ask_size
             FROM market_data
@@ -515,28 +543,35 @@ impl StrategyService {
             .await
             .map_err(AppError::Database)?;
 
-        if rows.len() >= 20 {
-            return Ok(rows
-                .into_iter()
-                .map(|row| MarketData {
-                    symbol: row.symbol,
-                    timestamp: row.timestamp,
-                    price: row.price,
-                    volume: row.volume,
-                    bid_price: row.bid_price,
-                    ask_price: row.ask_price,
-                    bid_size: row.bid_size,
-                    ask_size: row.ask_size,
-                    open_price: None,
-                    high_price: None,
-                    low_price: None,
-                    previous_close: None,
-                    market_cap: None,
-                    pe_ratio: None,
-                    data_source: Some("database".to_string()),
-                    exchange: None,
-                })
-                .collect());
+        let local_bars = rows
+            .into_iter()
+            .map(|row| MarketData {
+                symbol: row.symbol,
+                timestamp: row.timestamp,
+                price: row.price,
+                volume: row.volume,
+                bid_price: row.bid_price,
+                ask_price: row.ask_price,
+                bid_size: row.bid_size,
+                ask_size: row.ask_size,
+                open_price: None,
+                high_price: None,
+                low_price: None,
+                previous_close: None,
+                market_cap: None,
+                pe_ratio: None,
+                data_source: Some("database".to_string()),
+                exchange: None,
+            })
+            .collect::<Vec<_>>();
+
+        if local_bars.len() >= 20 {
+            let quality =
+                build_backtest_data_quality("本地行情库", true, false, &local_bars, timeframe);
+            return Ok(BacktestMarketDataBundle {
+                bars: local_bars,
+                quality,
+            });
         }
 
         let yahoo_client = crate::market_data::yahoo_finance::YahooFinanceClient::new();
@@ -554,10 +589,33 @@ impl StrategyService {
                 start,
                 end,
                 bars.len(),
+                Some(&build_backtest_data_quality(
+                    if local_bars.is_empty() {
+                        "Yahoo Finance"
+                    } else {
+                        "本地行情库 + Yahoo Finance 回退"
+                    },
+                    !local_bars.is_empty(),
+                    true,
+                    &bars,
+                    timeframe,
+                )),
             ));
         }
 
-        Ok(bars)
+        let quality = build_backtest_data_quality(
+            if local_bars.is_empty() {
+                "Yahoo Finance"
+            } else {
+                "本地行情库 + Yahoo Finance 回退"
+            },
+            !local_bars.is_empty(),
+            true,
+            &bars,
+            timeframe,
+        );
+
+        Ok(BacktestMarketDataBundle { bars, quality })
     }
 
     async fn store_backtest_run(
@@ -627,7 +685,7 @@ impl StrategyService {
             )
             .bind(result.symbol.as_deref().unwrap_or("AAPL"))
             .bind(result.timeframe.as_deref().unwrap_or("1d"))
-            .bind(serde_json::to_value(&config.parameters).map_err(AppError::Serialization)?)
+            .bind(persisted_backtest_parameters(config, result)?)
             .bind(serde_json::to_value(&result.trades).map_err(AppError::Serialization)?)
             .bind(serde_json::to_value(&result.equity_curve).map_err(AppError::Serialization)?)
             .bind(result.start_date)
@@ -1162,17 +1220,249 @@ fn attach_strategy_context_to_backtest_result(
     result
 }
 
+fn build_backtest_data_quality(
+    source_label: &str,
+    local_data_hit: bool,
+    external_data_fallback: bool,
+    bars: &[MarketData],
+    timeframe: &str,
+) -> BacktestDataQuality {
+    let missing_intervals = detect_backtest_missing_intervals(bars, timeframe);
+    let bar_count = bars.len();
+    let minimum_required_bars = 20;
+    let data_insufficient = bar_count < minimum_required_bars;
+
+    let mut notes = vec!["基于 bar 时间戳的启发式连续性检测".to_string()];
+    if local_data_hit {
+        notes.push("本地行情库命中".to_string());
+    }
+    if external_data_fallback {
+        notes.push("已回退外部数据源".to_string());
+    }
+    if data_insufficient {
+        notes.push(format!(
+            "历史 bar 不足 {} 条，结果不满足最小可交付阈值",
+            minimum_required_bars
+        ));
+    }
+    if !missing_intervals.is_empty() {
+        notes.push(format!("检测到 {} 处时间戳缺口", missing_intervals.len()));
+    }
+
+    BacktestDataQuality {
+        source_label: source_label.to_string(),
+        local_data_hit,
+        external_data_fallback,
+        bar_count,
+        minimum_required_bars,
+        data_insufficient,
+        missing_intervals,
+        notes,
+    }
+}
+
+fn build_backtest_assumptions(config: &StrategyConfig, source_label: &str) -> BacktestAssumptions {
+    let fee_bps = config
+        .parameters
+        .get("fee_bps")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(5.0);
+    let slippage_bps = config
+        .parameters
+        .get("slippage_bps")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(2.0);
+    let max_position_fraction = config
+        .parameters
+        .get("max_position_fraction")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(1.0);
+
+    BacktestAssumptions {
+        fee_bps,
+        slippage_bps,
+        max_position_fraction,
+        rebalancing_logic: describe_backtest_rebalancing_logic(config, max_position_fraction),
+        data_source: source_label.to_string(),
+    }
+}
+
+fn build_backtest_execution_link() -> BacktestExecutionLink {
+    BacktestExecutionLink {
+        status: "reference_match_only".to_string(),
+        reference_scope: "strategy_id + symbol + backtest window".to_string(),
+        explicit_link_id: None,
+        note: "当前仅按策略、标的和回测区间参考匹配真实执行成交，未建立一一对应关系。未来若支持显式关联，会在此处展示 link 状态。".to_string(),
+    }
+}
+
+fn describe_backtest_rebalancing_logic(
+    config: &StrategyConfig,
+    max_position_fraction: f64,
+) -> String {
+    let strategy_label = normalize_strategy_kind(&config.name);
+    let max_position_percent = (max_position_fraction * 100.0).round();
+
+    let strategy_phrase = match strategy_label.as_str() {
+        "simple_moving_average" | "dual_ma" | "ma_crossover" => "双均线交叉触发调仓",
+        "rsi" | "rsi_strategy" => "RSI 阈值反转触发调仓",
+        "macd" | "macd_strategy" => "MACD 柱线交叉触发调仓",
+        "bollinger" | "bollinger_bands" => "布林带区间触发调仓",
+        "mean_reversion" => "均值回归阈值触发调仓",
+        "pairs_trading" | "statistical_arbitrage" => "价差偏离触发调仓",
+        _ => "策略信号触发调仓",
+    };
+
+    format!(
+        "{strategy_phrase}，按参数快照中的最大仓位占比上限执行（{}%）",
+        max_position_percent as i64
+    )
+}
+
+fn build_backtest_runtime_metadata(result: &BacktestResult) -> BacktestRuntimeMetadata {
+    BacktestRuntimeMetadata {
+        data_quality: result.data_quality.clone(),
+        assumptions: result.assumptions.clone(),
+        execution_link: result.execution_link.clone(),
+    }
+}
+
+fn persisted_backtest_parameters(
+    config: &StrategyConfig,
+    result: &BacktestResult,
+) -> AppResult<serde_json::Value> {
+    let mut parameters = result
+        .parameters
+        .clone()
+        .unwrap_or_else(|| config.parameters.clone());
+    let metadata = build_backtest_runtime_metadata(result);
+
+    if metadata.data_quality.is_some()
+        || metadata.assumptions.is_some()
+        || metadata.execution_link.is_some()
+    {
+        parameters.insert(
+            BACKTEST_RUNTIME_METADATA_KEY.to_string(),
+            serde_json::to_value(metadata).map_err(AppError::Serialization)?,
+        );
+    }
+
+    serde_json::to_value(parameters).map_err(AppError::Serialization)
+}
+
+fn hydrate_backtest_runtime_metadata(
+    mut parameters: HashMap<String, serde_json::Value>,
+) -> AppResult<(
+    HashMap<String, serde_json::Value>,
+    Option<BacktestDataQuality>,
+    Option<BacktestAssumptions>,
+    Option<BacktestExecutionLink>,
+)> {
+    let metadata = parameters
+        .remove(BACKTEST_RUNTIME_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<BacktestRuntimeMetadata>(value).ok());
+
+    Ok((
+        parameters,
+        metadata
+            .as_ref()
+            .and_then(|value| value.data_quality.clone()),
+        metadata
+            .as_ref()
+            .and_then(|value| value.assumptions.clone()),
+        metadata
+            .as_ref()
+            .and_then(|value| value.execution_link.clone()),
+    ))
+}
+
+fn infer_backtest_timeframe_interval_seconds(timeframe: &str) -> Option<i64> {
+    match timeframe {
+        "1m" => Some(60),
+        "5m" => Some(5 * 60),
+        "15m" => Some(15 * 60),
+        "30m" => Some(30 * 60),
+        "1h" => Some(60 * 60),
+        "1d" => Some(24 * 60 * 60),
+        "1wk" => Some(7 * 24 * 60 * 60),
+        "1mo" => Some(30 * 24 * 60 * 60),
+        _ => None,
+    }
+}
+
+fn gap_detection_threshold_seconds(timeframe: &str, expected_interval_seconds: i64) -> i64 {
+    match timeframe {
+        "1d" => expected_interval_seconds * 4,
+        "1wk" => expected_interval_seconds * 3,
+        "1mo" => expected_interval_seconds * 2,
+        _ => expected_interval_seconds * 2,
+    }
+}
+
+fn detect_backtest_missing_intervals(bars: &[MarketData], timeframe: &str) -> Vec<BacktestDataGap> {
+    let Some(expected_interval_seconds) = infer_backtest_timeframe_interval_seconds(timeframe)
+    else {
+        return Vec::new();
+    };
+
+    let threshold_seconds = gap_detection_threshold_seconds(timeframe, expected_interval_seconds);
+    let expected_interval = chrono::Duration::seconds(expected_interval_seconds);
+
+    bars.windows(2)
+        .filter_map(|window| {
+            let start = window[0].timestamp;
+            let end = window[1].timestamp;
+            let observed_seconds = (end - start).num_seconds();
+
+            if observed_seconds <= threshold_seconds {
+                return None;
+            }
+
+            let missing_bars_hint = (observed_seconds / expected_interval_seconds)
+                .saturating_sub(1)
+                .max(1);
+            Some(BacktestDataGap {
+                start: start + expected_interval,
+                end: end - expected_interval,
+                expected_interval_seconds,
+                observed_interval_seconds: observed_seconds,
+                missing_bars_hint,
+            })
+        })
+        .collect()
+}
+
 fn build_historical_data_insufficient_error(
     symbol: &str,
     timeframe: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     points: usize,
+    quality: Option<&BacktestDataQuality>,
 ) -> AppError {
+    let quality_suffix = quality.map(|quality| {
+        let mut items = Vec::new();
+        if quality.local_data_hit {
+            items.push("本地行情库命中");
+        }
+        if quality.external_data_fallback {
+            items.push("外部回退");
+        }
+        if !quality.missing_intervals.is_empty() {
+            items.push("存在时间戳缺口");
+        }
+        if items.is_empty() {
+            String::new()
+        } else {
+            format!("；数据质量提示: {}", items.join("、"))
+        }
+    });
+
     AppError::historical_data_insufficient(format!(
-        "Historical data insufficient for {symbol} ({timeframe}) between {} and {}. Need at least 20 bars, found {points}.",
+        "Historical data insufficient for {symbol} ({timeframe}) between {} and {}. Need at least 20 bars, found {points}{}.",
         start.format("%Y-%m-%d"),
         end.format("%Y-%m-%d"),
+        quality_suffix.unwrap_or_default(),
     ))
 }
 
@@ -1191,7 +1481,7 @@ fn classify_backtest_data_load_error(
         || lowercase.contains("no quote data")
         || lowercase.contains("yahoo finance error: no data")
     {
-        return build_historical_data_insufficient_error(symbol, timeframe, start, end, 0);
+        return build_historical_data_insufficient_error(symbol, timeframe, start, end, 0, None);
     }
 
     AppError::data_source_failure(format!(
@@ -1454,6 +1744,9 @@ fn simulate_backtest(
         win_rate,
         total_trades: trades.len() as i32,
         performance_metrics,
+        data_quality: None,
+        assumptions: None,
+        execution_link: None,
         created_at: None,
     })
 }
@@ -2134,6 +2427,9 @@ mod tests {
             win_rate: 0.0,
             total_trades: 0,
             performance_metrics: crate::types::PerformanceMetrics::default(),
+            data_quality: None,
+            assumptions: None,
+            execution_link: None,
             created_at: None,
         };
 
@@ -2183,6 +2479,9 @@ mod tests {
             win_rate: 0.0,
             total_trades: 0,
             performance_metrics: crate::types::PerformanceMetrics::default(),
+            data_quality: None,
+            assumptions: None,
+            execution_link: None,
             created_at: None,
         };
 
@@ -2223,6 +2522,9 @@ mod tests {
             win_rate: 0.0,
             total_trades: 0,
             performance_metrics: crate::types::PerformanceMetrics::default(),
+            data_quality: None,
+            assumptions: None,
+            execution_link: None,
             created_at: None,
         };
 
@@ -2274,5 +2576,231 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Failed to load backtest data for AAPL (1d)"));
+    }
+
+    #[test]
+    fn build_historical_data_insufficient_error_includes_quality_hint() {
+        let quality = build_backtest_data_quality(
+            "本地行情库 + Yahoo Finance 回退",
+            true,
+            true,
+            &[MarketData {
+                symbol: "AAPL".to_string(),
+                timestamp: Utc::now(),
+                price: Decimal::new(100, 0),
+                volume: 1000,
+                bid_price: None,
+                ask_price: None,
+                bid_size: None,
+                ask_size: None,
+                open_price: None,
+                high_price: None,
+                low_price: None,
+                previous_close: None,
+                market_cap: None,
+                pe_ratio: None,
+                data_source: Some("database".to_string()),
+                exchange: None,
+            }],
+            "1d",
+        );
+        let start = Utc::now() - chrono::Duration::days(2);
+        let end = Utc::now();
+
+        let error =
+            build_historical_data_insufficient_error("AAPL", "1d", start, end, 1, Some(&quality));
+
+        assert!(error.to_string().contains("数据质量提示"));
+        assert!(error.to_string().contains("本地行情库命中"));
+    }
+
+    #[test]
+    fn build_backtest_data_quality_detects_gap_and_marks_local_hit() {
+        let base = Utc::now();
+        let bars = vec![
+            MarketData {
+                symbol: "AAPL".to_string(),
+                timestamp: base,
+                price: Decimal::new(100, 0),
+                volume: 1000,
+                bid_price: None,
+                ask_price: None,
+                bid_size: None,
+                ask_size: None,
+                open_price: None,
+                high_price: None,
+                low_price: None,
+                previous_close: None,
+                market_cap: None,
+                pe_ratio: None,
+                data_source: Some("database".to_string()),
+                exchange: None,
+            },
+            MarketData {
+                symbol: "AAPL".to_string(),
+                timestamp: base + chrono::Duration::hours(1),
+                price: Decimal::new(101, 0),
+                volume: 1000,
+                bid_price: None,
+                ask_price: None,
+                bid_size: None,
+                ask_size: None,
+                open_price: None,
+                high_price: None,
+                low_price: None,
+                previous_close: None,
+                market_cap: None,
+                pe_ratio: None,
+                data_source: Some("database".to_string()),
+                exchange: None,
+            },
+            MarketData {
+                symbol: "AAPL".to_string(),
+                timestamp: base + chrono::Duration::hours(4),
+                price: Decimal::new(105, 0),
+                volume: 1000,
+                bid_price: None,
+                ask_price: None,
+                bid_size: None,
+                ask_size: None,
+                open_price: None,
+                high_price: None,
+                low_price: None,
+                previous_close: None,
+                market_cap: None,
+                pe_ratio: None,
+                data_source: Some("database".to_string()),
+                exchange: None,
+            },
+        ];
+
+        let quality = build_backtest_data_quality("本地行情库", true, false, &bars, "1h");
+
+        assert!(quality.local_data_hit);
+        assert!(!quality.external_data_fallback);
+        assert_eq!(quality.bar_count, 3);
+        assert!(!quality.missing_intervals.is_empty());
+        assert!(quality.notes.iter().any(|note| note.contains("时间戳缺口")));
+    }
+
+    #[test]
+    fn build_backtest_data_quality_marks_very_short_windows_as_insufficient() {
+        let bars = vec![MarketData {
+            symbol: "AAPL".to_string(),
+            timestamp: Utc::now(),
+            price: Decimal::new(100, 0),
+            volume: 1000,
+            bid_price: None,
+            ask_price: None,
+            bid_size: None,
+            ask_size: None,
+            open_price: None,
+            high_price: None,
+            low_price: None,
+            previous_close: None,
+            market_cap: None,
+            pe_ratio: None,
+            data_source: Some("database".to_string()),
+            exchange: None,
+        }];
+
+        let quality = build_backtest_data_quality("本地行情库", true, false, &bars, "1d");
+
+        assert!(quality.data_insufficient);
+        assert_eq!(quality.bar_count, 1);
+        assert_eq!(quality.minimum_required_bars, 20);
+    }
+
+    #[test]
+    fn build_backtest_assumptions_reflects_snapshot_parameters() {
+        let mut config = StrategyConfig::new(
+            "strategy-7".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        config.parameters.insert("fee_bps".to_string(), json!(7.5));
+        config
+            .parameters
+            .insert("slippage_bps".to_string(), json!(3.0));
+        config
+            .parameters
+            .insert("max_position_fraction".to_string(), json!(0.8));
+
+        let assumptions = build_backtest_assumptions(&config, "本地行情库");
+
+        assert_eq!(assumptions.fee_bps, 7.5);
+        assert_eq!(assumptions.slippage_bps, 3.0);
+        assert_eq!(assumptions.max_position_fraction, 0.8);
+        assert_eq!(assumptions.data_source, "本地行情库");
+        assert!(assumptions.rebalancing_logic.contains("双均线交叉触发调仓"));
+    }
+
+    #[test]
+    fn persisted_and_hydrated_runtime_metadata_round_trip() {
+        let config = StrategyConfig::new(
+            "strategy-8".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        let result = BacktestResult {
+            run_id: None,
+            experiment_id: None,
+            experiment_label: None,
+            experiment_note: None,
+            parameter_version: None,
+            strategy_id: config.id.clone(),
+            strategy_name: Some("SMA".to_string()),
+            symbol: Some("AAPL".to_string()),
+            timeframe: Some("1d".to_string()),
+            parameters: Some(HashMap::from([("short_period".to_string(), json!(5))])),
+            trades: None,
+            equity_curve: None,
+            start_date: Utc::now(),
+            end_date: Utc::now(),
+            initial_capital: Decimal::new(100000, 0),
+            final_capital: Decimal::new(100000, 0),
+            total_return: 0.0,
+            annualized_return: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            win_rate: 0.0,
+            total_trades: 0,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            data_quality: Some(BacktestDataQuality {
+                source_label: "本地行情库".to_string(),
+                local_data_hit: true,
+                external_data_fallback: false,
+                bar_count: 20,
+                minimum_required_bars: 20,
+                data_insufficient: false,
+                missing_intervals: Vec::new(),
+                notes: vec!["ok".to_string()],
+            }),
+            assumptions: Some(BacktestAssumptions {
+                fee_bps: 5.0,
+                slippage_bps: 2.0,
+                max_position_fraction: 1.0,
+                rebalancing_logic: "test".to_string(),
+                data_source: "本地行情库".to_string(),
+            }),
+            execution_link: Some(build_backtest_execution_link()),
+            created_at: None,
+        };
+
+        let persisted =
+            persisted_backtest_parameters(&config, &result).expect("parameters should serialize");
+        let parameters: HashMap<String, serde_json::Value> =
+            serde_json::from_value(persisted).expect("parameters should deserialize");
+        let (parameters, data_quality, assumptions, execution_link) =
+            hydrate_backtest_runtime_metadata(parameters).expect("metadata should hydrate");
+
+        assert_eq!(
+            parameters
+                .get("short_period")
+                .and_then(|value| value.as_i64()),
+            Some(5)
+        );
+        assert!(data_quality.is_some());
+        assert!(assumptions.is_some());
+        assert!(execution_link.is_some());
+        assert!(!parameters.contains_key(BACKTEST_RUNTIME_METADATA_KEY));
     }
 }

@@ -23,6 +23,9 @@ export interface BacktestExportRow {
   sharpe_ratio: number;
   win_rate: number;
   total_trades: number;
+  data_quality_summary: string;
+  assumptions_summary: string;
+  execution_link_summary: string;
 }
 
 export function getBacktestResultKey(
@@ -75,6 +78,9 @@ export function buildBacktestExportRows(
     sharpe_ratio: result.sharpe_ratio,
     win_rate: result.win_rate,
     total_trades: result.total_trades,
+    data_quality_summary: summarizeDataQuality(result),
+    assumptions_summary: summarizeAssumptions(result),
+    execution_link_summary: summarizeExecutionLink(result),
   }));
 }
 
@@ -114,6 +120,9 @@ export function serializeBacktestExportRowsToCsv(rows: BacktestExportRow[]): str
     'sharpe_ratio',
     'win_rate',
     'total_trades',
+    'data_quality_summary',
+    'assumptions_summary',
+    'execution_link_summary',
   ];
 
   const lines = [
@@ -127,4 +136,44 @@ export function serializeBacktestExportRowsToCsv(rows: BacktestExportRow[]): str
 function escapeCsvCell(value: string | number): string {
   const text = String(value);
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function summarizeDataQuality(result: BacktestResult): string {
+  const quality = result.data_quality;
+  if (!quality) {
+    return '-';
+  }
+
+  const flags = [
+    quality.local_data_hit ? '本地命中' : null,
+    quality.external_data_fallback ? '外部回退' : null,
+    quality.data_insufficient ? '数据不足' : null,
+    quality.missing_intervals.length > 0 ? `缺口 ${quality.missing_intervals.length}` : null,
+  ].filter((value): value is string => Boolean(value));
+
+  return `${quality.source_label || '-'} | ${flags.join('、') || '暂无标识'}`;
+}
+
+function summarizeAssumptions(result: BacktestResult): string {
+  const assumptions = result.assumptions;
+  if (!assumptions) {
+    return '-';
+  }
+
+  return [
+    `手续费 ${assumptions.fee_bps}bps`,
+    `滑点 ${assumptions.slippage_bps}bps`,
+    `最大仓位 ${Math.round(assumptions.max_position_fraction * 100)}%`,
+    `调仓 ${assumptions.rebalancing_logic}`,
+    `数据源 ${assumptions.data_source}`,
+  ].join(' | ');
+}
+
+function summarizeExecutionLink(result: BacktestResult): string {
+  const link = result.execution_link;
+  if (!link) {
+    return 'reference_match_only';
+  }
+
+  return `${link.status}${link.explicit_link_id ? `:${link.explicit_link_id}` : ''}`;
 }

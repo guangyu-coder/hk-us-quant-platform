@@ -1475,6 +1475,35 @@ fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
         "symbol": result.symbol,
         "timeframe": result.timeframe,
         "parameters": result.parameters,
+        "data_quality": result.data_quality.as_ref().map(|quality| json!({
+            "source_label": quality.source_label,
+            "local_data_hit": quality.local_data_hit,
+            "external_data_fallback": quality.external_data_fallback,
+            "bar_count": quality.bar_count,
+            "minimum_required_bars": quality.minimum_required_bars,
+            "data_insufficient": quality.data_insufficient,
+            "notes": quality.notes,
+            "missing_intervals": quality.missing_intervals.iter().map(|gap| json!({
+                "start": gap.start.to_rfc3339(),
+                "end": gap.end.to_rfc3339(),
+                "expected_interval_seconds": gap.expected_interval_seconds,
+                "observed_interval_seconds": gap.observed_interval_seconds,
+                "missing_bars_hint": gap.missing_bars_hint,
+            })).collect::<Vec<_>>(),
+        })),
+        "assumptions": result.assumptions.as_ref().map(|assumptions| json!({
+            "fee_bps": assumptions.fee_bps,
+            "slippage_bps": assumptions.slippage_bps,
+            "max_position_fraction": assumptions.max_position_fraction,
+            "rebalancing_logic": assumptions.rebalancing_logic,
+            "data_source": assumptions.data_source,
+        })),
+        "execution_link": result.execution_link.as_ref().map(|link| json!({
+            "status": link.status,
+            "reference_scope": link.reference_scope,
+            "explicit_link_id": link.explicit_link_id.map(|id| id.to_string()),
+            "note": link.note,
+        })),
         "trades": result.trades.map(|trades| trades.into_iter().map(|trade| json!({
             "timestamp": trade.timestamp.to_rfc3339(),
             "side": trade.side,
@@ -2231,6 +2260,29 @@ mod http_e2e_tests {
             symbol: Some("AAPL".to_string()),
             timeframe: Some("1d".to_string()),
             parameters: Some(std::collections::HashMap::new()),
+            data_quality: Some(crate::types::BacktestDataQuality {
+                source_label: "本地行情库".to_string(),
+                local_data_hit: true,
+                external_data_fallback: false,
+                bar_count: 32,
+                minimum_required_bars: 20,
+                data_insufficient: false,
+                missing_intervals: Vec::new(),
+                notes: vec!["ok".to_string()],
+            }),
+            assumptions: Some(crate::types::BacktestAssumptions {
+                fee_bps: 5.0,
+                slippage_bps: 2.0,
+                max_position_fraction: 1.0,
+                rebalancing_logic: "双均线交叉触发调仓".to_string(),
+                data_source: "本地行情库".to_string(),
+            }),
+            execution_link: Some(crate::types::BacktestExecutionLink {
+                status: "reference_match_only".to_string(),
+                reference_scope: "strategy_id + symbol + backtest window".to_string(),
+                explicit_link_id: None,
+                note: "参考匹配".to_string(),
+            }),
             trades: Some(Vec::new()),
             equity_curve: Some(Vec::new()),
             start_date: Utc::now(),
@@ -2252,6 +2304,15 @@ mod http_e2e_tests {
         assert_eq!(response["experiment_label"], json!("Batch A"));
         assert_eq!(response["parameter_version"], json!("v1"));
         assert!(response["experiment_id"].as_str().is_some());
+        assert_eq!(
+            response["data_quality"]["source_label"],
+            json!("本地行情库")
+        );
+        assert_eq!(response["assumptions"]["fee_bps"], json!(5.0));
+        assert_eq!(
+            response["execution_link"]["status"],
+            json!("reference_match_only")
+        );
     }
 
     #[test]

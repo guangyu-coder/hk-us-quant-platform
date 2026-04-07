@@ -115,6 +115,29 @@ const backtestResult = {
     largest_win: 4000,
     largest_loss: 1000,
   },
+  data_quality: {
+    source_label: '本地行情库 + Yahoo Finance 回退',
+    local_data_hit: true,
+    external_data_fallback: true,
+    bar_count: 30,
+    minimum_required_bars: 20,
+    data_insufficient: false,
+    missing_intervals: [],
+    notes: ['基于 bar 时间戳的启发式连续性检测'],
+  },
+  assumptions: {
+    fee_bps: 5,
+    slippage_bps: 2,
+    max_position_fraction: 1,
+    rebalancing_logic: '双均线交叉触发调仓，按参数快照中的最大仓位占比上限执行（100%）',
+    data_source: '本地行情库 + Yahoo Finance 回退',
+  },
+  execution_link: {
+    status: 'reference_match_only',
+    reference_scope: 'strategy_id + symbol + backtest window',
+    explicit_link_id: null,
+    note: '当前仅按策略、标的和回测区间参考匹配真实执行成交，未建立一一对应关系。',
+  },
   created_at: '2026-04-02T01:00:00Z',
 };
 
@@ -241,6 +264,9 @@ describe('UI smoke', () => {
 
     await user.click(screen.getAllByRole('button', { name: '查看详情' })[0]);
     await screen.findByText('运行元数据');
+    await screen.findByText('可信度与回测假设');
+    await screen.findByText('本地数据命中');
+    await screen.findByText(/参考匹配真实执行成交/);
     await user.click(screen.getAllByRole('button', { name: '收起详情' })[0]);
 
     await waitFor(() => {

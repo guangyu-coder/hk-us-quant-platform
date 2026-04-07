@@ -6,11 +6,16 @@ import { strategyApi, tradeApi } from '@/lib/api';
 import type { BacktestResult, StrategyConfig } from '@/types';
 import {
   buildBacktestFilterSummary,
+  describeBacktestAssumptions,
+  describeBacktestDataQuality,
+  describeBacktestExecutionLink,
   buildParameterSnapshotSummary,
   describeBacktestExperiment,
   deriveBacktestStrategyName,
   deriveRunSnapshotName,
   getReferenceTradesForBacktestWindow,
+  formatBacktestMissingInterval,
+  summarizeBacktestConfidence,
   hasActiveBacktestFilters,
 } from './report-helpers';
 import {
@@ -870,6 +875,8 @@ export default function BacktestPage() {
             const isCompareSelected = compareSelection.includes(runKey);
             const experimentResults = getExperimentResults(result);
             const hasExperimentBatch = Boolean(result.experiment_id && experimentResults.length > 1);
+            const dataQualitySummary = describeBacktestDataQuality(result);
+            const assumptionSummary = describeBacktestAssumptions(result);
 
             return (
             <div id={`backtest-run-${runKey}`} key={runKey} className="bg-white rounded-lg shadow">
@@ -1238,6 +1245,75 @@ export default function BacktestPage() {
                       </div>
                     </div>
 
+                    <div className="rounded-lg border border-sky-200 bg-sky-50/60 p-4">
+                      <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                        <div>
+                          <h4 className="text-base font-medium text-sky-900">可信度与回测假设</h4>
+                          <p className="mt-1 text-sm text-sky-800">
+                            这里展示的是回测输入与数据质量快照，只用于参考，不代表真实执行成交与回测结果天然一一对应。
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-sky-700">
+                          {summarizeBacktestConfidence(result)}
+                        </span>
+                      </div>
+
+                      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                        <div className="rounded-lg border border-sky-100 bg-white p-4">
+                          <h5 className="text-sm font-medium text-slate-900">数据质量</h5>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {(dataQualitySummary.length > 0
+                              ? dataQualitySummary
+                              : ['暂无数据质量元数据']).map((item) => (
+                              <span
+                                key={item}
+                                className="rounded-full bg-sky-50 px-3 py-1 text-xs font-medium text-sky-700"
+                              >
+                                {item}
+                              </span>
+                            ))}
+                          </div>
+                          {(result.data_quality?.notes?.length ?? 0) > 0 && (
+                            <ul className="mt-3 space-y-1 text-sm text-slate-600">
+                              {result.data_quality?.notes.map((note) => (
+                                <li key={note}>· {note}</li>
+                              ))}
+                            </ul>
+                          )}
+                          {(result.data_quality?.missing_intervals?.length ?? 0) > 0 && (
+                            <div className="mt-4 rounded-md bg-amber-50 p-3 text-sm text-amber-900">
+                              <p className="font-medium">缺失区间提示</p>
+                              <ul className="mt-2 space-y-1">
+                                {result.data_quality?.missing_intervals.map((gap, index) => (
+                                  <li key={`${gap.start}-${gap.end}-${index}`}>
+                                    {formatBacktestMissingInterval(gap)}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="rounded-lg border border-sky-100 bg-white p-4">
+                          <h5 className="text-sm font-medium text-slate-900">回测假设</h5>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {(assumptionSummary.length > 0 ? assumptionSummary : ['暂无假设快照']).map((item) => (
+                              <span
+                                key={item}
+                                className="rounded-full bg-sky-50 px-3 py-1 text-xs font-medium text-sky-700"
+                              >
+                                {item}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-700">
+                            <p className="font-medium text-slate-900">执行关联说明</p>
+                            <p className="mt-1">{describeBacktestExecutionLink(result)}</p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
                       <div className="rounded-lg border border-gray-200 p-4">
                         <h4 className="mb-3 text-base font-medium text-gray-900">资金曲线</h4>
@@ -1309,17 +1385,17 @@ export default function BacktestPage() {
                       </div>
                     </div>
 
-                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-4">
-                      <div className="mb-3 flex items-center justify-between">
-                        <div>
-                          <h4 className="text-base font-medium text-gray-900">参考执行成交</h4>
-                          <p className="mt-1 text-sm text-gray-600">
-                            来自 `trades` 表中按策略、标的和回测区间匹配到的执行记录，用于和回测模拟成交做参考对照。
-                          </p>
-                        </div>
-                        <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
-                          {getReferenceTradesForRun(result).length} 笔
-                        </span>
+                      <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-4">
+                        <div className="mb-3 flex items-center justify-between">
+                          <div>
+                            <h4 className="text-base font-medium text-gray-900">参考执行成交</h4>
+                            <p className="mt-1 text-sm text-gray-600">
+                            来自 `trades` 表中按策略、标的和回测区间做参考匹配的执行记录，仅用于对照，不代表与回测结果一一绑定。
+                            </p>
+                          </div>
+                          <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
+                            {getReferenceTradesForRun(result).length} 笔
+                          </span>
                       </div>
                       <div className="max-h-72 overflow-auto rounded-lg bg-white">
                         <table className="min-w-full text-sm">

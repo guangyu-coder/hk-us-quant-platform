@@ -269,6 +269,40 @@ export interface RiskAlert {
   created_at: string;
 }
 
+export interface BacktestDataGap {
+  start: string;
+  end: string;
+  expected_interval_seconds: number;
+  observed_interval_seconds: number;
+  missing_bars_hint: number;
+}
+
+export interface BacktestDataQuality {
+  source_label: string;
+  local_data_hit: boolean;
+  external_data_fallback: boolean;
+  bar_count: number;
+  minimum_required_bars: number;
+  data_insufficient: boolean;
+  missing_intervals: BacktestDataGap[];
+  notes: string[];
+}
+
+export interface BacktestAssumptions {
+  fee_bps: number;
+  slippage_bps: number;
+  max_position_fraction: number;
+  rebalancing_logic: string;
+  data_source: string;
+}
+
+export interface BacktestExecutionLink {
+  status: string;
+  reference_scope: string;
+  explicit_link_id?: string | null;
+  note: string;
+}
+
 // 回测结果类型
 export interface BacktestResult {
   run_id?: string;
@@ -281,6 +315,9 @@ export interface BacktestResult {
   symbol?: string;
   timeframe?: string;
   parameters?: Record<string, any>;
+  data_quality?: BacktestDataQuality | null;
+  assumptions?: BacktestAssumptions | null;
+  execution_link?: BacktestExecutionLink | null;
   trades?: BacktestTrade[];
   equity_curve?: BacktestEquityPoint[];
   start_date: string;

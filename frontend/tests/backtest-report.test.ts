@@ -4,8 +4,12 @@ import {
   buildBacktestFilterSummary,
   buildParameterSnapshotSummary,
   describeBacktestExperiment,
+  describeBacktestAssumptions,
+  describeBacktestDataQuality,
+  describeBacktestExecutionLink,
   deriveBacktestStrategyName,
   deriveRunSnapshotName,
+  formatBacktestMissingInterval,
   getNextExpandedRunId,
   getReferenceTradesForBacktestWindow,
 } from '../src/app/backtest/report-helpers.ts';
@@ -72,6 +76,37 @@ const result: BacktestResult = {
     average_loss: 2000,
     largest_win: 12000,
     largest_loss: 2000,
+  },
+  data_quality: {
+    source_label: '本地行情库 + Yahoo Finance 回退',
+    local_data_hit: true,
+    external_data_fallback: true,
+    bar_count: 28,
+    minimum_required_bars: 20,
+    data_insufficient: false,
+    missing_intervals: [
+      {
+        start: '2026-03-12T00:00:00Z',
+        end: '2026-03-13T00:00:00Z',
+        expected_interval_seconds: 86400,
+        observed_interval_seconds: 259200,
+        missing_bars_hint: 2,
+      },
+    ],
+    notes: ['基于 bar 时间戳的启发式连续性检测'],
+  },
+  assumptions: {
+    fee_bps: 5,
+    slippage_bps: 2,
+    max_position_fraction: 1,
+    rebalancing_logic: '双均线交叉触发调仓，按参数快照中的最大仓位占比上限执行（100%）',
+    data_source: '本地行情库 + Yahoo Finance 回退',
+  },
+  execution_link: {
+    status: 'reference_match_only',
+    reference_scope: 'strategy_id + symbol + backtest window',
+    explicit_link_id: null,
+    note: '当前仅按策略、标的和回测区间参考匹配真实执行成交，未建立一一对应关系。',
   },
   created_at: '2026-04-01T00:00:00Z',
 };
@@ -159,4 +194,35 @@ test('experiment summary highlights batch metadata', () => {
     }),
     ['标签 Batch 1', '版本 v1', '备注 note', '实验 12345678']
   );
+});
+
+test('confidence helpers surface data quality and reference-only execution semantics', () => {
+  assert.deepEqual(describeBacktestDataQuality(result), [
+    '数据源 本地行情库 + Yahoo Finance 回退',
+    '本地数据命中',
+    '外部数据回退',
+    'bar 数 28',
+    '缺失区间 1 处',
+  ]);
+  assert.deepEqual(describeBacktestAssumptions(result), [
+    '手续费 5bps',
+    '滑点 2bps',
+    '最大仓位 100%',
+    '调仓 双均线交叉触发调仓，按参数快照中的最大仓位占比上限执行（100%）',
+    '数据源 本地行情库 + Yahoo Finance 回退',
+  ]);
+  assert.match(describeBacktestExecutionLink(result), /参考匹配真实执行成交/);
+});
+
+test('missing interval formatter keeps gap details readable', () => {
+  const formatted = formatBacktestMissingInterval({
+    start: '2026-03-12T00:00:00Z',
+    end: '2026-03-13T00:00:00Z',
+    expected_interval_seconds: 86400,
+    observed_interval_seconds: 259200,
+    missing_bars_hint: 2,
+  });
+
+  assert.match(formatted, /缺口约 2 根 bar/);
+  assert.match(formatted, /2026/);
 });

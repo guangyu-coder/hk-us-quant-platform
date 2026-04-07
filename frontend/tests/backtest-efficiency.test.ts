@@ -44,6 +44,29 @@ const sampleResult = {
     largest_win: 420,
     largest_loss: -260,
   },
+  data_quality: {
+    source_label: '本地行情库',
+    local_data_hit: true,
+    external_data_fallback: false,
+    bar_count: 24,
+    minimum_required_bars: 20,
+    data_insufficient: false,
+    missing_intervals: [],
+    notes: [],
+  },
+  assumptions: {
+    fee_bps: 5,
+    slippage_bps: 2,
+    max_position_fraction: 1,
+    rebalancing_logic: '信号触发调仓',
+    data_source: '本地行情库',
+  },
+  execution_link: {
+    status: 'reference_match_only',
+    reference_scope: 'strategy_id + symbol + backtest window',
+    explicit_link_id: null,
+    note: 'reference only',
+  },
 } satisfies BacktestResult;
 
 test('buildBacktestExportRows resolves names and keeps a stable key', () => {
@@ -54,6 +77,9 @@ test('buildBacktestExportRows resolves names and keeps a stable key', () => {
   assert.equal(rows[0].experiment_label, 'Alpha Batch');
   assert.equal(rows[0].parameter_version, 'v1.0');
   assert.equal(rows[0].run_snapshot_name, 'Legacy Momentum');
+  assert.match(rows[0].data_quality_summary, /本地行情库/);
+  assert.match(rows[0].assumptions_summary, /手续费 5bps/);
+  assert.equal(rows[0].execution_link_summary, 'reference_match_only');
   assert.equal(rows[0].total_return, 0.085);
   assert.equal(rows[0].win_rate, 0.58);
 });

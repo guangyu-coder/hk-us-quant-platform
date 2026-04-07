@@ -1,4 +1,9 @@
-import type { BacktestResult, ExecutionTrade, StrategyConfig } from '@/types';
+import type {
+  BacktestDataGap,
+  BacktestResult,
+  ExecutionTrade,
+  StrategyConfig,
+} from '@/types';
 
 export function deriveBacktestStrategyName(
   result: Pick<BacktestResult, 'strategy_id' | 'strategy_name'>,
@@ -120,6 +125,79 @@ export function describeBacktestExperiment(result: Pick<BacktestResult, 'experim
   return items;
 }
 
+export function describeBacktestDataQuality(
+  result: Pick<BacktestResult, 'data_quality'>
+): string[] {
+  const quality = result.data_quality;
+  if (!quality) {
+    return [];
+  }
+
+  const items = [
+    quality.source_label?.trim() ? `数据源 ${quality.source_label.trim()}` : null,
+    quality.local_data_hit ? '本地数据命中' : null,
+    quality.external_data_fallback ? '外部数据回退' : null,
+    `bar 数 ${quality.bar_count}`,
+    quality.data_insufficient ? '数据不足' : null,
+    quality.missing_intervals.length > 0
+      ? `缺失区间 ${quality.missing_intervals.length} 处`
+      : null,
+  ].filter((value): value is string => Boolean(value));
+
+  return items;
+}
+
+export function describeBacktestAssumptions(
+  result: Pick<BacktestResult, 'assumptions'>
+): string[] {
+  const assumptions = result.assumptions;
+  if (!assumptions) {
+    return [];
+  }
+
+  return [
+    `手续费 ${formatParameterNumber(assumptions.fee_bps)}bps`,
+    `滑点 ${formatParameterNumber(assumptions.slippage_bps)}bps`,
+    `最大仓位 ${formatParameterNumber(assumptions.max_position_fraction * 100)}%`,
+    `调仓 ${assumptions.rebalancing_logic}`,
+    `数据源 ${assumptions.data_source}`,
+  ];
+}
+
+export function describeBacktestExecutionLink(
+  result: Pick<BacktestResult, 'execution_link'>
+): string {
+  const link = result.execution_link;
+  if (!link) {
+    return '当前仅按策略、标的与时间区间做参考匹配，未建立一一对应关系。';
+  }
+
+  if (link.explicit_link_id) {
+    return `已显式关联执行记录 ${link.explicit_link_id.slice(0, 8)}，但仍保留参考匹配视图。`;
+  }
+
+  return link.note.trim() || '当前仅按策略、标的与时间区间做参考匹配，未建立一一对应关系。';
+}
+
+export function formatBacktestMissingInterval(gap: BacktestDataGap): string {
+  return `${formatDateTime(gap.start)} - ${formatDateTime(gap.end)} · 缺口约 ${gap.missing_bars_hint} 根 bar`;
+}
+
+export function summarizeBacktestConfidence(
+  result: Pick<BacktestResult, 'data_quality' | 'assumptions' | 'execution_link'>
+): string {
+  const quality = result.data_quality;
+  const parts = [
+    quality?.source_label?.trim() ? quality.source_label.trim() : null,
+    quality?.local_data_hit ? '本地命中' : null,
+    quality?.external_data_fallback ? '外部回退' : null,
+    quality?.data_insufficient ? '数据不足' : null,
+    result.assumptions?.rebalancing_logic?.trim() ? result.assumptions.rebalancing_logic.trim() : null,
+  ].filter((value): value is string => Boolean(value));
+
+  return parts.length > 0 ? parts.join(' · ') : '暂无可信度摘要';
+}
+
 export function buildParameterSnapshotSummary(
   parameters?: Record<string, unknown>
 ): string[] {
@@ -157,4 +235,8 @@ function formatParameterNumber(value: unknown): string {
   }
 
   return String(value);
+}
+
+function formatDateTime(value: string): string {
+  return new Date(value).toLocaleString('zh-CN');
 }
