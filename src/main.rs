@@ -44,8 +44,9 @@ use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
 use crate::strategy::StrategyService;
 use crate::types::{
-    BacktestExperimentMetadata, ExecutionTrade, OrderSide, OrderStatus, OrderType, RiskLimits,
-    StrategyConfig,
+    BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
+    RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
+    StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -411,6 +412,10 @@ fn create_router(state: AppState) -> Router {
         .route("/api/v1/strategies", post(create_strategy))
         .route("/api/v1/strategies/:strategy_id", put(update_strategy))
         .route("/api/v1/strategies/:strategy_id", delete(delete_strategy))
+        .route(
+            "/api/v1/strategies/:strategy_id/state",
+            get(get_strategy_state),
+        )
         .route(
             "/api/v1/strategies/:strategy_id/backtest",
             post(run_backtest),
@@ -1023,6 +1028,41 @@ async fn list_backtests(
         .collect::<Vec<_>>())))
 }
 
+async fn get_strategy_state(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let latest_backtest = state
+        .strategy_service
+        .list_backtest_runs_filtered(1, Some(&strategy_id), None, None, None, None, None)
+        .await?
+        .into_iter()
+        .next();
+
+    let latest_real_trade = state
+        .portfolio_service
+        .list_trades(Some(&strategy_id), None, 1)
+        .await?
+        .into_iter()
+        .next();
+
+    let strategy_name = state
+        .strategy_service
+        .get_strategy_config(&strategy_id)
+        .await
+        .ok()
+        .and_then(|config| config.display_name.or(Some(config.name)));
+
+    let overview = build_strategy_execution_overview(
+        strategy_id,
+        strategy_name,
+        latest_backtest,
+        latest_real_trade,
+    );
+
+    Ok(Json(json!(overview)))
+}
+
 async fn fetch_market_data_value(symbol: &str) -> Result<Value, AppError> {
     use crate::market_data::yahoo_finance::YahooFinanceClient;
 
@@ -1544,6 +1584,110 @@ fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
             "largest_loss": result.performance_metrics.largest_loss.to_f64().unwrap_or(0.0),
         }
     })
+}
+
+fn build_strategy_execution_overview(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    latest_backtest: Option<BacktestResult>,
+    latest_real_trade: Option<ExecutionTrade>,
+) -> StrategyExecutionOverview {
+    let latest_backtest_summary = latest_backtest
+        .as_ref()
+        .map(summarize_backtest_for_strategy_state);
+    let latest_real_trade_summary = latest_real_trade
+        .as_ref()
+        .map(summarize_real_trade_for_strategy_state);
+    let reference_symbol = latest_backtest_summary
+        .as_ref()
+        .and_then(|summary| summary.symbol.clone())
+        .or_else(|| {
+            latest_real_trade_summary
+                .as_ref()
+                .map(|summary| summary.symbol.clone())
+        });
+    let reference_timeframe = latest_backtest_summary
+        .as_ref()
+        .and_then(|summary| summary.timeframe.clone());
+
+    StrategyExecutionOverview {
+        strategy_id: strategy_id.clone(),
+        strategy_name: strategy_name.clone(),
+        latest_backtest: latest_backtest_summary,
+        latest_real_trade: latest_real_trade_summary,
+        recent_signal: build_recent_signal_placeholder(
+            strategy_id,
+            strategy_name,
+            reference_symbol,
+            reference_timeframe,
+        ),
+        generated_at: Utc::now(),
+    }
+}
+
+fn summarize_backtest_for_strategy_state(result: &BacktestResult) -> StrategyLatestBacktestSummary {
+    StrategyLatestBacktestSummary {
+        source: "backtest_runs".to_string(),
+        run_id: result.run_id,
+        created_at: result.created_at,
+        strategy_id: result.strategy_id.clone(),
+        strategy_name: result.strategy_name.clone(),
+        symbol: result.symbol.clone(),
+        timeframe: result.timeframe.clone(),
+        experiment_label: result.experiment_label.clone(),
+        parameter_version: result.parameter_version.clone(),
+        total_return: result.total_return,
+        annualized_return: result.annualized_return,
+        sharpe_ratio: result.sharpe_ratio,
+        max_drawdown: result.max_drawdown,
+        total_trades: result.total_trades,
+        note: "研究回测结果，仅供参考，不代表真实执行".to_string(),
+    }
+}
+
+fn summarize_real_trade_for_strategy_state(
+    trade: &ExecutionTrade,
+) -> StrategyLatestRealTradeSummary {
+    StrategyLatestRealTradeSummary {
+        source: "trades".to_string(),
+        trade_id: trade.id,
+        order_id: trade.order_id,
+        executed_at: trade.executed_at,
+        strategy_id: trade.strategy_id.clone(),
+        portfolio_id: trade.portfolio_id.clone(),
+        symbol: trade.symbol.clone(),
+        side: trade.side.clone(),
+        quantity: trade.quantity,
+        price: trade.price,
+        note: "真实执行成交".to_string(),
+    }
+}
+
+fn build_recent_signal_placeholder(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+) -> StrategyRecentSignalSummary {
+    let note = if symbol.is_some() || timeframe.is_some() {
+        "信号尚未持久化，当前仅预留确认台结构，回测上下文可作为人工复核参考。".to_string()
+    } else {
+        "信号尚未持久化，当前仅预留确认台结构。".to_string()
+    };
+
+    StrategyRecentSignalSummary {
+        source: "signal_events_not_persisted".to_string(),
+        status: "placeholder".to_string(),
+        confirmation_state: "manual_review_only".to_string(),
+        strategy_id,
+        strategy_name,
+        symbol,
+        timeframe,
+        latest_signal_at: None,
+        signal_type: None,
+        strength: None,
+        note,
+    }
 }
 
 fn build_backtest_experiment_metadata(
@@ -2245,6 +2389,80 @@ mod http_e2e_tests {
             Some(8)
         );
         assert_eq!(config.is_active, false);
+    }
+
+    #[test]
+    fn strategy_execution_overview_separates_research_and_real_execution() {
+        let latest_backtest = crate::types::BacktestResult {
+            run_id: Some(Uuid::new_v4()),
+            experiment_id: None,
+            experiment_label: Some("Batch A".to_string()),
+            experiment_note: None,
+            parameter_version: Some("v1".to_string()),
+            strategy_id: "strategy-1".to_string(),
+            strategy_name: Some("SMA".to_string()),
+            symbol: Some("AAPL".to_string()),
+            timeframe: Some("1d".to_string()),
+            parameters: Some(std::collections::HashMap::new()),
+            trades: Some(Vec::new()),
+            equity_curve: Some(Vec::new()),
+            start_date: Utc::now() - chrono::Duration::days(30),
+            end_date: Utc::now() - chrono::Duration::days(1),
+            initial_capital: rust_decimal::Decimal::new(100000, 0),
+            final_capital: rust_decimal::Decimal::new(102000, 0),
+            total_return: 0.02,
+            annualized_return: 0.1,
+            sharpe_ratio: 1.1,
+            max_drawdown: 0.03,
+            win_rate: 0.5,
+            total_trades: 4,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            data_quality: None,
+            assumptions: None,
+            execution_link: None,
+            created_at: Some(Utc::now() - chrono::Duration::days(1)),
+        };
+        let latest_trade = ExecutionTrade {
+            id: 42,
+            order_id: Uuid::new_v4(),
+            symbol: "AAPL".to_string(),
+            side: "BUY".to_string(),
+            quantity: 10,
+            price: rust_decimal::Decimal::new(101, 0),
+            executed_at: Utc::now(),
+            portfolio_id: Some("paper".to_string()),
+            strategy_id: Some("strategy-1".to_string()),
+        };
+
+        let overview = build_strategy_execution_overview(
+            "strategy-1".to_string(),
+            Some("SMA Alpha".to_string()),
+            Some(latest_backtest),
+            Some(latest_trade),
+        );
+
+        assert_eq!(overview.strategy_id, "strategy-1");
+        assert_eq!(overview.strategy_name.as_deref(), Some("SMA Alpha"));
+        assert_eq!(
+            overview
+                .latest_backtest
+                .as_ref()
+                .map(|summary| summary.source.as_str()),
+            Some("backtest_runs")
+        );
+        assert_eq!(
+            overview
+                .latest_real_trade
+                .as_ref()
+                .map(|summary| summary.source.as_str()),
+            Some("trades")
+        );
+        assert_eq!(overview.recent_signal.status, "placeholder");
+        assert_eq!(
+            overview.recent_signal.confirmation_state,
+            "manual_review_only"
+        );
+        assert!(overview.recent_signal.note.contains("信号尚未持久化"));
     }
 
     #[test]

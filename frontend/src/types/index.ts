@@ -303,6 +303,61 @@ export interface BacktestExecutionLink {
   note: string;
 }
 
+export interface StrategyLatestBacktestSummary {
+  source: string;
+  run_id?: string | null;
+  created_at?: string | null;
+  strategy_id: string;
+  strategy_name?: string | null;
+  symbol?: string | null;
+  timeframe?: string | null;
+  experiment_label?: string | null;
+  parameter_version?: string | null;
+  total_return: number;
+  annualized_return: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  total_trades: number;
+  note: string;
+}
+
+export interface StrategyLatestRealTradeSummary {
+  source: string;
+  trade_id: number;
+  order_id: string;
+  executed_at: string;
+  strategy_id?: string | null;
+  portfolio_id?: string | null;
+  symbol: string;
+  side: string;
+  quantity: number;
+  price: number;
+  note: string;
+}
+
+export interface StrategyRecentSignalSummary {
+  source: string;
+  status: string;
+  confirmation_state: string;
+  strategy_id: string;
+  strategy_name?: string | null;
+  symbol?: string | null;
+  timeframe?: string | null;
+  latest_signal_at?: string | null;
+  signal_type?: SignalType | null;
+  strength?: number | null;
+  note: string;
+}
+
+export interface StrategyExecutionOverview {
+  strategy_id: string;
+  strategy_name?: string | null;
+  latest_backtest?: StrategyLatestBacktestSummary | null;
+  latest_real_trade?: StrategyLatestRealTradeSummary | null;
+  recent_signal: StrategyRecentSignalSummary;
+  generated_at: string;
+}
+
 // 回测结果类型
 export interface BacktestResult {
   run_id?: string;

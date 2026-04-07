@@ -711,6 +711,69 @@ pub struct BacktestExecutionLink {
     pub note: String,
 }
 
+/// Compact summary of the latest backtest for a strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategyLatestBacktestSummary {
+    pub source: String,
+    pub run_id: Option<Uuid>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub experiment_label: Option<String>,
+    pub parameter_version: Option<String>,
+    pub total_return: f64,
+    pub annualized_return: f64,
+    pub sharpe_ratio: f64,
+    pub max_drawdown: f64,
+    pub total_trades: i32,
+    pub note: String,
+}
+
+/// Compact summary of the latest real execution for a strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategyLatestRealTradeSummary {
+    pub source: String,
+    pub trade_id: i64,
+    pub order_id: Uuid,
+    pub executed_at: DateTime<Utc>,
+    pub strategy_id: Option<String>,
+    pub portfolio_id: Option<String>,
+    pub symbol: String,
+    pub side: String,
+    pub quantity: i64,
+    pub price: Decimal,
+    pub note: String,
+}
+
+/// Placeholder for the recent signal summary that will later power a confirmation table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategyRecentSignalSummary {
+    pub source: String,
+    pub status: String,
+    pub confirmation_state: String,
+    pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub latest_signal_at: Option<DateTime<Utc>>,
+    pub signal_type: Option<SignalType>,
+    pub strength: Option<f64>,
+    pub note: String,
+}
+
+/// Strategy-level execution snapshot for semi-automated execution support.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategyExecutionOverview {
+    pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub latest_backtest: Option<StrategyLatestBacktestSummary>,
+    pub latest_real_trade: Option<StrategyLatestRealTradeSummary>,
+    pub recent_signal: StrategyRecentSignalSummary,
+    pub generated_at: DateTime<Utc>,
+}
+
 /// Backtest result structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResult {

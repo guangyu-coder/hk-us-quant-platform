@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   runBacktest: vi.fn(),
   runBacktestBatch: vi.fn(),
   listBacktestsWithFilters: vi.fn(),
+  getStrategyState: vi.fn(),
   listTrades: vi.fn(),
   searchSymbols: vi.fn(),
 }));
@@ -27,6 +28,7 @@ vi.mock('@/lib/api', () => ({
     runBacktest: apiMocks.runBacktest,
     runBacktestBatch: apiMocks.runBacktestBatch,
     listBacktestsWithFilters: apiMocks.listBacktestsWithFilters,
+    getStrategyState: apiMocks.getStrategyState,
   },
   tradeApi: {
     listTrades: apiMocks.listTrades,
@@ -150,6 +152,43 @@ const siblingBacktestResult = {
   created_at: '2026-04-02T02:00:00Z',
 };
 
+const strategyState = {
+  strategy_id: strategy.id,
+  strategy_name: strategy.display_name,
+  latest_backtest: {
+    source: 'backtest_runs',
+    run_id: backtestResult.run_id,
+    created_at: backtestResult.created_at,
+    strategy_id: strategy.id,
+    strategy_name: strategy.display_name,
+    symbol: backtestResult.symbol,
+    timeframe: backtestResult.timeframe,
+    experiment_label: backtestResult.experiment_label,
+    parameter_version: backtestResult.parameter_version,
+    total_return: backtestResult.total_return,
+    annualized_return: backtestResult.annualized_return,
+    sharpe_ratio: backtestResult.sharpe_ratio,
+    max_drawdown: backtestResult.max_drawdown,
+    total_trades: backtestResult.total_trades,
+    note: '研究回测结果，仅供参考，不代表真实执行',
+  },
+  latest_real_trade: null,
+  recent_signal: {
+    source: 'signal_events_not_persisted',
+    status: 'placeholder',
+    confirmation_state: 'manual_review_only',
+    strategy_id: strategy.id,
+    strategy_name: strategy.display_name,
+    symbol: backtestResult.symbol,
+    timeframe: backtestResult.timeframe,
+    latest_signal_at: null,
+    signal_type: null,
+    strength: null,
+    note: '信号尚未持久化，当前仅预留确认台结构，回测上下文可作为人工复核参考。',
+  },
+  generated_at: '2026-04-02T03:00:00Z',
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -178,6 +217,7 @@ describe('UI smoke', () => {
     apiMocks.runBacktest.mockResolvedValue({ run_id: backtestResult.run_id });
     apiMocks.runBacktestBatch.mockResolvedValue({ count: 2, results: [backtestResult, backtestResult] });
     apiMocks.listBacktestsWithFilters.mockResolvedValue([backtestResult, siblingBacktestResult]);
+    apiMocks.getStrategyState.mockResolvedValue(strategyState);
     apiMocks.listTrades.mockResolvedValue([]);
     apiMocks.searchSymbols.mockResolvedValue([]);
 
@@ -265,8 +305,10 @@ describe('UI smoke', () => {
     await user.click(screen.getAllByRole('button', { name: '查看详情' })[0]);
     await screen.findByText('运行元数据');
     await screen.findByText('可信度与回测假设');
+    await screen.findByText('研究与真实执行复盘');
     await screen.findByText('本地数据命中');
     await screen.findByText(/参考匹配真实执行成交/);
+    await screen.findByText(/人工复核入口预留中/);
     await user.click(screen.getAllByRole('button', { name: '收起详情' })[0]);
 
     await waitFor(() => {

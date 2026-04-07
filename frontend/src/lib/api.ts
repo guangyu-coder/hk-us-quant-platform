@@ -18,6 +18,7 @@ import type {
   BacktestBatchResult,
   BacktestExperimentMetadata,
   BacktestListFilters,
+  StrategyExecutionOverview,
   ApiResponse,
   RiskMetrics,
   RiskLimitsSnapshot,
@@ -252,6 +253,10 @@ export const strategyApi = {
 
   listBacktestsWithFilters: async (filters: BacktestListFilters = {}): Promise<BacktestResult[]> => {
     return api.get('/v1/backtests', { params: filters });
+  },
+
+  getStrategyState: async (strategyId: string): Promise<StrategyExecutionOverview> => {
+    return api.get(`/v1/strategies/${strategyId}/state`);
   },
 };
 

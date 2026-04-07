@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { strategyApi, tradeApi } from '@/lib/api';
-import type { BacktestResult, StrategyConfig } from '@/types';
+import type { BacktestResult, StrategyConfig, StrategyExecutionOverview } from '@/types';
 import {
   buildBacktestFilterSummary,
   describeBacktestAssumptions,
@@ -319,6 +319,19 @@ export default function BacktestPage() {
     setExpandedRunId((current) => toggleExpandedRunId(current, runKey));
   };
 
+  const expandedResult = useMemo(
+    () => filteredBacktestResults.find((result) => getBacktestResultKey(result) === expandedRunId) ?? null,
+    [expandedRunId, filteredBacktestResults]
+  );
+
+  const { data: expandedStrategyState = null } = useQuery<StrategyExecutionOverview | null>({
+    queryKey: ['strategy-state', expandedResult?.strategy_id ?? null],
+    queryFn: () =>
+      expandedResult?.strategy_id ? strategyApi.getStrategyState(expandedResult.strategy_id) : Promise.resolve(null),
+    enabled: Boolean(expandedResult?.strategy_id),
+    staleTime: 30000,
+  });
+
   const collapseRun = (runKey: string) => {
     setExpandedRunId(null);
     scrollToRunCard(runKey);
@@ -414,6 +427,14 @@ export default function BacktestPage() {
       executionTrades,
       strategiesById.get(result.strategy_id)
     );
+
+  const getStrategyExecutionOverviewForRun = (result: BacktestResult) =>
+    expandedStrategyState && expandedStrategyState.strategy_id === result.strategy_id
+      ? expandedStrategyState
+      : null;
+
+  const formatOverviewTime = (value?: string | null) =>
+    value ? new Date(value).toLocaleString('zh-CN') : '暂无';
 
   const getExperimentResults = (result: BacktestResult) => {
     if (!result.experiment_id) {
@@ -1313,6 +1334,89 @@ export default function BacktestPage() {
                         </div>
                       </div>
                     </div>
+
+                    {(() => {
+                      const strategyOverview = getStrategyExecutionOverviewForRun(result);
+
+                      return (
+                        <div className="rounded-lg border border-violet-200 bg-violet-50/50 p-4">
+                          <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                            <div>
+                              <h4 className="text-base font-medium text-violet-900">研究与真实执行复盘</h4>
+                              <p className="mt-1 text-sm text-violet-800">
+                                当前展开的是这次研究回测；右侧展示的是同一策略维度下最近一次真实执行与信号确认占位，用于人工复核，不代表系统已自动下单。
+                              </p>
+                            </div>
+                            <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-violet-700">
+                              策略维度对照
+                            </span>
+                          </div>
+
+                          <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+                            <div className="rounded-lg border border-violet-100 bg-white p-4">
+                              <h5 className="text-sm font-medium text-slate-900">当前研究回测</h5>
+                              <div className="mt-3 space-y-2 text-sm text-slate-700">
+                                <div>{result.symbol ?? '-'} / {result.timeframe ?? '-'}</div>
+                                <div>
+                                  收益率 {(result.total_return * 100).toFixed(2)}%，Sharpe {result.sharpe_ratio.toFixed(2)}
+                                </div>
+                                <div>总交易 {result.total_trades} 笔，最大回撤 {(result.max_drawdown * 100).toFixed(2)}%</div>
+                                <div className="text-xs text-slate-500">
+                                  运行时间 {formatOverviewTime(result.created_at)}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="rounded-lg border border-emerald-100 bg-white p-4">
+                              <h5 className="text-sm font-medium text-slate-900">最近真实执行</h5>
+                              {strategyOverview?.latest_real_trade ? (
+                                <div className="mt-3 space-y-2 text-sm text-slate-700">
+                                  <div>
+                                    {strategyOverview.latest_real_trade.symbol} / {strategyOverview.latest_real_trade.side} /{' '}
+                                    {strategyOverview.latest_real_trade.quantity} 股
+                                  </div>
+                                  <div>${strategyOverview.latest_real_trade.price.toFixed(2)}</div>
+                                  <div className="text-xs text-slate-500">
+                                    成交时间 {formatOverviewTime(strategyOverview.latest_real_trade.executed_at)}
+                                  </div>
+                                  <div className="text-xs text-slate-500">
+                                    {strategyOverview.latest_real_trade.note}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mt-3 text-sm text-slate-500">
+                                  同一策略下暂时没有真实执行成交，可继续用下方“参考执行成交”做窗口内对照。
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="rounded-lg border border-amber-100 bg-white p-4">
+                              <h5 className="text-sm font-medium text-slate-900">信号确认占位</h5>
+                              {strategyOverview ? (
+                                <div className="mt-3 space-y-2 text-sm text-slate-700">
+                                  <div>
+                                    {strategyOverview.recent_signal.signal_type
+                                      ? `${strategyOverview.recent_signal.signal_type} / ${Math.round((strategyOverview.recent_signal.strength ?? 0) * 100)}%`
+                                      : '人工复核入口预留中'}
+                                  </div>
+                                  <div className="text-xs text-slate-500">
+                                    {strategyOverview.recent_signal.symbol ?? result.symbol ?? '待接入标的上下文'}
+                                    {strategyOverview.recent_signal.timeframe
+                                      ? ` / ${strategyOverview.recent_signal.timeframe}`
+                                      : ''}
+                                  </div>
+                                  <div className="text-xs text-slate-500">
+                                    {strategyOverview.recent_signal.note}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mt-3 text-sm text-slate-500">正在加载策略状态概览...</div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
                       <div className="rounded-lg border border-gray-200 p-4">

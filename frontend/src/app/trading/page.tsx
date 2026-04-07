@@ -2,10 +2,19 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { orderApi } from '@/lib/api';
+import { orderApi, strategyApi } from '@/lib/api';
 import { formatMarketPrice, formatMarketTimestamp } from '@/lib/market';
-import { ChevronRight, Clock3, Plus, X } from 'lucide-react';
-import type { CreateOrderResult, Order, OrderAuditEntry, OrderSide, OrderType, PaperSimulationResult } from '@/types';
+import { Activity, ChevronRight, Clock3, Plus, Radar, X } from 'lucide-react';
+import type {
+  CreateOrderResult,
+  Order,
+  OrderAuditEntry,
+  OrderSide,
+  OrderType,
+  PaperSimulationResult,
+  StrategyConfig,
+  StrategyExecutionOverview,
+} from '@/types';
 import { deriveTradingOrderCounts, normalizeOrdersCollection, selectTradingOrderId } from './trading-helpers';
 
 export default function TradingPage() {
@@ -31,6 +40,24 @@ export default function TradingPage() {
     queryKey: ['orders'],
     queryFn: () => orderApi.getOrders(),
     refetchInterval: 5000,
+  });
+
+  const { data: strategies = [] } = useQuery({
+    queryKey: ['strategies'],
+    queryFn: () => strategyApi.getStrategies(),
+    staleTime: 60000,
+  });
+
+  const trackedStrategies = useMemo(
+    () => strategies.filter((strategy: StrategyConfig) => strategy.is_active).slice(0, 6),
+    [strategies]
+  );
+
+  const { data: strategyStates = [] } = useQuery({
+    queryKey: ['strategy-state-overview', trackedStrategies.map((strategy) => strategy.id)],
+    queryFn: () => Promise.all(trackedStrategies.map((strategy) => strategyApi.getStrategyState(strategy.id))),
+    enabled: trackedStrategies.length > 0,
+    staleTime: 30000,
   });
 
   const createOrderMutation = useMutation({
@@ -169,6 +196,34 @@ export default function TradingPage() {
     : 0;
   const { open: openOrdersCount, partiallyFilled: partiallyFilledCount, filled: filledCount, terminal: terminalCount } =
     deriveTradingOrderCounts(ordersArray);
+
+  const strategyStateCards = useMemo(() => {
+    const stateById = new Map(strategyStates.map((state) => [state.strategy_id, state]));
+    return trackedStrategies.map((strategy) => ({
+      strategy,
+      state: stateById.get(strategy.id) ?? null,
+    }));
+  }, [strategyStates, trackedStrategies]);
+
+  const formatCompactDateTime = (value?: string | null): string => {
+    if (!value) {
+      return '暂无';
+    }
+
+    return new Date(value).toLocaleString('zh-CN');
+  };
+
+  const formatSignalStatus = (recentSignal: StrategyExecutionOverview['recent_signal']): string => {
+    if (recentSignal.signal_type) {
+      return `${recentSignal.signal_type} / ${Math.round((recentSignal.strength ?? 0) * 100)}%`;
+    }
+
+    if (recentSignal.confirmation_state === 'manual_review_only') {
+      return '人工复核预留中';
+    }
+
+    return recentSignal.status;
+  };
 
   const getLifecycleStep = (order: Order): string => {
     switch (order.status) {
@@ -497,6 +552,104 @@ export default function TradingPage() {
           )}
         </div>
       )}
+
+      <div className="rounded-lg border border-slate-200 bg-white shadow">
+        <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-900">策略执行状态概览</h3>
+            <p className="mt-1 text-sm text-slate-500">
+              按策略维度并排查看最近回测、最近真实成交，以及为未来信号确认台预留的信号摘要位置。
+            </p>
+          </div>
+          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+            {strategyStateCards.length} 个活跃策略
+          </span>
+        </div>
+        <div className="grid gap-4 p-6 lg:grid-cols-2 xl:grid-cols-3">
+          {strategyStateCards.map(({ strategy, state }) => (
+            <div key={strategy.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h4 className="text-base font-semibold text-slate-900">
+                    {strategy.display_name || strategy.name}
+                  </h4>
+                  <p className="mt-1 font-mono text-xs text-slate-500">{strategy.id}</p>
+                </div>
+                <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                  {state ? '已聚合' : '加载中'}
+                </span>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <div className="rounded-xl border border-sky-100 bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-sky-900">
+                    <Activity className="h-4 w-4" />
+                    最近一次回测
+                  </div>
+                  {state?.latest_backtest ? (
+                    <div className="mt-2 space-y-1 text-sm text-slate-700">
+                      <div>{state.latest_backtest.symbol ?? '-'} / {state.latest_backtest.timeframe ?? '-'}</div>
+                      <div>
+                        收益率 {(state.latest_backtest.total_return * 100).toFixed(2)}%，Sharpe{' '}
+                        {state.latest_backtest.sharpe_ratio.toFixed(2)}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        {formatCompactDateTime(state.latest_backtest.created_at)}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-sm text-slate-500">暂无回测记录</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-emerald-100 bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-emerald-900">
+                    <Clock3 className="h-4 w-4" />
+                    最近一次真实成交
+                  </div>
+                  {state?.latest_real_trade ? (
+                    <div className="mt-2 space-y-1 text-sm text-slate-700">
+                      <div>
+                        {state.latest_real_trade.symbol} / {state.latest_real_trade.side} / {state.latest_real_trade.quantity} 股
+                      </div>
+                      <div>{formatMarketPrice(state.latest_real_trade.price, { symbol: state.latest_real_trade.symbol })}</div>
+                      <div className="text-xs text-slate-500">
+                        {formatCompactDateTime(state.latest_real_trade.executed_at)}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-sm text-slate-500">暂无真实执行成交</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-amber-100 bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-amber-900">
+                    <Radar className="h-4 w-4" />
+                    最近信号摘要
+                  </div>
+                  {state ? (
+                    <div className="mt-2 space-y-1 text-sm text-slate-700">
+                      <div>{formatSignalStatus(state.recent_signal)}</div>
+                      <div className="text-xs text-slate-500">
+                        {state.recent_signal.symbol ?? state.latest_backtest?.symbol ?? '待接入标的上下文'}
+                        {state.recent_signal.timeframe ? ` / ${state.recent_signal.timeframe}` : ''}
+                      </div>
+                      <div className="text-xs text-slate-500">{state.recent_signal.note}</div>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-sm text-slate-500">正在加载信号摘要</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+          {strategyStateCards.length === 0 && (
+            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6 text-sm text-slate-500">
+              当前没有活跃策略，策略执行状态概览会在启用策略后显示。
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* 订单表单弹窗 */}
       {showOrderForm && (
