@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildBacktestFilterSummary,
   buildParameterSnapshotSummary,
+  describeBacktestExperiment,
   deriveBacktestStrategyName,
   deriveRunSnapshotName,
   getNextExpandedRunId,
@@ -129,8 +130,13 @@ test('filter summary shows active values at a glance', () => {
       selectedStrategyName: 'SMA Alpha',
       strategyNameKeyword: 'alpha',
       symbol: 'AAPL',
+      experimentLabel: 'Batch 1',
+      parameterVersion: 'v1',
+      createdAfter: '2026-04-01',
+      createdBefore: '2026-04-03',
+      sortLabel: '最新',
     }),
-    '策略: SMA Alpha · 名称关键字: alpha · 标的: AAPL'
+    '策略: SMA Alpha · 名称关键字: alpha · 标的: AAPL · 标签: Batch 1 · 版本: v1 · 起始: 2026-04-01 · 结束: 2026-04-03 · 排序: 最新'
   );
 });
 
@@ -141,4 +147,16 @@ test('parameter snapshot summary stays human readable', () => {
     '初始资金 100000',
     '均线 5/20',
   ]);
+});
+
+test('experiment summary highlights batch metadata', () => {
+  assert.deepEqual(
+    describeBacktestExperiment({
+      experiment_id: '12345678-aaaa-bbbb-cccc-123456789abc',
+      experiment_label: 'Batch 1',
+      experiment_note: 'note',
+      parameter_version: 'v1',
+    }),
+    ['标签 Batch 1', '版本 v1', '备注 note', '实验 12345678']
+  );
 });

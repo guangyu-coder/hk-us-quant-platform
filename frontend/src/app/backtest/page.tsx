@@ -7,6 +7,7 @@ import type { BacktestResult, StrategyConfig } from '@/types';
 import {
   buildBacktestFilterSummary,
   buildParameterSnapshotSummary,
+  describeBacktestExperiment,
   deriveBacktestStrategyName,
   deriveRunSnapshotName,
   getReferenceTradesForBacktestWindow,
@@ -52,6 +53,13 @@ export default function BacktestPage() {
   const [selectedStrategyId, setSelectedStrategyId] = useState('all');
   const [strategyNameFilter, setStrategyNameFilter] = useState('');
   const [symbolFilter, setSymbolFilter] = useState('');
+  const [experimentLabelFilter, setExperimentLabelFilter] = useState('');
+  const [parameterVersionFilter, setParameterVersionFilter] = useState('');
+  const [createdAfterFilter, setCreatedAfterFilter] = useState('');
+  const [createdBeforeFilter, setCreatedBeforeFilter] = useState('');
+  const [sortBy, setSortBy] = useState<'created_at' | 'total_return' | 'max_drawdown' | 'sharpe_ratio'>(
+    'created_at'
+  );
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const [compareSelection, setCompareSelection] = useState<string[]>([]);
 
@@ -62,11 +70,27 @@ export default function BacktestPage() {
   });
 
   const { data: backtestResults = [], isLoading: resultsLoading } = useQuery({
-    queryKey: ['backtest-history', selectedStrategyId, symbolFilter],
+    queryKey: [
+      'backtest-history',
+      selectedStrategyId,
+      symbolFilter,
+      experimentLabelFilter,
+      parameterVersionFilter,
+      createdAfterFilter,
+      createdBeforeFilter,
+    ],
     queryFn: () =>
       strategyApi.listBacktestsWithFilters({
         strategy_id: selectedStrategyId === 'all' ? undefined : selectedStrategyId,
         symbol: symbolFilter.trim() || undefined,
+        experiment_label: experimentLabelFilter.trim() || undefined,
+        parameter_version: parameterVersionFilter.trim() || undefined,
+        created_after: createdAfterFilter
+          ? new Date(`${createdAfterFilter}T00:00:00Z`).toISOString()
+          : undefined,
+        created_before: createdBeforeFilter
+          ? new Date(`${createdBeforeFilter}T23:59:59.999Z`).toISOString()
+          : undefined,
         limit: 100,
       }),
     staleTime: 60000,
@@ -118,30 +142,95 @@ export default function BacktestPage() {
       ? undefined
       : strategyOptions.find((option) => option.id === selectedStrategyId)?.name;
 
+  const sortLabelMap: Record<typeof sortBy, string> = {
+    created_at: '最新',
+    total_return: '收益率',
+    max_drawdown: '回撤',
+    sharpe_ratio: 'Sharpe',
+  };
+
   const activeFilterSummary = buildBacktestFilterSummary({
     selectedStrategyName,
     strategyNameKeyword: strategyNameFilter,
     symbol: symbolFilter,
+    experimentLabel: experimentLabelFilter,
+    parameterVersion: parameterVersionFilter,
+    createdAfter: createdAfterFilter,
+    createdBefore: createdBeforeFilter,
+    sortLabel: sortLabelMap[sortBy],
   });
 
   const canResetFilters = hasActiveBacktestFilters({
     selectedStrategyId,
     strategyNameKeyword: strategyNameFilter,
     symbol: symbolFilter,
+    experimentLabel: experimentLabelFilter,
+    parameterVersion: parameterVersionFilter,
+    createdAfter: createdAfterFilter,
+    createdBefore: createdBeforeFilter,
   });
 
   const filteredBacktestResults = useMemo(() => {
     const keyword = strategyNameFilter.trim().toLowerCase();
-    if (!keyword) {
-      return backtestResults;
-    }
+    const experimentLabelKeyword = experimentLabelFilter.trim().toLowerCase();
+    const parameterVersionKeyword = parameterVersionFilter.trim().toLowerCase();
+    const createdAfterTimestamp = createdAfterFilter ? new Date(`${createdAfterFilter}T00:00:00Z`).getTime() : null;
+    const createdBeforeTimestamp = createdBeforeFilter ? new Date(`${createdBeforeFilter}T23:59:59.999Z`).getTime() : null;
 
-    return backtestResults.filter((result: BacktestResult) =>
-      (strategyNameById.get(result.strategy_id) ?? result.strategy_name ?? result.strategy_id)
-        .toLowerCase()
-        .includes(keyword)
-    );
-  }, [backtestResults, strategyNameById, strategyNameFilter]);
+    const nextResults = backtestResults.filter((result: BacktestResult) => {
+      const strategyName = (strategyNameById.get(result.strategy_id) ?? result.strategy_name ?? result.strategy_id)
+        .toLowerCase();
+      const experimentLabel = (result.experiment_label ?? '').toLowerCase();
+      const parameterVersion = (result.parameter_version ?? '').toLowerCase();
+      const createdAt = new Date(result.created_at ?? result.start_date).getTime();
+
+      if (keyword && !strategyName.includes(keyword)) {
+        return false;
+      }
+
+      if (experimentLabelKeyword && !experimentLabel.includes(experimentLabelKeyword)) {
+        return false;
+      }
+
+      if (parameterVersionKeyword && !parameterVersion.includes(parameterVersionKeyword)) {
+        return false;
+      }
+
+      if (createdAfterTimestamp !== null && createdAt < createdAfterTimestamp) {
+        return false;
+      }
+
+      if (createdBeforeTimestamp !== null && createdAt > createdBeforeTimestamp) {
+        return false;
+      }
+
+      return true;
+    });
+
+    const compare = (left: BacktestResult, right: BacktestResult) => {
+      switch (sortBy) {
+        case 'total_return':
+          return right.total_return - left.total_return;
+        case 'max_drawdown':
+          return left.max_drawdown - right.max_drawdown;
+        case 'sharpe_ratio':
+          return right.sharpe_ratio - left.sharpe_ratio;
+        default:
+          return new Date(right.created_at ?? right.start_date).getTime() - new Date(left.created_at ?? left.start_date).getTime();
+      }
+    };
+
+    return [...nextResults].sort(compare);
+  }, [
+    backtestResults,
+    createdAfterFilter,
+    createdBeforeFilter,
+    experimentLabelFilter,
+    parameterVersionFilter,
+    sortBy,
+    strategyNameById,
+    strategyNameFilter,
+  ]);
 
   const filteredResultsByKey = useMemo(
     () => new Map(filteredBacktestResults.map((result) => [getBacktestResultKey(result), result])),
@@ -156,7 +245,39 @@ export default function BacktestPage() {
     [compareSelection, filteredResultsByKey]
   );
 
+  const experimentGroups = useMemo(() => {
+    const groups = new Map<string, BacktestResult[]>();
+
+    filteredBacktestResults.forEach((result) => {
+      if (!result.experiment_id) {
+        return;
+      }
+
+      const current = groups.get(result.experiment_id) ?? [];
+      current.push(result);
+      groups.set(result.experiment_id, current);
+    });
+
+    return Array.from(groups.entries())
+      .map(([experimentId, results]) => ({
+        experimentId,
+        results: [...results].sort(
+          (left, right) =>
+            new Date(right.created_at ?? right.start_date).getTime() -
+            new Date(left.created_at ?? left.start_date).getTime()
+        ),
+      }))
+      .filter((group) => group.results.length > 1);
+  }, [filteredBacktestResults]);
+
   const comparisonStrategyId = selectedComparisonResults[0]?.strategy_id ?? null;
+  const comparisonExperimentId =
+    selectedComparisonResults.length > 0 &&
+    selectedComparisonResults.every(
+      (result) => result.experiment_id && result.experiment_id === selectedComparisonResults[0]?.experiment_id
+    )
+      ? selectedComparisonResults[0]?.experiment_id ?? null
+      : null;
 
   const comparisonExportRows = useMemo(
     () =>
@@ -289,10 +410,34 @@ export default function BacktestPage() {
       strategiesById.get(result.strategy_id)
     );
 
+  const getExperimentResults = (result: BacktestResult) => {
+    if (!result.experiment_id) {
+      return [result];
+    }
+
+    return filteredBacktestResults.filter(
+      (candidate) => candidate.experiment_id === result.experiment_id
+    );
+  };
+
+  const compareExperimentResults = (result: BacktestResult) => {
+    const experimentResults = getExperimentResults(result);
+    if (experimentResults.length < 2) {
+      return;
+    }
+
+    setCompareSelection(experimentResults.map(getBacktestResultKey));
+  };
+
   const resetFilters = () => {
     setSelectedStrategyId('all');
     setStrategyNameFilter('');
     setSymbolFilter('');
+    setExperimentLabelFilter('');
+    setParameterVersionFilter('');
+    setCreatedAfterFilter('');
+    setCreatedBeforeFilter('');
+    setSortBy('created_at');
   };
 
   return (
@@ -305,7 +450,8 @@ export default function BacktestPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 rounded-lg border border-gray-200 bg-white p-4 md:grid-cols-4">
+      <div className="space-y-4 rounded-lg border border-gray-200 bg-white p-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <div>
           <label className="mb-1 block text-sm font-medium text-gray-700">策略筛选</label>
           <select
@@ -363,6 +509,67 @@ export default function BacktestPage() {
             </button>
           </div>
         </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+          <div>
+            <label className="mb-1 block text-sm font-medium text-gray-700">实验标签</label>
+            <input
+              value={experimentLabelFilter}
+              onChange={(e) => setExperimentLabelFilter(e.target.value)}
+              placeholder="例如：SMA 2026-04"
+              className="w-full rounded-md border border-gray-300 px-3 py-2"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-gray-700">参数版本</label>
+            <input
+              value={parameterVersionFilter}
+              onChange={(e) => setParameterVersionFilter(e.target.value)}
+              placeholder="例如：v1.0"
+              className="w-full rounded-md border border-gray-300 px-3 py-2"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-gray-700">开始时间</label>
+            <input
+              type="date"
+              value={createdAfterFilter}
+              onChange={(e) => setCreatedAfterFilter(e.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-gray-700">结束时间</label>
+            <input
+              type="date"
+              value={createdBeforeFilter}
+              onChange={(e) => setCreatedBeforeFilter(e.target.value)}
+              className="w-full rounded-md border border-gray-300 px-3 py-2"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="w-full max-w-xs">
+            <label className="mb-1 block text-sm font-medium text-gray-700">排序方式</label>
+            <select
+              value={sortBy}
+              onChange={(e) =>
+                setSortBy(e.target.value as 'created_at' | 'total_return' | 'max_drawdown' | 'sharpe_ratio')
+              }
+              className="w-full rounded-md border border-gray-300 px-3 py-2"
+            >
+              <option value="created_at">最新</option>
+              <option value="total_return">总收益率</option>
+              <option value="max_drawdown">最大回撤</option>
+              <option value="sharpe_ratio">Sharpe</option>
+            </select>
+          </div>
+          <div className="rounded-md bg-gray-50 px-3 py-2 text-sm text-gray-600">
+            当前结果 {filteredBacktestResults.length} 条
+          </div>
+        </div>
       </div>
 
       <div className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600">
@@ -377,11 +584,11 @@ export default function BacktestPage() {
               研究效率工具
             </div>
             <p className="mt-1 text-sm text-sky-800">
-              勾选同一策略的多个回测结果进行对比；切换到其他策略时会自动重置为新的对比集合。
+              勾选同一策略的多个回测结果进行对比，也可以一键带出同一实验批次的全部结果。
             </p>
             <p className="mt-1 text-xs text-sky-700">
               {selectedComparisonResults.length > 0
-                ? `已选择 ${selectedComparisonResults.length} 条回测结果${comparisonStrategyId ? ` · 策略 ID ${comparisonStrategyId}` : ''}`
+                ? `已选择 ${selectedComparisonResults.length} 条回测结果${comparisonStrategyId ? ` · 策略 ID ${comparisonStrategyId}` : ''}${comparisonExperimentId ? ` · 实验 ${comparisonExperimentId.slice(0, 8)}` : ''}`
                 : '当前没有选中的对比结果。'}
             </p>
           </div>
@@ -416,6 +623,98 @@ export default function BacktestPage() {
           </div>
         </div>
 
+        {experimentGroups.length > 0 && (
+          <div className="mt-4 rounded-lg border border-sky-100 bg-white p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-slate-900">实验批次</h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  按实验批次查看同一组参数覆盖产生的多条回测结果。
+                </p>
+              </div>
+              <div className="text-xs text-slate-500">共 {experimentGroups.length} 个批次</div>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              {experimentGroups.map((group) => {
+                const anchorRunKey = getBacktestResultKey(group.results[0]);
+                const label = group.results[0]?.experiment_label?.trim() || '未命名实验';
+                const version = group.results[0]?.parameter_version?.trim() || '未标注版本';
+
+                return (
+                  <div
+                    key={group.experimentId}
+                    className="flex flex-col gap-3 rounded-lg border border-sky-100 bg-sky-50/40 p-3 lg:flex-row lg:items-center lg:justify-between"
+                  >
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-slate-900">
+                        <span>{label}</span>
+                        <span className="rounded-full bg-white px-2 py-0.5 text-xs text-sky-700">
+                          {version}
+                        </span>
+                        <span className="rounded-full bg-white px-2 py-0.5 text-xs text-slate-500">
+                          实验 {group.experimentId.slice(0, 8)}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {group.results.length} 条结果 · 最新于{' '}
+                        {new Date(
+                          group.results[0]?.created_at ?? group.results[0]?.start_date
+                        ).toLocaleString('zh-CN')}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => compareExperimentResults(group.results[0])}
+                        className="inline-flex items-center gap-2 rounded-md border border-sky-300 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50"
+                      >
+                        <CheckSquare className="h-4 w-4" />
+                        对比同批次
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          exportBacktests(
+                            'json',
+                            group.results,
+                            `experiment-${group.experimentId.slice(0, 8)}`
+                          )
+                        }
+                        className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50"
+                      >
+                        <Download className="h-4 w-4" />
+                        导出批次 JSON
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          exportBacktests(
+                            'csv',
+                            group.results,
+                            `experiment-${group.experimentId.slice(0, 8)}`
+                          )
+                        }
+                        className="inline-flex items-center gap-2 rounded-md border border-sky-200 bg-white px-3 py-2 text-sm text-sky-700 hover:bg-sky-50"
+                      >
+                        <Download className="h-4 w-4" />
+                        导出批次 CSV
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => scrollToRunCard(anchorRunKey)}
+                        className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                      >
+                        查看结果
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {selectedComparisonResults.length > 0 && comparisonStrategyId && (
           <div className="mt-4 overflow-x-auto rounded-lg border border-sky-100 bg-white">
             <table className="min-w-full text-sm">
@@ -435,6 +734,20 @@ export default function BacktestPage() {
                             {new Date(result.start_date).toLocaleDateString('zh-CN')} -{' '}
                             {new Date(result.end_date).toLocaleDateString('zh-CN')}
                           </div>
+                          {(result.experiment_label || result.parameter_version) && (
+                            <div className="flex flex-wrap gap-1 text-[11px] text-sky-700">
+                              {result.experiment_label && (
+                                <span className="rounded-full bg-sky-50 px-2 py-0.5">
+                                  {result.experiment_label}
+                                </span>
+                              )}
+                              {result.parameter_version && (
+                                <span className="rounded-full bg-sky-50 px-2 py-0.5">
+                                  {result.parameter_version}
+                                </span>
+                              )}
+                            </div>
+                          )}
                           <div className="font-mono text-xs text-slate-400">
                             {result.run_id?.slice(0, 8) ?? runKey.slice(0, 12)}
                           </div>
@@ -500,7 +813,11 @@ export default function BacktestPage() {
             </table>
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-sky-100 px-4 py-3 text-xs text-slate-500">
-              <span>对比结果仅保留同一策略下的回测记录，便于快速比较不同时间段或参数快照。</span>
+              <span>
+                {comparisonExperimentId
+                  ? `当前导出的是同一实验批次 ${comparisonExperimentId.slice(0, 8)} 的对比结果。`
+                  : '对比结果仅保留同一策略下的回测记录，便于快速比较不同时间段或参数快照。'}
+              </span>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
@@ -551,6 +868,8 @@ export default function BacktestPage() {
           {filteredBacktestResults.map((result: BacktestResult) => {
             const runKey = getBacktestResultKey(result);
             const isCompareSelected = compareSelection.includes(runKey);
+            const experimentResults = getExperimentResults(result);
+            const hasExperimentBatch = Boolean(result.experiment_id && experimentResults.length > 1);
 
             return (
             <div id={`backtest-run-${runKey}`} key={runKey} className="bg-white rounded-lg shadow">
@@ -580,6 +899,18 @@ export default function BacktestPage() {
                         </span>
                       )}
                     </div>
+                    {(result.experiment_label || result.parameter_version || result.experiment_note || result.experiment_id) && (
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs text-sky-700">
+                        {describeBacktestExperiment(result).map((item) => (
+                          <span
+                            key={item}
+                            className="rounded-full bg-sky-50 px-2 py-1 font-medium text-sky-700"
+                          >
+                            {item}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="text-sm text-gray-500 text-right">
                     <div className="flex items-center justify-end space-x-2">
@@ -600,6 +931,64 @@ export default function BacktestPage() {
 
               <div className="p-6 space-y-6">
                 <div className="flex flex-wrap items-center justify-end gap-2">
+                  {hasExperimentBatch && (
+                    <button
+                      type="button"
+                      onClick={() => compareExperimentResults(result)}
+                      className="inline-flex items-center gap-2 rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-700 hover:bg-sky-100"
+                    >
+                      <CheckSquare className="h-4 w-4" />
+                      对比同批次
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => exportBacktests('json', [result], 'snapshot')}
+                    className="inline-flex items-center gap-2 rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Download className="h-4 w-4" />
+                    快照 JSON
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => exportBacktests('csv', [result], 'snapshot')}
+                    className="inline-flex items-center gap-2 rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    <Download className="h-4 w-4" />
+                    快照 CSV
+                  </button>
+                  {hasExperimentBatch && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          exportBacktests(
+                            'json',
+                            experimentResults,
+                            `experiment-${result.experiment_id?.slice(0, 8) ?? 'batch'}`
+                          )
+                        }
+                        className="inline-flex items-center gap-2 rounded-md border border-sky-200 px-3 py-2 text-sm text-sky-700 hover:bg-sky-50"
+                      >
+                        <Download className="h-4 w-4" />
+                        导出批次 JSON
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          exportBacktests(
+                            'csv',
+                            experimentResults,
+                            `experiment-${result.experiment_id?.slice(0, 8) ?? 'batch'}`
+                          )
+                        }
+                        className="inline-flex items-center gap-2 rounded-md border border-sky-200 px-3 py-2 text-sm text-sky-700 hover:bg-sky-50"
+                      >
+                        <Download className="h-4 w-4" />
+                        导出批次 CSV
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={() => toggleCompareSelection(result)}

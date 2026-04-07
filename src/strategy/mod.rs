@@ -1,14 +1,15 @@
 use crate::error::{AppError, AppResult};
 use crate::events::{EventBus, PlatformEvent};
 use crate::types::{
-    BacktestEquityPoint, BacktestResult, BacktestTrade, MarketData, Signal, StrategyConfig,
+    BacktestEquityPoint, BacktestExperimentMetadata, BacktestResult, BacktestTrade, MarketData,
+    Signal, StrategyConfig,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal::MathematicalOps;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -174,11 +175,136 @@ impl StrategyService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> AppResult<BacktestResult> {
+        self.run_backtest_with_metadata(strategy_id, start, end, None)
+            .await
+    }
+
+    pub async fn run_backtest_with_metadata(
+        &self,
+        strategy_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        experiment: Option<BacktestExperimentMetadata>,
+    ) -> AppResult<BacktestResult> {
         info!(
             "Running backtest for strategy {} from {} to {}",
             strategy_id, start, end
         );
         let config = self.get_strategy_config(strategy_id).await?;
+        self.run_backtest_for_config(strategy_id, &config, start, end, experiment)
+            .await
+    }
+
+    pub async fn run_backtest_batch(
+        &self,
+        strategy_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        experiment_label: Option<String>,
+        experiment_note: Option<String>,
+        parameter_version: Option<String>,
+        parameter_sets: Vec<HashMap<String, serde_json::Value>>,
+    ) -> AppResult<Vec<BacktestResult>> {
+        if !(2..=5).contains(&parameter_sets.len()) {
+            return Err(AppError::strategy(
+                "Batch experiments require between 2 and 5 parameter sets",
+            ));
+        }
+
+        let base_config = self.get_strategy_config(strategy_id).await?;
+        let experiment_id = Uuid::new_v4();
+        let mut configs = Vec::with_capacity(parameter_sets.len());
+
+        for parameter_set in parameter_sets {
+            let mut config = base_config.clone();
+            for (key, value) in parameter_set {
+                config.parameters.insert(key, value);
+            }
+
+            configs.push(validate_and_normalize_strategy_config(config)?);
+        }
+
+        let metadata = BacktestExperimentMetadata {
+            experiment_id: Some(experiment_id),
+            experiment_label,
+            experiment_note,
+            parameter_version,
+        };
+        let mut results = Vec::with_capacity(configs.len());
+
+        for config in &configs {
+            results.push(
+                self.prepare_backtest_result_for_config(
+                    strategy_id,
+                    config,
+                    start,
+                    end,
+                    Some(metadata.clone()),
+                )
+                .await?,
+            );
+        }
+
+        let mut transaction = self.db_pool.begin().await.map_err(AppError::Database)?;
+
+        for (config, result) in configs.iter().zip(results.iter_mut()) {
+            let run_id = self
+                .store_backtest_run_in_transaction(&mut transaction, config, result)
+                .await?;
+            result.run_id = Some(run_id);
+        }
+
+        transaction.commit().await.map_err(AppError::Database)?;
+
+        for result in &results {
+            let event = PlatformEvent::BacktestCompleted {
+                strategy_id: strategy_id.to_string(),
+                result: serde_json::to_value(result).map_err(AppError::Serialization)?,
+            };
+
+            if let Err(error) = self.event_bus.publish(event).await {
+                warn!("Failed to publish backtest completed event: {}", error);
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn run_backtest_for_config(
+        &self,
+        strategy_id: &str,
+        config: &StrategyConfig,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        experiment: Option<BacktestExperimentMetadata>,
+    ) -> AppResult<BacktestResult> {
+        let mut result = self
+            .prepare_backtest_result_for_config(strategy_id, config, start, end, experiment)
+            .await?;
+
+        let run_id = self.store_backtest_run(config, &result).await?;
+        result.run_id = Some(run_id);
+
+        let event = PlatformEvent::BacktestCompleted {
+            strategy_id: strategy_id.to_string(),
+            result: serde_json::to_value(&result).map_err(AppError::Serialization)?,
+        };
+
+        if let Err(e) = self.event_bus.publish(event).await {
+            warn!("Failed to publish backtest completed event: {}", e);
+        }
+
+        Ok(result)
+    }
+
+    async fn prepare_backtest_result_for_config(
+        &self,
+        strategy_id: &str,
+        config: &StrategyConfig,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        experiment: Option<BacktestExperimentMetadata>,
+    ) -> AppResult<BacktestResult> {
         let symbol = config
             .parameters
             .get("symbol")
@@ -213,26 +339,14 @@ impl StrategyService {
         }
 
         let result = simulate_backtest(strategy_id, &config, historical_data, initial_capital)?;
-        let mut result = attach_strategy_context_to_backtest_result(result, &config);
-
-        let run_id = self.store_backtest_run(&config, &result).await?;
-        result.run_id = Some(run_id);
-
-        // Publish backtest completed event
-        let event = PlatformEvent::BacktestCompleted {
-            strategy_id: strategy_id.to_string(),
-            result: serde_json::to_value(&result).map_err(|e| AppError::Serialization(e))?,
-        };
-
-        if let Err(e) = self.event_bus.publish(event).await {
-            warn!("Failed to publish backtest completed event: {}", e);
-        }
-
-        Ok(result)
+        Ok(attach_strategy_context_to_backtest_result(
+            result, config, experiment,
+        ))
     }
 
     pub async fn list_backtest_runs(&self, limit: i64) -> AppResult<Vec<BacktestResult>> {
-        self.list_backtest_runs_filtered(limit, None, None).await
+        self.list_backtest_runs_filtered(limit, None, None, None, None, None, None)
+            .await
     }
 
     pub async fn list_backtest_runs_filtered(
@@ -240,10 +354,18 @@ impl StrategyService {
         limit: i64,
         strategy_id: Option<&str>,
         symbol: Option<&str>,
+        experiment_label: Option<&str>,
+        parameter_version: Option<&str>,
+        created_after: Option<DateTime<Utc>>,
+        created_before: Option<DateTime<Utc>>,
     ) -> AppResult<Vec<BacktestResult>> {
         #[derive(sqlx::FromRow)]
         struct BacktestRunRow {
             id: Uuid,
+            experiment_id: Option<Uuid>,
+            experiment_label: Option<String>,
+            experiment_note: Option<String>,
+            parameter_version: Option<String>,
             strategy_id: String,
             strategy_name: String,
             symbol: String,
@@ -266,7 +388,7 @@ impl StrategyService {
         }
 
         let mut query_builder = QueryBuilder::<Postgres>::new(
-            "SELECT id, strategy_id, strategy_name, symbol, timeframe, parameters, trades, equity_curve, start_date, end_date, \
+            "SELECT id, experiment_id, experiment_label, experiment_note, parameter_version, strategy_id, strategy_name, symbol, timeframe, parameters, trades, equity_curve, start_date, end_date, \
              initial_capital, final_capital, total_return, annualized_return, sharpe_ratio, max_drawdown, \
              win_rate, total_trades, performance_metrics, created_at FROM backtest_runs",
         );
@@ -282,6 +404,31 @@ impl StrategyService {
             query_builder.push(if has_filter { " AND " } else { " WHERE " });
             query_builder.push("symbol = ");
             query_builder.push_bind(symbol.trim());
+            has_filter = true;
+        }
+        if let Some(experiment_label) = experiment_label.filter(|value| !value.trim().is_empty()) {
+            query_builder.push(if has_filter { " AND " } else { " WHERE " });
+            query_builder.push("experiment_label ILIKE ");
+            query_builder.push_bind(format!("%{}%", experiment_label.trim()));
+            has_filter = true;
+        }
+        if let Some(parameter_version) = parameter_version.filter(|value| !value.trim().is_empty())
+        {
+            query_builder.push(if has_filter { " AND " } else { " WHERE " });
+            query_builder.push("parameter_version ILIKE ");
+            query_builder.push_bind(format!("%{}%", parameter_version.trim()));
+            has_filter = true;
+        }
+        if let Some(created_after) = created_after {
+            query_builder.push(if has_filter { " AND " } else { " WHERE " });
+            query_builder.push("created_at >= ");
+            query_builder.push_bind(created_after);
+            has_filter = true;
+        }
+        if let Some(created_before) = created_before {
+            query_builder.push(if has_filter { " AND " } else { " WHERE " });
+            query_builder.push("created_at <= ");
+            query_builder.push_bind(created_before);
         }
 
         query_builder.push(" ORDER BY created_at DESC LIMIT ");
@@ -306,6 +453,10 @@ impl StrategyService {
                     serde_json::from_value(row.equity_curve).map_err(AppError::Serialization)?;
                 Ok(BacktestResult {
                     run_id: Some(row.id),
+                    experiment_id: row.experiment_id,
+                    experiment_label: row.experiment_label,
+                    experiment_note: row.experiment_note,
+                    parameter_version: row.parameter_version,
                     strategy_id: row.strategy_id,
                     strategy_name: Some(row.strategy_name),
                     symbol: Some(row.symbol),
@@ -415,24 +566,57 @@ impl StrategyService {
         result: &BacktestResult,
     ) -> AppResult<Uuid> {
         let run_id = Uuid::new_v4();
+        self.store_backtest_run_with_executor(&self.db_pool, run_id, config, result)
+            .await?;
+        Ok(run_id)
+    }
+
+    async fn store_backtest_run_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        config: &StrategyConfig,
+        result: &BacktestResult,
+    ) -> AppResult<Uuid> {
+        let run_id = Uuid::new_v4();
+        self.store_backtest_run_with_executor(&mut **transaction, run_id, config, result)
+            .await?;
+        Ok(run_id)
+    }
+
+    async fn store_backtest_run_with_executor<'a, E>(
+        &self,
+        executor: E,
+        run_id: Uuid,
+        config: &StrategyConfig,
+        result: &BacktestResult,
+    ) -> AppResult<()>
+    where
+        E: sqlx::Executor<'a, Database = Postgres>,
+    {
         let query = r#"
             INSERT INTO backtest_runs (
-                id, strategy_id, strategy_name, symbol, timeframe, parameters,
+                id, experiment_id, experiment_label, experiment_note, parameter_version,
+                strategy_id, strategy_name, symbol, timeframe, parameters,
                 trades, equity_curve,
                 start_date, end_date, initial_capital, final_capital, total_return,
                 annualized_return, sharpe_ratio, max_drawdown, win_rate, total_trades,
                 performance_metrics, created_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11,
-                $12, $13, $14, $15, $16,
-                $17, $18, $19, $20
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15,
+                $16, $17, $18, $19, $20,
+                $21, $22, $23, $24
             )
         "#;
 
         sqlx::query(query)
             .bind(run_id)
+            .bind(result.experiment_id)
+            .bind(&result.experiment_label)
+            .bind(&result.experiment_note)
+            .bind(&result.parameter_version)
             .bind(&result.strategy_id)
             .bind(
                 result
@@ -461,11 +645,11 @@ impl StrategyService {
                     .map_err(AppError::Serialization)?,
             )
             .bind(result.created_at.unwrap_or_else(Utc::now))
-            .execute(&self.db_pool)
+            .execute(executor)
             .await
             .map_err(AppError::Database)?;
 
-        Ok(run_id)
+        Ok(())
     }
 
     /// Create strategy instance based on configuration
@@ -948,6 +1132,7 @@ fn validate_and_normalize_strategy_config(mut config: StrategyConfig) -> AppResu
 fn attach_strategy_context_to_backtest_result(
     mut result: BacktestResult,
     config: &StrategyConfig,
+    experiment: Option<BacktestExperimentMetadata>,
 ) -> BacktestResult {
     result.strategy_name = Some(
         config
@@ -969,6 +1154,11 @@ fn attach_strategy_context_to_backtest_result(
         .or_else(|| Some("1d".to_string()));
     result.parameters = Some(config.parameters.clone());
     result.created_at = Some(Utc::now());
+    let metadata = experiment.unwrap_or_default();
+    result.experiment_id = metadata.experiment_id;
+    result.experiment_label = metadata.experiment_label;
+    result.experiment_note = metadata.experiment_note;
+    result.parameter_version = metadata.parameter_version;
     result
 }
 
@@ -1242,6 +1432,10 @@ fn simulate_backtest(
 
     Ok(BacktestResult {
         run_id: None,
+        experiment_id: None,
+        experiment_label: None,
+        experiment_note: None,
+        parameter_version: None,
         strategy_id: strategy_id.to_string(),
         strategy_name: None,
         symbol: None,
@@ -1918,6 +2112,10 @@ mod tests {
 
         let result = BacktestResult {
             run_id: None,
+            experiment_id: None,
+            experiment_label: None,
+            experiment_note: None,
+            parameter_version: None,
             strategy_id: config.id.clone(),
             strategy_name: Some("simple_moving_average".to_string()),
             symbol: None,
@@ -1939,11 +2137,12 @@ mod tests {
             created_at: None,
         };
 
-        let snapshot = attach_strategy_context_to_backtest_result(result, &config);
+        let snapshot = attach_strategy_context_to_backtest_result(result, &config, None);
 
         assert_eq!(snapshot.strategy_name.as_deref(), Some("SMA Alpha"));
         assert_eq!(snapshot.symbol.as_deref(), Some("0700.HK"));
         assert_eq!(snapshot.timeframe.as_deref(), Some("1h"));
+        assert!(snapshot.experiment_id.is_none());
         assert_eq!(
             snapshot
                 .parameters
@@ -1962,6 +2161,10 @@ mod tests {
         );
         let result = BacktestResult {
             run_id: None,
+            experiment_id: None,
+            experiment_label: None,
+            experiment_note: None,
+            parameter_version: None,
             strategy_id: config.id.clone(),
             strategy_name: None,
             symbol: None,
@@ -1983,10 +2186,58 @@ mod tests {
             created_at: None,
         };
 
-        let snapshot = attach_strategy_context_to_backtest_result(result, &config);
+        let snapshot = attach_strategy_context_to_backtest_result(result, &config, None);
 
         assert_eq!(snapshot.symbol.as_deref(), Some("AAPL"));
         assert_eq!(snapshot.timeframe.as_deref(), Some("1d"));
+        assert!(snapshot.experiment_id.is_none());
+    }
+
+    #[test]
+    fn attach_strategy_context_to_backtest_result_preserves_explicit_metadata() {
+        let config = StrategyConfig::new(
+            "strategy-6".to_string(),
+            "simple_moving_average".to_string(),
+        );
+        let result = BacktestResult {
+            run_id: None,
+            experiment_id: None,
+            experiment_label: None,
+            experiment_note: None,
+            parameter_version: None,
+            strategy_id: config.id.clone(),
+            strategy_name: None,
+            symbol: None,
+            timeframe: None,
+            parameters: None,
+            trades: None,
+            equity_curve: None,
+            start_date: Utc::now(),
+            end_date: Utc::now(),
+            initial_capital: Decimal::new(100000, 0),
+            final_capital: Decimal::new(100000, 0),
+            total_return: 0.0,
+            annualized_return: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            win_rate: 0.0,
+            total_trades: 0,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            created_at: None,
+        };
+
+        let metadata = BacktestExperimentMetadata {
+            experiment_id: Some(Uuid::new_v4()),
+            experiment_label: Some("Batch B".to_string()),
+            experiment_note: Some("note".to_string()),
+            parameter_version: Some("v2".to_string()),
+        };
+
+        let snapshot = attach_strategy_context_to_backtest_result(result, &config, Some(metadata));
+
+        assert_eq!(snapshot.experiment_label.as_deref(), Some("Batch B"));
+        assert_eq!(snapshot.experiment_note.as_deref(), Some("note"));
+        assert_eq!(snapshot.parameter_version.as_deref(), Some("v2"));
     }
 
     #[test]

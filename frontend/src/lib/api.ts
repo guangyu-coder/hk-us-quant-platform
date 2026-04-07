@@ -15,6 +15,9 @@ import type {
   StrategyConfig, 
   SystemHealth,
   BacktestResult,
+  BacktestBatchResult,
+  BacktestExperimentMetadata,
+  BacktestListFilters,
   ApiResponse,
   RiskMetrics,
   RiskLimitsSnapshot,
@@ -219,23 +222,35 @@ export const strategyApi = {
   runBacktest: async (
     strategyId: string, 
     startDate: string, 
-    endDate: string
+    endDate: string,
+    metadata: BacktestExperimentMetadata = {}
   ): Promise<BacktestResult> => {
     return api.post(`/v1/strategies/${strategyId}/backtest`, {
       start_date: startDate,
-      end_date: endDate
+      end_date: endDate,
+      ...metadata,
     });
+  },
+
+  runBacktestBatch: async (
+    strategyId: string,
+    payload: {
+      start_date: string;
+      end_date: string;
+      experiment_label?: string | null;
+      experiment_note?: string | null;
+      parameter_version?: string | null;
+      parameter_sets: Array<Record<string, any>>;
+    }
+  ): Promise<BacktestBatchResult> => {
+    return api.post(`/v1/strategies/${strategyId}/backtest/batch`, payload);
   },
 
   listBacktests: async (): Promise<BacktestResult[]> => {
     return api.get('/v1/backtests');
   },
 
-  listBacktestsWithFilters: async (filters: {
-    strategy_id?: string;
-    symbol?: string;
-    limit?: number;
-  }): Promise<BacktestResult[]> => {
+  listBacktestsWithFilters: async (filters: BacktestListFilters = {}): Promise<BacktestResult[]> => {
     return api.get('/v1/backtests', { params: filters });
   },
 };

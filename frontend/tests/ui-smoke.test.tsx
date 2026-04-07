@@ -10,6 +10,7 @@ const apiMocks = vi.hoisted(() => ({
   updateStrategy: vi.fn(),
   deleteStrategy: vi.fn(),
   runBacktest: vi.fn(),
+  runBacktestBatch: vi.fn(),
   listBacktestsWithFilters: vi.fn(),
   listTrades: vi.fn(),
   searchSymbols: vi.fn(),
@@ -24,6 +25,7 @@ vi.mock('@/lib/api', () => ({
     updateStrategy: apiMocks.updateStrategy,
     deleteStrategy: apiMocks.deleteStrategy,
     runBacktest: apiMocks.runBacktest,
+    runBacktestBatch: apiMocks.runBacktestBatch,
     listBacktestsWithFilters: apiMocks.listBacktestsWithFilters,
   },
   tradeApi: {
@@ -80,6 +82,10 @@ const strategy = {
 
 const backtestResult = {
   run_id: 'run-001',
+  experiment_id: 'experiment-001',
+  experiment_label: 'Alpha Batch',
+  experiment_note: 'batch note',
+  parameter_version: 'v1',
   strategy_id: strategy.id,
   strategy_name: strategy.display_name,
   symbol: 'AAPL',
@@ -112,6 +118,15 @@ const backtestResult = {
   created_at: '2026-04-02T01:00:00Z',
 };
 
+const siblingBacktestResult = {
+  ...backtestResult,
+  run_id: 'run-002',
+  total_return: 0.06,
+  annualized_return: 0.09,
+  sharpe_ratio: 1.4,
+  created_at: '2026-04-02T02:00:00Z',
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -138,7 +153,8 @@ describe('UI smoke', () => {
     apiMocks.updateStrategy.mockResolvedValue({ id: strategy.id });
     apiMocks.deleteStrategy.mockResolvedValue(undefined);
     apiMocks.runBacktest.mockResolvedValue({ run_id: backtestResult.run_id });
-    apiMocks.listBacktestsWithFilters.mockResolvedValue([backtestResult]);
+    apiMocks.runBacktestBatch.mockResolvedValue({ count: 2, results: [backtestResult, backtestResult] });
+    apiMocks.listBacktestsWithFilters.mockResolvedValue([backtestResult, siblingBacktestResult]);
     apiMocks.listTrades.mockResolvedValue([]);
     apiMocks.searchSymbols.mockResolvedValue([]);
 
@@ -203,18 +219,27 @@ describe('UI smoke', () => {
     fireEvent.submit(backtestForm as HTMLFormElement);
 
     await waitFor(() => {
-      expect(apiMocks.runBacktest).toHaveBeenCalledWith(strategy.id, '2026-03-01', '2026-03-31');
+      expect(apiMocks.runBacktest).toHaveBeenCalledWith(
+        strategy.id,
+        '2026-03-01',
+        '2026-03-31',
+        expect.objectContaining({
+          experiment_label: 'Alpha Trend 实验',
+          experiment_note: 'Baseline trend strategy',
+          parameter_version: expect.stringMatching(/^v\d{4}-\d{2}-\d{2}$/),
+        })
+      );
       expect(alert).toHaveBeenCalled();
     });
   });
 
-  it('drives the backtest page through detail toggle and export actions', async () => {
+  it('drives the backtest page through detail toggle and experiment export actions', async () => {
     const user = userEvent.setup();
     renderWithQueryClient(React.createElement(BacktestPage));
 
     await screen.findAllByText('Alpha Trend');
 
-    await user.click(screen.getByRole('button', { name: '查看详情' }));
+    await user.click(screen.getAllByRole('button', { name: '查看详情' })[0]);
     await screen.findByText('运行元数据');
     await user.click(screen.getAllByRole('button', { name: '收起详情' })[0]);
 
@@ -224,10 +249,14 @@ describe('UI smoke', () => {
 
     await user.click(screen.getByRole('button', { name: '导出筛选 JSON' }));
     await user.click(screen.getByRole('button', { name: '导出筛选 CSV' }));
+    await user.click(screen.getAllByRole('button', { name: '快照 JSON' })[0]);
+    await user.click(screen.getAllByRole('button', { name: '对比同批次' })[0]);
+    await user.click(screen.getAllByRole('button', { name: '导出批次 JSON' })[0]);
 
     await waitFor(() => {
       expect(URL.createObjectURL).toHaveBeenCalled();
       expect(HTMLAnchorElement.prototype.click).toHaveBeenCalled();
+      expect(screen.getByText(/当前导出的是同一实验批次/)).toBeTruthy();
     });
   });
 });

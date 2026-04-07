@@ -3,6 +3,10 @@ import type { BacktestResult } from '@/types';
 export interface BacktestExportRow {
   run_key: string;
   run_id: string;
+  experiment_id: string;
+  experiment_label: string;
+  experiment_note: string;
+  parameter_version: string;
   strategy_id: string;
   strategy_name: string;
   run_snapshot_name: string;
@@ -51,6 +55,10 @@ export function buildBacktestExportRows(
   return results.map((result) => ({
     run_key: getBacktestResultKey(result),
     run_id: result.run_id?.trim() || '-',
+    experiment_id: result.experiment_id?.trim() || '-',
+    experiment_label: result.experiment_label?.trim() || '-',
+    experiment_note: result.experiment_note?.trim() || '-',
+    parameter_version: result.parameter_version?.trim() || '-',
     strategy_id: result.strategy_id,
     strategy_name: resolveStrategyName(result).trim() || result.strategy_id,
     run_snapshot_name: result.strategy_name?.trim() || '-',
@@ -86,6 +94,10 @@ export function serializeBacktestExportRowsToCsv(rows: BacktestExportRow[]): str
   const headers: Array<keyof BacktestExportRow> = [
     'run_key',
     'run_id',
+    'experiment_id',
+    'experiment_label',
+    'experiment_note',
+    'parameter_version',
     'strategy_id',
     'strategy_name',
     'run_snapshot_name',

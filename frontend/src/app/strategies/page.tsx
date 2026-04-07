@@ -24,8 +24,11 @@ import {
 import {
   COMMON_SYMBOL_SHORTCUTS,
   STRATEGY_TEMPLATE_SHORTCUTS,
+  buildDefaultBacktestParameterSets,
   loadRecentSymbols,
   normalizeSymbolShortcut,
+  parseBacktestParameterSets,
+  serializeBacktestParameterSets,
   saveRecentSymbols,
   upsertRecentSymbol,
 } from './strategy-workflow';
@@ -251,6 +254,7 @@ export default function StrategiesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [backtestMode, setBacktestMode] = useState<'single' | 'batch'>('single');
   const [strategyForm, setStrategyForm] = useState<{
     name: StrategyPresetKey;
     display_name: string;
@@ -263,6 +267,10 @@ export default function StrategiesPage() {
     start_date: '',
     end_date: '',
   });
+  const [experimentLabel, setExperimentLabel] = useState('');
+  const [experimentNote, setExperimentNote] = useState('');
+  const [parameterVersion, setParameterVersion] = useState('');
+  const [batchParameterSetsText, setBatchParameterSetsText] = useState('');
   const [symbolSearchQuery, setSymbolSearchQuery] = useState('');
   const [symbolSearchResults, setSymbolSearchResults] = useState<SearchResult[]>([]);
   const [showSymbolResults, setShowSymbolResults] = useState(false);
@@ -396,8 +404,26 @@ export default function StrategiesPage() {
   });
 
   const runBacktestMutation = useMutation({
-    mutationFn: ({ strategyId, startDate, endDate }: { strategyId: string; startDate: string; endDate: string }) =>
-      strategyApi.runBacktest(strategyId, startDate, endDate),
+    mutationFn: ({
+      strategyId,
+      startDate,
+      endDate,
+      experimentLabel,
+      experimentNote,
+      parameterVersion,
+    }: {
+      strategyId: string;
+      startDate: string;
+      endDate: string;
+      experimentLabel?: string;
+      experimentNote?: string;
+      parameterVersion?: string;
+    }) =>
+      strategyApi.runBacktest(strategyId, startDate, endDate, {
+        experiment_label: experimentLabel,
+        experiment_note: experimentNote,
+        parameter_version: parameterVersion,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['backtest-history'] });
       setShowBacktestModal(false);
@@ -406,6 +432,43 @@ export default function StrategiesPage() {
     },
     onError: (error) => {
       setBacktestError(getApiErrorMessage(error, '回测运行失败'));
+    },
+  });
+
+  const runBacktestBatchMutation = useMutation({
+    mutationFn: ({
+      strategyId,
+      startDate,
+      endDate,
+      experimentLabel,
+      experimentNote,
+      parameterVersion,
+      parameterSets,
+    }: {
+      strategyId: string;
+      startDate: string;
+      endDate: string;
+      experimentLabel?: string;
+      experimentNote?: string;
+      parameterVersion?: string;
+      parameterSets: Array<Record<string, unknown>>;
+    }) =>
+      strategyApi.runBacktestBatch(strategyId, {
+        start_date: startDate,
+        end_date: endDate,
+        experiment_label: experimentLabel,
+        experiment_note: experimentNote,
+        parameter_version: parameterVersion,
+        parameter_sets: parameterSets,
+      }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['backtest-history'] });
+      setShowBacktestModal(false);
+      resetBacktestForm();
+      alert(`实验批次已完成，共 ${data.count} 组回测结果`);
+    },
+    onError: (error) => {
+      setBacktestError(getApiErrorMessage(error, '批量回测运行失败'));
     },
   });
 
@@ -512,28 +575,70 @@ export default function StrategiesPage() {
     });
   };
 
-  const handleRunBacktest = (strategy: StrategyConfig) => {
-    if (runBacktestMutation.isPending) {
+  const isBacktestSubmitting = runBacktestMutation.isPending || runBacktestBatchMutation.isPending;
+
+  const initializeBacktestMetadata = (strategy: StrategyConfig) => {
+    const experimentBaseName = getStrategyDisplayName(strategy);
+    setExperimentLabel(`${experimentBaseName} 实验`);
+    setExperimentNote(strategy.description?.trim() || '');
+    setParameterVersion(`v${new Date().toISOString().slice(0, 10)}`);
+  };
+
+  const initializeBatchParameterSets = (strategy: StrategyConfig) => {
+    setBatchParameterSetsText(
+      serializeBacktestParameterSets(buildDefaultBacktestParameterSets(strategy))
+    );
+  };
+
+  const handleRunBacktest = (strategy: StrategyConfig, mode: 'single' | 'batch' = 'single') => {
+    if (isBacktestSubmitting) {
       return;
     }
 
     resetBacktestForm();
     setSelectedStrategy(strategy);
+    setBacktestMode(mode);
+    initializeBacktestMetadata(strategy);
+    if (mode === 'batch') {
+      initializeBatchParameterSets(strategy);
+    }
     setShowBacktestModal(true);
   };
 
   const handleSubmitBacktest = (e: React.FormEvent) => {
     e.preventDefault();
-    if (runBacktestMutation.isPending) {
+    if (isBacktestSubmitting) {
       return;
     }
 
     if (selectedStrategy) {
       setBacktestError(null);
+      if (backtestMode === 'batch') {
+        const parsed = parseBacktestParameterSets(batchParameterSetsText);
+        if (parsed.error) {
+          setBacktestError(parsed.error);
+          return;
+        }
+
+        runBacktestBatchMutation.mutate({
+          strategyId: selectedStrategy.id,
+          startDate: backtestParams.start_date,
+          endDate: backtestParams.end_date,
+          experimentLabel: experimentLabel.trim() || undefined,
+          experimentNote: experimentNote.trim() || undefined,
+          parameterVersion: parameterVersion.trim() || undefined,
+          parameterSets: parsed.parameterSets,
+        });
+        return;
+      }
+
       runBacktestMutation.mutate({
         strategyId: selectedStrategy.id,
         startDate: backtestParams.start_date,
         endDate: backtestParams.end_date,
+        experimentLabel: experimentLabel.trim() || undefined,
+        experimentNote: experimentNote.trim() || undefined,
+        parameterVersion: parameterVersion.trim() || undefined,
       });
     }
   };
@@ -555,6 +660,11 @@ export default function StrategiesPage() {
   const resetBacktestForm = () => {
     setBacktestError(null);
     setBacktestParams({ start_date: '', end_date: '' });
+    setBacktestMode('single');
+    setExperimentLabel('');
+    setExperimentNote('');
+    setParameterVersion('');
+    setBatchParameterSetsText('');
   };
 
   const openCreateStrategyForm = (presetName: StrategyPresetKey = 'simple_moving_average') => {
@@ -961,9 +1071,21 @@ export default function StrategiesPage() {
                 <Plus className="h-4 w-4 mr-2" />
                 新建策略
               </button>
-              <button className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50">
+              <button
+                type="button"
+                onClick={() => {
+                  if (strategiesArray.length === 1) {
+                    handleRunBacktest(strategiesArray[0], 'batch');
+                    return;
+                  }
+
+                  alert('请先从具体策略卡片进入回测弹窗，再切换到批量模式。');
+                }}
+                disabled={strategiesArray.length === 0}
+                className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+              >
                 <BarChart className="h-4 w-4 mr-2" />
-                批量回测
+                批量实验
               </button>
             </div>
           </div>
@@ -1306,10 +1428,17 @@ export default function StrategiesPage() {
       )}
 
       {showBacktestModal && selectedStrategy && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white p-6 rounded-lg shadow-lg w-full max-w-lg">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-medium">运行回测</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+          <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-lg bg-white p-6 shadow-lg">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-medium">{backtestMode === 'batch' ? '批量实验' : '运行回测'}</h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  {backtestMode === 'batch'
+                    ? '在同一实验批次里顺序执行 2-5 组参数覆盖。'
+                    : '保留当前策略配置做一次完整回测。'}
+                </p>
+              </div>
               <button
                 onClick={() => {
                   setShowBacktestModal(false);
@@ -1323,7 +1452,7 @@ export default function StrategiesPage() {
 
             <div className="space-y-4">
               <div>
-                <p className="text-sm text-gray-500 mb-2">策略名称</p>
+                <p className="mb-2 text-sm text-gray-500">策略名称</p>
                 <p className="font-medium text-gray-900">{getStrategyDisplayName(selectedStrategy)}</p>
                 <p className="mt-1 text-xs text-gray-500">
                   name: {selectedStrategy.name} · 标的: {String(selectedStrategy.parameters?.symbol ?? '-')} · 周期: {String(selectedStrategy.parameters?.timeframe ?? '-')}
@@ -1333,7 +1462,9 @@ export default function StrategiesPage() {
               <div className="rounded-md border border-gray-200 bg-gray-50 px-4 py-3">
                 <p className="text-sm font-medium text-gray-900">提交前确认</p>
                 <p className="mt-1 text-xs text-gray-500">
-                  请先核对本次研究条件，确认无误后再运行回测。
+                  {backtestMode === 'batch'
+                    ? '请先核对实验标签和参数覆盖，再顺序提交多个参数组合。'
+                    : '请先核对本次研究条件，确认无误后再运行回测。'}
                 </p>
                 <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
                   <div>
@@ -1377,17 +1508,102 @@ export default function StrategiesPage() {
                 </dl>
               </div>
 
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">实验标签</label>
+                  <input
+                    type="text"
+                    value={experimentLabel}
+                    onChange={(e) => setExperimentLabel(e.target.value)}
+                    className="w-full rounded-md border border-gray-300 px-3 py-2"
+                    placeholder="例如：SMA 2026-04 波动测试"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">参数版本</label>
+                  <input
+                    type="text"
+                    value={parameterVersion}
+                    onChange={(e) => setParameterVersion(e.target.value)}
+                    className="w-full rounded-md border border-gray-300 px-3 py-2"
+                    placeholder="例如：v1.0 / 2026-04-03"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <div className="flex w-full rounded-md border border-gray-200 bg-gray-50 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setBacktestMode('single')}
+                      className={`flex-1 rounded-md px-3 py-2 text-sm font-medium ${
+                        backtestMode === 'single' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600'
+                      }`}
+                    >
+                      单次
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBacktestMode('batch');
+                        if (selectedStrategy) {
+                          initializeBatchParameterSets(selectedStrategy);
+                        }
+                      }}
+                      className={`flex-1 rounded-md px-3 py-2 text-sm font-medium ${
+                        backtestMode === 'batch' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600'
+                      }`}
+                    >
+                      批量
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">实验备注</label>
+                <textarea
+                  value={experimentNote}
+                  onChange={(e) => setExperimentNote(e.target.value)}
+                  className="w-full rounded-md border border-gray-300 px-3 py-2"
+                  rows={3}
+                  placeholder="补充实验假设、数据窗口或任何需要在回测后复盘的说明"
+                />
+              </div>
+
+              {backtestMode === 'batch' && (
+                <div className="space-y-2 rounded-md border border-sky-200 bg-sky-50/60 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-sky-900">参数覆盖 JSON</p>
+                      <p className="text-xs text-sky-800">
+                        填写 2-5 个对象，每个对象会覆盖当前策略参数中的对应字段。
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => selectedStrategy && initializeBatchParameterSets(selectedStrategy)}
+                      className="rounded-md border border-sky-200 bg-white px-3 py-2 text-xs font-medium text-sky-700 hover:bg-sky-50"
+                    >
+                      重置示例
+                    </button>
+                  </div>
+                  <textarea
+                    value={batchParameterSetsText}
+                    onChange={(e) => setBatchParameterSetsText(e.target.value)}
+                    className="min-h-56 w-full rounded-md border border-sky-200 bg-white px-3 py-2 font-mono text-sm text-slate-700"
+                    placeholder={serializeBacktestParameterSets(buildDefaultBacktestParameterSets(selectedStrategy))}
+                  />
+                </div>
+              )}
+
               {backtestError && (
-                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm leading-6 text-red-700 whitespace-pre-wrap">
+                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm leading-6 whitespace-pre-wrap text-red-700">
                   {backtestError}
                 </div>
               )}
 
               <form onSubmit={handleSubmitBacktest} className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    开始日期
-                  </label>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">开始日期</label>
                   <input
                     type="date"
                     value={backtestParams.start_date}
@@ -1395,15 +1611,13 @@ export default function StrategiesPage() {
                       setBacktestError(null);
                       setBacktestParams({ ...backtestParams, start_date: e.target.value });
                     }}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                    className="w-full rounded-md border border-gray-300 px-3 py-2"
                     required
                   />
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    结束日期
-                  </label>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">结束日期</label>
                   <input
                     type="date"
                     value={backtestParams.end_date}
@@ -1411,7 +1625,7 @@ export default function StrategiesPage() {
                       setBacktestError(null);
                       setBacktestParams({ ...backtestParams, end_date: e.target.value });
                     }}
-                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                    className="w-full rounded-md border border-gray-300 px-3 py-2"
                     required
                   />
                 </div>
@@ -1423,17 +1637,21 @@ export default function StrategiesPage() {
                       setShowBacktestModal(false);
                       resetBacktestForm();
                     }}
-                    disabled={runBacktestMutation.isPending}
-                    className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                    disabled={isBacktestSubmitting}
+                    className="flex-1 rounded-md border border-gray-300 px-4 py-2 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
                   >
                     取消
                   </button>
                   <button
                     type="submit"
-                    disabled={runBacktestMutation.isPending}
-                    className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                    disabled={isBacktestSubmitting}
+                    className="flex-1 rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 disabled:opacity-50"
                   >
-                    {runBacktestMutation.isPending ? '运行中...' : '运行回测'}
+                    {isBacktestSubmitting
+                      ? '运行中...'
+                      : backtestMode === 'batch'
+                        ? '运行批量实验'
+                        : '运行回测'}
                   </button>
                 </div>
               </form>

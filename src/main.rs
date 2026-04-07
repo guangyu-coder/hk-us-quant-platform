@@ -43,7 +43,10 @@ use crate::portfolio::{PortfolioExecutionHandler, PortfolioService};
 use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
 use crate::strategy::StrategyService;
-use crate::types::{ExecutionTrade, OrderSide, OrderStatus, OrderType, RiskLimits, StrategyConfig};
+use crate::types::{
+    BacktestExperimentMetadata, ExecutionTrade, OrderSide, OrderStatus, OrderType, RiskLimits,
+    StrategyConfig,
+};
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
 };
@@ -92,6 +95,19 @@ pub struct UpdateStrategyRequest {
 pub struct BacktestRequest {
     pub start_date: String,
     pub end_date: String,
+    pub experiment_label: Option<String>,
+    pub experiment_note: Option<String>,
+    pub parameter_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestBatchRequest {
+    pub start_date: String,
+    pub end_date: String,
+    pub experiment_label: Option<String>,
+    pub experiment_note: Option<String>,
+    pub parameter_version: Option<String>,
+    pub parameter_sets: Vec<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +239,10 @@ pub struct PortfolioPnlHistoryQuery {
 pub struct BacktestListQuery {
     pub strategy_id: Option<String>,
     pub symbol: Option<String>,
+    pub experiment_label: Option<String>,
+    pub parameter_version: Option<String>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
 }
 
@@ -394,6 +414,10 @@ fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/strategies/:strategy_id/backtest",
             post(run_backtest),
+        )
+        .route(
+            "/api/v1/strategies/:strategy_id/backtest/batch",
+            post(run_backtest_batch),
         )
         .route("/api/v1/backtests", get(list_backtests))
         .route("/api/v1/trades", get(list_trades))
@@ -928,11 +952,52 @@ async fn run_backtest(
     let start = parse_backtest_datetime(&req.start_date)?;
     let end = parse_backtest_datetime(&req.end_date)?;
     validate_backtest_date_range(start, end)?;
+    let metadata = build_backtest_experiment_metadata(
+        req.experiment_label,
+        req.experiment_note,
+        req.parameter_version,
+    );
     let result = state
         .strategy_service
-        .run_backtest(&strategy_id, start, end)
+        .run_backtest_with_metadata(&strategy_id, start, end, metadata)
         .await?;
     Ok(Json(backtest_to_json(result)))
+}
+
+async fn run_backtest_batch(
+    State(state): State<AppState>,
+    Path(strategy_id): Path<String>,
+    Json(req): Json<BacktestBatchRequest>,
+) -> Result<Json<Value>, AppError> {
+    let start = parse_backtest_datetime(&req.start_date)?;
+    let end = parse_backtest_datetime(&req.end_date)?;
+    validate_backtest_date_range(start, end)?;
+    if !(2..=5).contains(&req.parameter_sets.len()) {
+        return Err(AppError::invalid_backtest_parameters(
+            "Batch experiments require between 2 and 5 parameter sets.",
+        ));
+    }
+
+    let results = state
+        .strategy_service
+        .run_backtest_batch(
+            &strategy_id,
+            start,
+            end,
+            req.experiment_label,
+            req.experiment_note,
+            req.parameter_version,
+            req.parameter_sets,
+        )
+        .await?;
+    Ok(Json(json!({
+        "experiment_id": results
+            .first()
+            .and_then(|result| result.experiment_id)
+            .map(|id| id.to_string()),
+        "count": results.len(),
+        "results": results.into_iter().map(backtest_to_json).collect::<Vec<_>>()
+    })))
 }
 
 async fn list_backtests(
@@ -942,7 +1007,15 @@ async fn list_backtests(
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let results = state
         .strategy_service
-        .list_backtest_runs_filtered(limit, query.strategy_id.as_deref(), query.symbol.as_deref())
+        .list_backtest_runs_filtered(
+            limit,
+            query.strategy_id.as_deref(),
+            query.symbol.as_deref(),
+            query.experiment_label.as_deref(),
+            query.parameter_version.as_deref(),
+            query.created_after,
+            query.created_before,
+        )
         .await?;
     Ok(Json(json!(results
         .into_iter()
@@ -1393,6 +1466,10 @@ fn validate_backtest_date_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Res
 fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
     json!({
         "run_id": result.run_id.map(|id| id.to_string()),
+        "experiment_id": result.experiment_id.map(|id| id.to_string()),
+        "experiment_label": result.experiment_label,
+        "experiment_note": result.experiment_note,
+        "parameter_version": result.parameter_version,
         "strategy_id": result.strategy_id,
         "strategy_name": result.strategy_name,
         "symbol": result.symbol,
@@ -1437,6 +1514,23 @@ fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
             "largest_win": result.performance_metrics.largest_win.to_f64().unwrap_or(0.0),
             "largest_loss": result.performance_metrics.largest_loss.to_f64().unwrap_or(0.0),
         }
+    })
+}
+
+fn build_backtest_experiment_metadata(
+    experiment_label: Option<String>,
+    experiment_note: Option<String>,
+    parameter_version: Option<String>,
+) -> Option<BacktestExperimentMetadata> {
+    if experiment_label.is_none() && experiment_note.is_none() && parameter_version.is_none() {
+        return None;
+    }
+
+    Some(BacktestExperimentMetadata {
+        experiment_id: None,
+        experiment_label,
+        experiment_note,
+        parameter_version,
     })
 }
 
@@ -2125,6 +2219,42 @@ mod http_e2e_tests {
     }
 
     #[test]
+    fn backtest_json_includes_experiment_metadata() {
+        let result = crate::types::BacktestResult {
+            run_id: Some(Uuid::new_v4()),
+            experiment_id: Some(Uuid::new_v4()),
+            experiment_label: Some("Batch A".to_string()),
+            experiment_note: Some("note".to_string()),
+            parameter_version: Some("v1".to_string()),
+            strategy_id: "strategy-1".to_string(),
+            strategy_name: Some("SMA".to_string()),
+            symbol: Some("AAPL".to_string()),
+            timeframe: Some("1d".to_string()),
+            parameters: Some(std::collections::HashMap::new()),
+            trades: Some(Vec::new()),
+            equity_curve: Some(Vec::new()),
+            start_date: Utc::now(),
+            end_date: Utc::now(),
+            initial_capital: rust_decimal::Decimal::new(100000, 0),
+            final_capital: rust_decimal::Decimal::new(102000, 0),
+            total_return: 0.02,
+            annualized_return: 0.1,
+            sharpe_ratio: 1.1,
+            max_drawdown: 0.03,
+            win_rate: 0.5,
+            total_trades: 1,
+            performance_metrics: crate::types::PerformanceMetrics::default(),
+            created_at: Some(Utc::now()),
+        };
+
+        let response = backtest_to_json(result);
+
+        assert_eq!(response["experiment_label"], json!("Batch A"));
+        assert_eq!(response["parameter_version"], json!("v1"));
+        assert!(response["experiment_id"].as_str().is_some());
+    }
+
+    #[test]
     fn health_response_includes_optional_operational_summary() {
         let summary = json!({
             "strategies_total": 3,
@@ -2136,7 +2266,9 @@ mod http_e2e_tests {
 
         let response = build_health_response(Some(summary.clone()), None);
         assert_eq!(response["status"], json!("healthy"));
-        assert!(response["deployed_at"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(response["deployed_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert_eq!(response["recent_error"], Value::Null);
         assert_eq!(response["summary"], summary);
 

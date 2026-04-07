@@ -661,9 +661,22 @@ impl RiskMetrics {
 }
 
 /// Backtest result structure
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BacktestExperimentMetadata {
+    pub experiment_id: Option<Uuid>,
+    pub experiment_label: Option<String>,
+    pub experiment_note: Option<String>,
+    pub parameter_version: Option<String>,
+}
+
+/// Backtest result structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResult {
     pub run_id: Option<Uuid>,
+    pub experiment_id: Option<Uuid>,
+    pub experiment_label: Option<String>,
+    pub experiment_note: Option<String>,
+    pub parameter_version: Option<String>,
     pub strategy_id: String,
     pub strategy_name: Option<String>,
     pub symbol: Option<String>,

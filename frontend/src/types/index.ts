@@ -272,6 +272,10 @@ export interface RiskAlert {
 // 回测结果类型
 export interface BacktestResult {
   run_id?: string;
+  experiment_id?: string | null;
+  experiment_label?: string | null;
+  experiment_note?: string | null;
+  parameter_version?: string | null;
   strategy_id: string;
   strategy_name?: string;
   symbol?: string;
@@ -291,6 +295,32 @@ export interface BacktestResult {
   total_trades: number;
   performance_metrics: PerformanceMetrics;
   created_at?: string;
+}
+
+export interface BacktestExperimentMetadata {
+  experiment_label?: string | null;
+  experiment_note?: string | null;
+  parameter_version?: string | null;
+}
+
+export interface BacktestParameterSet {
+  parameters: Record<string, any>;
+}
+
+export interface BacktestBatchResult {
+  experiment_id?: string | null;
+  count: number;
+  results: BacktestResult[];
+}
+
+export interface BacktestListFilters {
+  strategy_id?: string;
+  symbol?: string;
+  experiment_label?: string;
+  parameter_version?: string;
+  created_after?: string;
+  created_before?: string;
+  limit?: number;
 }
 
 export interface BacktestTrade {

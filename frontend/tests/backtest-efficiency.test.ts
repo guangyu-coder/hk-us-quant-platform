@@ -11,6 +11,10 @@ import {
 
 const sampleResult = {
   run_id: 'run-123',
+  experiment_id: 'experiment-123',
+  experiment_label: 'Alpha Batch',
+  experiment_note: 'note',
+  parameter_version: 'v1.0',
   strategy_id: 'strategy-1',
   strategy_name: 'Legacy Momentum',
   symbol: 'AAPL',
@@ -47,6 +51,8 @@ test('buildBacktestExportRows resolves names and keeps a stable key', () => {
 
   assert.equal(getBacktestResultKey(sampleResult), 'run-run-123');
   assert.equal(rows[0].strategy_name, 'Alpha, "Core"');
+  assert.equal(rows[0].experiment_label, 'Alpha Batch');
+  assert.equal(rows[0].parameter_version, 'v1.0');
   assert.equal(rows[0].run_snapshot_name, 'Legacy Momentum');
   assert.equal(rows[0].total_return, 0.085);
   assert.equal(rows[0].win_rate, 0.58);
@@ -69,5 +75,6 @@ test('serializeBacktestExportRowsToJson preserves the run snapshot name', () => 
 
   assert.equal(parsed.count, 1);
   assert.equal(parsed.rows[0].strategy_name, 'Alpha, "Core"');
+  assert.equal(parsed.rows[0].experiment_id, 'experiment-123');
   assert.equal(parsed.rows[0].run_snapshot_name, 'Legacy Momentum');
 });
