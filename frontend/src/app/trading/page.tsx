@@ -264,7 +264,7 @@ export default function TradingPage() {
       return '人工复核预留中';
     }
 
-    return recentSignal.status;
+    return recentSignal.status ?? '暂无信号状态';
   };
 
   const getSignalDirectionLabel = (signal: StrategySignalSnapshot | null | undefined): string => {

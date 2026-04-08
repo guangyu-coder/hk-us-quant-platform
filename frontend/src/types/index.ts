@@ -337,15 +337,17 @@ export interface StrategyLatestRealTradeSummary {
 
 export interface StrategyRecentSignalSummary {
   source: string;
-  status: string;
+  status?: string;
   confirmation_state: string;
   strategy_id: string;
   strategy_name?: string | null;
   symbol?: string | null;
   timeframe?: string | null;
   latest_signal_at?: string | null;
+  generated_at?: string | null;
   signal_type?: SignalType | null;
   strength?: number | null;
+  suggested_order?: StrategySuggestedOrderDraft | null;
   note: string;
 }
 

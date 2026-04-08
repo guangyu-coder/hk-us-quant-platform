@@ -217,17 +217,24 @@ const strategyState = {
   },
   latest_real_trade: null,
   recent_signal: {
-    source: 'signal_events_not_persisted',
-    status: 'placeholder',
+    source: 'strategy_engine_latest_snapshot',
+    status: 'live',
     confirmation_state: 'manual_review_only',
     strategy_id: strategy.id,
     strategy_name: strategy.display_name,
     symbol: backtestResult.symbol,
     timeframe: backtestResult.timeframe,
-    latest_signal_at: null,
-    signal_type: null,
-    strength: null,
-    note: '信号尚未持久化，当前仅预留确认台结构，回测上下文可作为人工复核参考。',
+    latest_signal_at: '2026-04-02T03:30:00Z',
+    generated_at: '2026-04-02T03:30:00Z',
+    signal_type: 'Buy',
+    strength: 0.82,
+    suggested_order: {
+      symbol: 'AAPL',
+      side: 'Buy',
+      quantity: 100,
+      strategy_id: strategy.id,
+    },
+    note: '研究信号仅用于人工确认，不会自动下单。',
   },
   generated_at: '2026-04-02T03:00:00Z',
 };
@@ -247,7 +254,17 @@ const secondStrategyState = {
     strategy_id: secondStrategy.id,
     strategy_name: secondStrategy.display_name,
     symbol: secondStrategy.parameters.symbol,
-    note: '第二条策略的人工复核占位。',
+    latest_signal_at: '2026-04-02T03:40:00Z',
+    generated_at: '2026-04-02T03:40:00Z',
+    signal_type: 'Sell',
+    strength: 0.67,
+    suggested_order: {
+      symbol: 'MSFT',
+      side: 'Sell',
+      quantity: 100,
+      strategy_id: secondStrategy.id,
+    },
+    note: '第二条策略的人工复核快照。',
   },
 };
 
@@ -434,7 +451,9 @@ describe('UI smoke', () => {
     await screen.findByText('研究与真实执行复盘');
     await screen.findByText('本地数据命中');
     await screen.findByText(/参考匹配真实执行成交/);
-    await screen.findByText(/人工复核入口预留中/);
+    await screen.findByText('最新信号快照');
+    await screen.findByText(/建议订单: Buy \/ 100 股/);
+    await screen.findByText(/该信号仅用于人工确认，不会自动触发下单/);
     await user.click(screen.getAllByRole('button', { name: '收起详情' })[0]);
 
     await waitFor(() => {

@@ -3,7 +3,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { strategyApi, tradeApi } from '@/lib/api';
-import type { BacktestResult, StrategyConfig, StrategyExecutionOverview } from '@/types';
+import type {
+  BacktestResult,
+  StrategyConfig,
+  StrategyExecutionOverview,
+  StrategySuggestedOrderDraft,
+} from '@/types';
 import {
   buildBacktestFilterSummary,
   describeBacktestAssumptions,
@@ -435,6 +440,50 @@ export default function BacktestPage() {
 
   const formatOverviewTime = (value?: string | null) =>
     value ? new Date(value).toLocaleString('zh-CN') : '暂无';
+
+  const getRecentSignalGeneratedAt = (recentSignal: StrategyExecutionOverview['recent_signal']) =>
+    recentSignal.generated_at ?? recentSignal.latest_signal_at ?? null;
+
+  const getRecentSignalDirectionLabel = (recentSignal: StrategyExecutionOverview['recent_signal']) => {
+    if (!recentSignal.signal_type) {
+      return '暂无可确认方向';
+    }
+
+    switch (recentSignal.signal_type) {
+      case 'Buy':
+        return '买入';
+      case 'Sell':
+        return '卖出';
+      case 'Hold':
+      default:
+        return '观望';
+    }
+  };
+
+  const getRecentSignalSuggestedOrder = (
+    recentSignal: StrategyExecutionOverview['recent_signal'],
+    fallbackSymbol?: string | null
+  ): StrategySuggestedOrderDraft | null => {
+    if (recentSignal.suggested_order) {
+      return recentSignal.suggested_order;
+    }
+
+    if (!recentSignal.signal_type || recentSignal.signal_type === 'Hold') {
+      return null;
+    }
+
+    const symbol = recentSignal.symbol ?? fallbackSymbol;
+    if (!symbol) {
+      return null;
+    }
+
+    return {
+      symbol,
+      side: recentSignal.signal_type,
+      quantity: 100,
+      strategy_id: recentSignal.strategy_id,
+    };
+  };
 
   const getExperimentResults = (result: BacktestResult) => {
     if (!result.experiment_id) {
@@ -1391,23 +1440,62 @@ export default function BacktestPage() {
                             </div>
 
                             <div className="rounded-lg border border-amber-100 bg-white p-4">
-                              <h5 className="text-sm font-medium text-slate-900">信号确认占位</h5>
+                              <h5 className="text-sm font-medium text-slate-900">最新信号快照</h5>
                               {strategyOverview ? (
                                 <div className="mt-3 space-y-2 text-sm text-slate-700">
-                                  <div>
-                                    {strategyOverview.recent_signal.signal_type
-                                      ? `${strategyOverview.recent_signal.signal_type} / ${Math.round((strategyOverview.recent_signal.strength ?? 0) * 100)}%`
-                                      : '人工复核入口预留中'}
-                                  </div>
-                                  <div className="text-xs text-slate-500">
-                                    {strategyOverview.recent_signal.symbol ?? result.symbol ?? '待接入标的上下文'}
-                                    {strategyOverview.recent_signal.timeframe
-                                      ? ` / ${strategyOverview.recent_signal.timeframe}`
-                                      : ''}
-                                  </div>
-                                  <div className="text-xs text-slate-500">
-                                    {strategyOverview.recent_signal.note}
-                                  </div>
+                                  {strategyOverview.recent_signal.signal_type ? (
+                                    <>
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="font-medium text-slate-900">
+                                          {getRecentSignalDirectionLabel(strategyOverview.recent_signal)}
+                                        </span>
+                                        <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
+                                          强度 {Math.round((strategyOverview.recent_signal.strength ?? 0) * 100)}%
+                                        </span>
+                                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
+                                          {strategyOverview.recent_signal.confirmation_state}
+                                        </span>
+                                      </div>
+                                      <div className="text-xs text-slate-500">
+                                        {strategyOverview.recent_signal.symbol ?? result.symbol ?? '待接入标的上下文'}
+                                        {strategyOverview.recent_signal.timeframe
+                                          ? ` / ${strategyOverview.recent_signal.timeframe}`
+                                          : ''}
+                                      </div>
+                                      <div className="text-xs text-slate-500">
+                                        生成时间 {formatOverviewTime(getRecentSignalGeneratedAt(strategyOverview.recent_signal))}
+                                      </div>
+                                      <div className="text-xs text-slate-500">
+                                        建议订单:{' '}
+                                        {(() => {
+                                          const suggestedOrder = getRecentSignalSuggestedOrder(
+                                            strategyOverview.recent_signal,
+                                            result.symbol
+                                          );
+
+                                          return suggestedOrder
+                                            ? `${suggestedOrder.side} / ${suggestedOrder.quantity} 股`
+                                            : '暂无建议订单';
+                                        })()}
+                                      </div>
+                                      <div className="text-xs text-slate-500">
+                                        {strategyOverview.recent_signal.note}
+                                      </div>
+                                      <div className="text-xs font-medium text-violet-700">
+                                        该信号仅用于人工确认，不会自动触发下单。
+                                      </div>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <div className="text-sm text-slate-500">当前没有可确认的最新信号。</div>
+                                      <div className="text-xs text-slate-500">
+                                        {strategyOverview.recent_signal.note}
+                                      </div>
+                                      <div className="text-xs font-medium text-violet-700">
+                                        该信号仅用于人工确认，不会自动触发下单。
+                                      </div>
+                                    </>
+                                  )}
                                 </div>
                               ) : (
                                 <div className="mt-3 text-sm text-slate-500">正在加载策略状态概览...</div>
