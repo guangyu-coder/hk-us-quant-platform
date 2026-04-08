@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { orderApi, signalApi, strategyApi } from '@/lib/api';
+import { getApiErrorMessage, orderApi, signalApi, strategyApi } from '@/lib/api';
 import { formatMarketPrice, formatMarketTimestamp } from '@/lib/market';
 import { Activity, ChevronRight, Clock3, Plus, Radar, X } from 'lucide-react';
 import type {
@@ -19,14 +19,7 @@ import type {
 import { deriveTradingOrderCounts, normalizeOrdersCollection, selectTradingOrderId } from './trading-helpers';
 
 export default function TradingPage() {
-  const [showOrderForm, setShowOrderForm] = useState(false);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [orderFeedback, setOrderFeedback] = useState<CreateOrderResult | null>(null);
-  const [simulationFeedback, setSimulationFeedback] = useState<PaperSimulationResult | null>(null);
-  const [focusedStrategyId, setFocusedStrategyId] = useState<string | null>(null);
-  const [signalPrefillNotice, setSignalPrefillNotice] = useState<string | null>(null);
-  const [orderForm, setOrderForm] = useState({
+  const createBlankOrderForm = () => ({
     symbol: '',
     side: 'Buy' as OrderSide,
     quantity: '',
@@ -35,7 +28,17 @@ export default function TradingPage() {
     time_in_force: 'Day',
     stop_price: '',
     extended_hours: false,
+    strategy_id: '',
   });
+
+  const [showOrderForm, setShowOrderForm] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [orderFeedback, setOrderFeedback] = useState<CreateOrderResult | null>(null);
+  const [simulationFeedback, setSimulationFeedback] = useState<PaperSimulationResult | null>(null);
+  const [focusedStrategyId, setFocusedStrategyId] = useState<string | null>(null);
+  const [signalPrefillNotice, setSignalPrefillNotice] = useState<string | null>(null);
+  const [orderForm, setOrderForm] = useState(createBlankOrderForm);
 
   const queryClient = useQueryClient();
 
@@ -78,17 +81,19 @@ export default function TradingPage() {
     staleTime: 30000,
   });
 
-  const { data: latestSignals = [], refetch: refetchLatestSignals } = useQuery({
+  const { data: latestSignals = [] } = useQuery({
     queryKey: ['latest-signals'],
     queryFn: () => signalApi.listLatestSignals(),
     enabled: trackedStrategies.length > 0,
-    staleTime: 10000,
+    staleTime: Infinity,
   });
 
   const {
     data: focusedSignal = null,
     refetch: refetchFocusedSignal,
     isFetching: isRefreshingFocusedSignal,
+    isError: isFocusedSignalError,
+    error: focusedSignalError,
   } = useQuery({
     queryKey: ['focused-signal', focusedStrategyId],
     queryFn: () => signalApi.refreshStrategySignal(focusedStrategyId as string),
@@ -109,16 +114,7 @@ export default function TradingPage() {
       queryClient.invalidateQueries({ queryKey: ['risk-alerts'] });
       if (result.accepted) {
         setShowOrderForm(false);
-        setOrderForm({
-          symbol: '',
-          side: 'Buy',
-          quantity: '',
-          price: '',
-          order_type: 'Market',
-          time_in_force: 'Day',
-          stop_price: '',
-          extended_hours: false,
-        });
+        setOrderForm(createBlankOrderForm());
       }
     },
   });
@@ -153,6 +149,7 @@ export default function TradingPage() {
       quantity: parseInt(orderForm.quantity),
       price: orderForm.order_type === 'Market' ? undefined : parseFloat(orderForm.price),
       order_type: orderForm.order_type,
+      strategy_id: orderForm.strategy_id || undefined,
       time_in_force: orderForm.time_in_force,
       stop_price: orderForm.stop_price ? parseFloat(orderForm.stop_price) : undefined,
       extended_hours: orderForm.extended_hours,
@@ -298,6 +295,7 @@ export default function TradingPage() {
       order_type: 'Market',
       price: '',
       stop_price: '',
+      strategy_id: draft.strategy_id,
     }));
   };
 
@@ -321,6 +319,12 @@ export default function TradingPage() {
       focused: strategy.id === focusedStrategyId,
     }));
   }, [focusedStrategyId, signalByStrategyId, trackedStrategies]);
+
+  const hasAnySignal = signalByStrategyId.size > 0;
+
+  const focusedSignalErrorMessage = isFocusedSignalError
+    ? getApiErrorMessage(focusedSignalError, '当前关注策略信号刷新失败')
+    : null;
 
   const getLifecycleStep = (order: Order): string => {
     switch (order.status) {
@@ -572,7 +576,13 @@ export default function TradingPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold tracking-tight">交易执行</h1>
         <button
-          onClick={() => setShowOrderForm(true)}
+          onClick={() => {
+            setShowOrderForm(true);
+            setShowAdvanced(false);
+            setOrderFeedback(null);
+            setSignalPrefillNotice(null);
+            setOrderForm(createBlankOrderForm());
+          }}
           className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
         >
           <Plus className="h-4 w-4 mr-2" />
@@ -757,24 +767,24 @@ export default function TradingPage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            <label className="text-sm text-slate-600">
+            <label htmlFor="focused-strategy-select" className="text-sm text-slate-600">
               当前关注策略
-              <select
-                value={focusedStrategyId ?? ''}
-                onChange={(event) => setFocusedStrategyId(event.target.value || null)}
-                className="ml-2 rounded-md border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm"
-              >
-                {trackedStrategies.map((strategy) => (
-                  <option key={strategy.id} value={strategy.id}>
-                    {strategy.display_name || strategy.name}
-                  </option>
-                ))}
-              </select>
             </label>
+            <select
+              id="focused-strategy-select"
+              value={focusedStrategyId ?? ''}
+              onChange={(event) => setFocusedStrategyId(event.target.value || null)}
+              className="rounded-md border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm"
+            >
+              {trackedStrategies.map((strategy) => (
+                <option key={strategy.id} value={strategy.id}>
+                  {strategy.display_name || strategy.name}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               onClick={() => {
-                void refetchLatestSignals();
                 void refetchFocusedSignal();
               }}
               className="rounded-md border border-amber-300 bg-white px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100"
@@ -783,6 +793,18 @@ export default function TradingPage() {
             </button>
           </div>
         </div>
+
+        {focusedSignalErrorMessage && (
+          <div className="border-b border-rose-100 bg-rose-50 px-6 py-3 text-sm text-rose-900">
+            当前关注策略刷新失败: {focusedSignalErrorMessage}
+          </div>
+        )}
+
+        {!hasAnySignal && !focusedSignalErrorMessage && (
+          <div className="border-b border-amber-100 bg-white/70 px-6 py-3 text-sm text-amber-900">
+            当前没有可确认的最新信号，已保留人工确认边界。你可以切换关注策略后再刷新。
+          </div>
+        )}
 
         {signalPrefillNotice && (
           <div className="border-b border-amber-100 px-6 py-3 text-sm text-amber-900">
@@ -865,7 +887,10 @@ export default function TradingPage() {
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-medium">新建订单</h3>
               <button
-                onClick={() => setShowOrderForm(false)}
+                onClick={() => {
+                  setShowOrderForm(false);
+                  setSignalPrefillNotice(null);
+                }}
                 className="text-gray-400 hover:text-gray-600"
               >
                 <X className="h-5 w-5" />

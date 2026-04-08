@@ -103,6 +103,28 @@ const strategy = {
   updated_at: '2026-04-02T00:00:00Z',
 };
 
+const secondStrategy = {
+  id: 'strategy-002',
+  name: 'macd',
+  display_name: 'Beta Momentum',
+  description: 'Secondary momentum strategy',
+  parameters: {
+    symbol: 'MSFT',
+    timeframe: '1d',
+    initial_capital: 100000,
+    fee_bps: 5,
+    slippage_bps: 2,
+    max_position_fraction: 1,
+    fast_period: 12,
+    slow_period: 26,
+    signal_period: 9,
+  },
+  risk_limits: {},
+  is_active: true,
+  created_at: '2026-04-01T00:00:00Z',
+  updated_at: '2026-04-02T00:00:00Z',
+};
+
 const backtestResult = {
   run_id: 'run-001',
   experiment_id: 'experiment-001',
@@ -210,6 +232,25 @@ const strategyState = {
   generated_at: '2026-04-02T03:00:00Z',
 };
 
+const secondStrategyState = {
+  ...strategyState,
+  strategy_id: secondStrategy.id,
+  strategy_name: secondStrategy.display_name,
+  latest_backtest: {
+    ...strategyState.latest_backtest,
+    strategy_id: secondStrategy.id,
+    strategy_name: secondStrategy.display_name,
+    symbol: secondStrategy.parameters.symbol,
+  },
+  recent_signal: {
+    ...strategyState.recent_signal,
+    strategy_id: secondStrategy.id,
+    strategy_name: secondStrategy.display_name,
+    symbol: secondStrategy.parameters.symbol,
+    note: '第二条策略的人工复核占位。',
+  },
+};
+
 const latestSignalSnapshot = {
   strategy_id: strategy.id,
   strategy_name: strategy.display_name,
@@ -227,6 +268,31 @@ const latestSignalSnapshot = {
     quantity: 100,
     strategy_id: strategy.id,
   },
+};
+
+const latestSecondSignalSnapshot = {
+  strategy_id: secondStrategy.id,
+  strategy_name: secondStrategy.display_name,
+  symbol: 'MSFT',
+  timeframe: '1d',
+  signal_type: 'Sell',
+  strength: 0.67,
+  generated_at: '2026-04-02T04:05:00Z',
+  source: 'strategy_engine_latest_snapshot',
+  confirmation_state: 'manual_review_only',
+  note: '研究信号仅用于人工确认，不会自动下单。',
+  suggested_order: {
+    symbol: 'MSFT',
+    side: 'Sell',
+    quantity: 100,
+    strategy_id: secondStrategy.id,
+  },
+};
+
+const refreshedSecondSignalSnapshot = {
+  ...latestSecondSignalSnapshot,
+  generated_at: '2026-04-02T05:00:00Z',
+  note: '刷新后的第二条策略信号。',
 };
 
 function renderWithQueryClient(ui: React.ReactNode) {
@@ -250,20 +316,24 @@ describe('UI smoke', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    apiMocks.getStrategies.mockResolvedValue([strategy]);
+    apiMocks.getStrategies.mockResolvedValue([strategy, secondStrategy]);
     apiMocks.createStrategy.mockResolvedValue({ id: 'created-strategy' });
     apiMocks.updateStrategy.mockResolvedValue({ id: strategy.id });
     apiMocks.deleteStrategy.mockResolvedValue(undefined);
     apiMocks.runBacktest.mockResolvedValue({ run_id: backtestResult.run_id });
     apiMocks.runBacktestBatch.mockResolvedValue({ count: 2, results: [backtestResult, backtestResult] });
     apiMocks.listBacktestsWithFilters.mockResolvedValue([backtestResult, siblingBacktestResult]);
-    apiMocks.getStrategyState.mockResolvedValue(strategyState);
-    apiMocks.listLatestSignals.mockResolvedValue([latestSignalSnapshot]);
-    apiMocks.refreshStrategySignal.mockResolvedValue(latestSignalSnapshot);
+    apiMocks.getStrategyState.mockImplementation(async (strategyId: string) =>
+      strategyId === secondStrategy.id ? secondStrategyState : strategyState
+    );
+    apiMocks.listLatestSignals.mockResolvedValue([latestSignalSnapshot, latestSecondSignalSnapshot]);
+    apiMocks.refreshStrategySignal.mockImplementation(async (strategyId: string) =>
+      strategyId === secondStrategy.id ? refreshedSecondSignalSnapshot : latestSignalSnapshot
+    );
     apiMocks.getOrders.mockResolvedValue([]);
     apiMocks.createOrder.mockResolvedValue({ accepted: true });
     apiMocks.cancelOrder.mockResolvedValue(undefined);
-    apiMocks.getOrderStatus.mockResolvedValue([]);
+    apiMocks.getOrderStatus.mockResolvedValue({} as any);
     apiMocks.getOrderAudit.mockResolvedValue({ order_id: 'order-001', entries: [] });
     apiMocks.simulateOrders.mockResolvedValue({
       processed: 0,
@@ -389,12 +459,41 @@ describe('UI smoke', () => {
     renderWithQueryClient(React.createElement(TradingPage));
 
     await screen.findByText('待确认信号');
-    await screen.findByText(/按此信号预填订单/);
-    await user.click(screen.getByRole('button', { name: /按此信号预填订单/ }));
+    await screen.findAllByRole('button', { name: /按此信号预填订单/ });
+    await waitFor(() => {
+      expect(apiMocks.listLatestSignals).toHaveBeenCalledTimes(1);
+      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledWith(strategy.id);
+    });
+
+    await user.selectOptions(screen.getByLabelText('当前关注策略'), secondStrategy.id);
 
     await waitFor(() => {
-      expect(apiMocks.listLatestSignals).toHaveBeenCalled();
-      expect(apiMocks.refreshStrategySignal).toHaveBeenCalled();
+      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledWith(secondStrategy.id);
+    });
+
+    await user.click(screen.getByRole('button', { name: '立即刷新信号' }));
+
+    await waitFor(() => {
+      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledTimes(3);
+    });
+
+    await user.click(screen.getAllByRole('button', { name: /按此信号预填订单/ })[1]);
+
+    await screen.findByRole('heading', { name: '新建订单' });
+    const orderForm = screen.getByRole('button', { name: '提交订单' }).closest('form');
+    expect(orderForm).not.toBeNull();
+    fireEvent.submit(orderForm as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(apiMocks.createOrder.mock.calls[0]?.[0]).toEqual(
+        expect.objectContaining({
+          symbol: 'MSFT',
+          side: 'Sell',
+          quantity: 100,
+          order_type: 'Market',
+          strategy_id: secondStrategy.id,
+        })
+      );
     });
   });
 });
