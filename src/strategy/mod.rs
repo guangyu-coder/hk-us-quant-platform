@@ -973,6 +973,58 @@ impl StrategyService {
 
         rows.into_iter().map(TryInto::try_into).collect()
     }
+
+    pub async fn update_signal_review_status(
+        &self,
+        review_id: Uuid,
+        status: &str,
+    ) -> AppResult<SignalReviewRecord> {
+        let row = sqlx::query_as::<_, SignalReviewRow>(
+            r#"
+            UPDATE signal_reviews
+            SET status = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                      generated_at, source, confirmation_state, note, status, user_note,
+                      suggested_order, created_at, updated_at
+            "#,
+        )
+        .bind(review_id)
+        .bind(status)
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        let row = row.ok_or_else(|| AppError::not_found(format!("Signal review {}", review_id)))?;
+        row.try_into()
+    }
+
+    pub async fn update_signal_review_note(
+        &self,
+        review_id: Uuid,
+        user_note: Option<&str>,
+    ) -> AppResult<SignalReviewRecord> {
+        let row = sqlx::query_as::<_, SignalReviewRow>(
+            r#"
+            UPDATE signal_reviews
+            SET user_note = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                      generated_at, source, confirmation_state, note, status, user_note,
+                      suggested_order, created_at, updated_at
+            "#,
+        )
+        .bind(review_id)
+        .bind(user_note)
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        let row = row.ok_or_else(|| AppError::not_found(format!("Signal review {}", review_id)))?;
+        row.try_into()
+    }
 }
 
 fn strategy_related_cleanup_tables() -> &'static [&'static str] {

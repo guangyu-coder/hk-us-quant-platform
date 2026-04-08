@@ -138,6 +138,11 @@ pub struct SignalReviewListQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSignalReviewNoteRequest {
+    pub user_note: Option<String>,
+}
+
 fn normalize_history_interval(interval: Option<&str>) -> &'static str {
     match interval.unwrap_or("1d").to_ascii_lowercase().as_str() {
         "1m" | "1min" | "1minute" => "1m",
@@ -427,6 +432,18 @@ fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/signals/latest", get(list_latest_signals))
         .route("/api/v1/signals/reviews", get(list_signal_reviews))
+        .route(
+            "/api/v1/signals/reviews/:review_id/confirm",
+            post(confirm_signal_review),
+        )
+        .route(
+            "/api/v1/signals/reviews/:review_id/ignore",
+            post(ignore_signal_review),
+        )
+        .route(
+            "/api/v1/signals/reviews/:review_id/note",
+            put(update_signal_review_note),
+        )
         .route(
             "/api/v1/strategies/:strategy_id/signals/refresh",
             post(refresh_strategy_signal),
@@ -1919,6 +1936,40 @@ async fn list_signal_reviews(
         .await?;
 
     Ok(Json(signal_review_list_to_json(reviews)))
+}
+
+async fn confirm_signal_review(
+    State(state): State<AppState>,
+    Path(review_id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let review = state
+        .strategy_service
+        .update_signal_review_status(review_id, "confirmed")
+        .await?;
+    Ok(Json(signal_review_record_to_json(review)))
+}
+
+async fn ignore_signal_review(
+    State(state): State<AppState>,
+    Path(review_id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let review = state
+        .strategy_service
+        .update_signal_review_status(review_id, "ignored")
+        .await?;
+    Ok(Json(signal_review_record_to_json(review)))
+}
+
+async fn update_signal_review_note(
+    State(state): State<AppState>,
+    Path(review_id): Path<Uuid>,
+    Json(req): Json<UpdateSignalReviewNoteRequest>,
+) -> Result<Json<Value>, AppError> {
+    let review = state
+        .strategy_service
+        .update_signal_review_note(review_id, req.user_note.as_deref())
+        .await?;
+    Ok(Json(signal_review_record_to_json(review)))
 }
 
 async fn refresh_strategy_signal(
