@@ -15,6 +15,10 @@ const apiMocks = vi.hoisted(() => ({
   getStrategyState: vi.fn(),
   listLatestSignals: vi.fn(),
   refreshStrategySignal: vi.fn(),
+  listSignalReviews: vi.fn(),
+  confirmSignalReview: vi.fn(),
+  ignoreSignalReview: vi.fn(),
+  updateSignalReviewNote: vi.fn(),
   getOrders: vi.fn(),
   createOrder: vi.fn(),
   cancelOrder: vi.fn(),
@@ -41,6 +45,10 @@ vi.mock('@/lib/api', () => ({
   signalApi: {
     listLatestSignals: apiMocks.listLatestSignals,
     refreshStrategySignal: apiMocks.refreshStrategySignal,
+    listSignalReviews: apiMocks.listSignalReviews,
+    confirmSignalReview: apiMocks.confirmSignalReview,
+    ignoreSignalReview: apiMocks.ignoreSignalReview,
+    updateSignalReviewNote: apiMocks.updateSignalReviewNote,
   },
   orderApi: {
     getOrders: apiMocks.getOrders,
@@ -312,6 +320,54 @@ const refreshedSecondSignalSnapshot = {
   note: '刷新后的第二条策略信号。',
 };
 
+const pendingReviewOne = {
+  id: 'review-001',
+  strategy_id: strategy.id,
+  strategy_name: strategy.display_name,
+  symbol: 'AAPL',
+  timeframe: '1d',
+  signal_type: 'Buy',
+  strength: 0.82,
+  generated_at: '2026-04-02T04:00:00Z',
+  source: 'strategy_engine_latest_snapshot',
+  confirmation_state: 'manual_review_only',
+  note: '研究信号仅用于人工确认，不会自动下单。',
+  status: 'pending',
+  user_note: null,
+  suggested_order: {
+    symbol: 'AAPL',
+    side: 'Buy',
+    quantity: 100,
+    strategy_id: strategy.id,
+  },
+  created_at: '2026-04-02T04:00:00Z',
+  updated_at: '2026-04-02T04:00:00Z',
+};
+
+const pendingReviewTwo = {
+  id: 'review-002',
+  strategy_id: secondStrategy.id,
+  strategy_name: secondStrategy.display_name,
+  symbol: 'MSFT',
+  timeframe: '1d',
+  signal_type: 'Sell',
+  strength: 0.67,
+  generated_at: '2026-04-02T04:05:00Z',
+  source: 'strategy_engine_latest_snapshot',
+  confirmation_state: 'manual_review_only',
+  note: '研究信号仅用于人工确认，不会自动下单。',
+  status: 'pending',
+  user_note: '请关注财报窗口',
+  suggested_order: {
+    symbol: 'MSFT',
+    side: 'Sell',
+    quantity: 100,
+    strategy_id: secondStrategy.id,
+  },
+  created_at: '2026-04-02T04:05:00Z',
+  updated_at: '2026-04-02T04:05:00Z',
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -347,6 +403,10 @@ describe('UI smoke', () => {
     apiMocks.refreshStrategySignal.mockImplementation(async (strategyId: string) =>
       strategyId === secondStrategy.id ? refreshedSecondSignalSnapshot : latestSignalSnapshot
     );
+    apiMocks.listSignalReviews.mockResolvedValue([pendingReviewOne, pendingReviewTwo]);
+    apiMocks.confirmSignalReview.mockResolvedValue(pendingReviewOne);
+    apiMocks.ignoreSignalReview.mockResolvedValue(pendingReviewTwo);
+    apiMocks.updateSignalReviewNote.mockResolvedValue(pendingReviewTwo);
     apiMocks.getOrders.mockResolvedValue([]);
     apiMocks.createOrder.mockResolvedValue({ accepted: true });
     apiMocks.cancelOrder.mockResolvedValue(undefined);
@@ -473,27 +533,18 @@ describe('UI smoke', () => {
     });
   });
 
-  it('shows the pending signal panel on the trading page', async () => {
+  it('shows the pending signal queue on the trading page', async () => {
     const user = userEvent.setup();
     renderWithQueryClient(React.createElement(TradingPage));
 
-    await screen.findByText('待确认信号');
+    await screen.findByText('待处理信号队列');
     await screen.findAllByRole('button', { name: /按此信号预填订单/ });
+    await screen.findAllByRole('button', { name: '标记已确认' });
+    await screen.findAllByRole('button', { name: '忽略' });
     await waitFor(() => {
-      expect(apiMocks.listLatestSignals).toHaveBeenCalledTimes(1);
-      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledWith(strategy.id);
-    });
-
-    await user.selectOptions(screen.getByLabelText('当前关注策略'), secondStrategy.id);
-
-    await waitFor(() => {
-      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledWith(secondStrategy.id);
-    });
-
-    await user.click(screen.getByRole('button', { name: '立即刷新信号' }));
-
-    await waitFor(() => {
-      expect(apiMocks.refreshStrategySignal).toHaveBeenCalledTimes(3);
+      expect(apiMocks.listSignalReviews).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'pending' })
+      );
     });
 
     await user.click(screen.getAllByRole('button', { name: /按此信号预填订单/ })[1]);
@@ -513,6 +564,18 @@ describe('UI smoke', () => {
           strategy_id: secondStrategy.id,
         })
       );
+    });
+
+    await user.click(screen.getAllByRole('button', { name: '标记已确认' })[0]);
+
+    await waitFor(() => {
+      expect(apiMocks.confirmSignalReview).toHaveBeenCalledWith(pendingReviewOne.id);
+    });
+
+    await user.click(screen.getAllByRole('button', { name: '忽略' })[0]);
+
+    await waitFor(() => {
+      expect(apiMocks.ignoreSignalReview).toHaveBeenCalledWith(pendingReviewTwo.id);
     });
   });
 });

@@ -12,11 +12,13 @@ import type {
   OrderSide,
   OrderType,
   PaperSimulationResult,
+  SignalReviewRecord,
   StrategyConfig,
   StrategyExecutionOverview,
-  StrategySignalSnapshot,
 } from '@/types';
 import { deriveTradingOrderCounts, normalizeOrdersCollection, selectTradingOrderId } from './trading-helpers';
+
+const EMPTY_SIGNAL_REVIEWS: SignalReviewRecord[] = [];
 
 export default function TradingPage() {
   const createBlankOrderForm = () => ({
@@ -38,6 +40,7 @@ export default function TradingPage() {
   const [simulationFeedback, setSimulationFeedback] = useState<PaperSimulationResult | null>(null);
   const [focusedStrategyId, setFocusedStrategyId] = useState<string | null>(null);
   const [signalPrefillNotice, setSignalPrefillNotice] = useState<string | null>(null);
+  const [reviewNoteDrafts, setReviewNoteDrafts] = useState<Record<string, string>>({});
   const [orderForm, setOrderForm] = useState(createBlankOrderForm);
 
   const queryClient = useQueryClient();
@@ -81,25 +84,57 @@ export default function TradingPage() {
     staleTime: 30000,
   });
 
-  const { data: latestSignals = [] } = useQuery({
-    queryKey: ['latest-signals'],
-    queryFn: () => signalApi.listLatestSignals(),
+  const signalReviewQueryKey = ['signal-review-queue'];
+  const {
+    data: signalReviewsData,
+    refetch: refetchSignalReviews,
+    isFetching: isRefreshingSignalReviews,
+    isError: isSignalReviewError,
+    error: signalReviewError,
+  } = useQuery({
+    queryKey: signalReviewQueryKey,
+    queryFn: () => signalApi.listSignalReviews({ status: 'pending', limit: 20 }),
     enabled: trackedStrategies.length > 0,
-    staleTime: Infinity,
+    staleTime: 5000,
+  });
+  const signalReviews = signalReviewsData ?? EMPTY_SIGNAL_REVIEWS;
+
+  const refreshSignalMutation = useMutation({
+    mutationFn: (strategyId: string) => signalApi.refreshStrategySignal(strategyId),
+    onSuccess: async () => {
+      await refetchSignalReviews();
+      queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+    },
   });
 
-  const {
-    data: focusedSignal = null,
-    refetch: refetchFocusedSignal,
-    isFetching: isRefreshingFocusedSignal,
-    isError: isFocusedSignalError,
-    error: focusedSignalError,
-  } = useQuery({
-    queryKey: ['focused-signal', focusedStrategyId],
-    queryFn: () => signalApi.refreshStrategySignal(focusedStrategyId as string),
-    enabled: !!focusedStrategyId,
-    staleTime: 5000,
-    refetchInterval: focusedStrategyId ? 15000 : false,
+  const confirmSignalReviewMutation = useMutation({
+    mutationFn: (reviewId: string) => signalApi.confirmSignalReview(reviewId),
+    onSuccess: (_review, reviewId) => {
+      queryClient.setQueryData<SignalReviewRecord[]>(signalReviewQueryKey, (current = []) =>
+        current.filter((review) => review.id !== reviewId)
+      );
+      queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+    },
+  });
+
+  const ignoreSignalReviewMutation = useMutation({
+    mutationFn: (reviewId: string) => signalApi.ignoreSignalReview(reviewId),
+    onSuccess: (_review, reviewId) => {
+      queryClient.setQueryData<SignalReviewRecord[]>(signalReviewQueryKey, (current = []) =>
+        current.filter((review) => review.id !== reviewId)
+      );
+      queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+    },
+  });
+
+  const updateSignalReviewNoteMutation = useMutation({
+    mutationFn: ({ reviewId, userNote }: { reviewId: string; userNote: string | null }) =>
+      signalApi.updateSignalReviewNote(reviewId, userNote),
+    onSuccess: (review) => {
+      queryClient.setQueryData<SignalReviewRecord[]>(signalReviewQueryKey, (current = []) =>
+        current.map((item) => (item.id === review.id ? review : item))
+      );
+    },
   });
 
   const createOrderMutation = useMutation({
@@ -267,16 +302,16 @@ export default function TradingPage() {
     return recentSignal.status ?? '暂无信号状态';
   };
 
-  const getSignalDirectionLabel = (signal: StrategySignalSnapshot | null | undefined): string => {
-    if (signal?.signal_type) {
-      return signal.signal_type === 'Buy' ? '看多' : signal.signal_type === 'Sell' ? '看空' : '观望';
+  const getReviewDirectionLabel = (review: SignalReviewRecord | null | undefined): string => {
+    if (review?.signal_type) {
+      return review.signal_type === 'Buy' ? '看多' : review.signal_type === 'Sell' ? '看空' : '观望';
     }
 
     return '待确认';
   };
 
-  const prefillOrderFromSignal = (signal: StrategySignalSnapshot) => {
-    const draft = signal.suggested_order;
+  const prefillOrderFromReview = (review: SignalReviewRecord) => {
+    const draft = review.suggested_order;
     if (!draft) {
       return;
     }
@@ -285,7 +320,7 @@ export default function TradingPage() {
     setShowAdvanced(false);
     setOrderFeedback(null);
     setSignalPrefillNotice(
-      `${signal.strategy_name ?? signal.strategy_id} 的 ${signal.signal_type ?? '待确认'} 信号已带入订单表单，请人工确认后提交。`
+      `${review.strategy_name ?? review.strategy_id} 的 ${review.signal_type ?? '待确认'} 信号已带入订单表单，请人工确认后提交。`
     );
     setOrderForm((current) => ({
       ...current,
@@ -299,31 +334,31 @@ export default function TradingPage() {
     }));
   };
 
-  const signalByStrategyId = useMemo(() => {
-    const map = new Map<string, StrategySignalSnapshot>();
-    latestSignals.forEach((signal) => {
-      map.set(signal.strategy_id, signal);
-    });
+  const signalReviewCards = useMemo(() => {
+    return signalReviews.map((review) => ({
+      review,
+      focused: review.strategy_id === focusedStrategyId,
+    }));
+  }, [focusedStrategyId, signalReviews]);
 
-    if (focusedSignal) {
-      map.set(focusedSignal.strategy_id, focusedSignal);
+  useEffect(() => {
+    if (signalReviews.length === 0) {
+      return;
     }
 
-    return map;
-  }, [latestSignals, focusedSignal]);
+    setReviewNoteDrafts((current) => {
+      const next = { ...current };
+      for (const review of signalReviews) {
+        if (!(review.id in next)) {
+          next[review.id] = review.user_note ?? '';
+        }
+      }
+      return next;
+    });
+  }, [signalReviews]);
 
-  const pendingSignalCards = useMemo(() => {
-    return trackedStrategies.map((strategy) => ({
-      strategy,
-      signal: signalByStrategyId.get(strategy.id) ?? null,
-      focused: strategy.id === focusedStrategyId,
-    }));
-  }, [focusedStrategyId, signalByStrategyId, trackedStrategies]);
-
-  const hasAnySignal = signalByStrategyId.size > 0;
-
-  const focusedSignalErrorMessage = isFocusedSignalError
-    ? getApiErrorMessage(focusedSignalError, '当前关注策略信号刷新失败')
+  const signalReviewErrorMessage = isSignalReviewError
+    ? getApiErrorMessage(signalReviewError, '待处理信号队列加载失败')
     : null;
 
   const getLifecycleStep = (order: Order): string => {
@@ -761,9 +796,9 @@ export default function TradingPage() {
       <div className="rounded-lg border border-amber-200 bg-amber-50/70 shadow">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-amber-100 px-6 py-4">
           <div>
-            <h3 className="text-lg font-medium text-slate-900">待确认信号</h3>
+            <h3 className="text-lg font-medium text-slate-900">待处理信号队列</h3>
             <p className="mt-1 text-sm text-slate-600">
-              这些信号来自策略引擎的最新快照，仅用于人工确认，不会自动下单。
+              这些信号来自策略引擎的最新快照，仅用于人工确认，不会自动下单。你可以先预填订单，再标记已确认或忽略。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -785,24 +820,27 @@ export default function TradingPage() {
             <button
               type="button"
               onClick={() => {
-                void refetchFocusedSignal();
+                if (focusedStrategyId) {
+                  refreshSignalMutation.mutate(focusedStrategyId);
+                }
               }}
-              className="rounded-md border border-amber-300 bg-white px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100"
+              className="rounded-md border border-amber-300 bg-white px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!focusedStrategyId || refreshSignalMutation.isPending}
             >
-              {isRefreshingFocusedSignal ? '刷新中...' : '立即刷新信号'}
+              {isRefreshingSignalReviews || refreshSignalMutation.isPending ? '刷新中...' : '立即刷新当前策略'}
             </button>
           </div>
         </div>
 
-        {focusedSignalErrorMessage && (
+        {signalReviewErrorMessage && (
           <div className="border-b border-rose-100 bg-rose-50 px-6 py-3 text-sm text-rose-900">
-            当前关注策略刷新失败: {focusedSignalErrorMessage}
+            待处理信号队列加载失败: {signalReviewErrorMessage}
           </div>
         )}
 
-        {!hasAnySignal && !focusedSignalErrorMessage && (
+        {signalReviews.length === 0 && !signalReviewErrorMessage && (
           <div className="border-b border-amber-100 bg-white/70 px-6 py-3 text-sm text-amber-900">
-            当前没有可确认的最新信号，已保留人工确认边界。你可以切换关注策略后再刷新。
+            当前没有待处理信号，已保留人工确认边界。你可以切换关注策略后再刷新当前策略。
           </div>
         )}
 
@@ -813,11 +851,12 @@ export default function TradingPage() {
         )}
 
         <div className="grid gap-4 p-6 lg:grid-cols-2 xl:grid-cols-3">
-          {pendingSignalCards.map(({ strategy, signal, focused }) => {
-            const draft = signal?.suggested_order ?? null;
+          {signalReviewCards.map(({ review, focused }) => {
+            const draft = review.suggested_order ?? null;
+            const noteDraft = reviewNoteDrafts[review.id] ?? review.user_note ?? '';
             return (
               <div
-                key={strategy.id}
+                key={review.id}
                 className={`rounded-2xl border p-4 transition ${
                   focused ? 'border-amber-400 bg-white shadow-sm' : 'border-amber-100 bg-white/80'
                 }`}
@@ -825,56 +864,119 @@ export default function TradingPage() {
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <h4 className="text-base font-semibold text-slate-900">
-                      {signal?.strategy_name || strategy.display_name || strategy.name}
+                      {review.strategy_name || review.strategy_id}
                     </h4>
-                    <p className="mt-1 font-mono text-xs text-slate-500">{strategy.id}</p>
+                    <p className="mt-1 font-mono text-xs text-slate-500">{review.strategy_id}</p>
                   </div>
                   <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-900">
-                    {focused ? '当前关注' : '待观察'}
+                    {focused ? '当前关注' : '待处理'}
                   </span>
                 </div>
 
                 <div className="mt-4 space-y-2 text-sm text-slate-700">
                   <div className="flex items-center justify-between gap-3">
-                    <span>{signal?.symbol ?? strategy.parameters?.symbol ?? '暂无标的'}</span>
+                    <span>{review.symbol ?? '暂无标的'}</span>
                     <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
-                      {signal?.timeframe ?? strategy.parameters?.timeframe ?? '暂无周期'}
+                      {review.timeframe ?? '暂无周期'}
                     </span>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <span>{getSignalDirectionLabel(signal)}</span>
-                    <span>{formatSignalStrength(signal?.strength ?? null)}</span>
+                    <span>{getReviewDirectionLabel(review)}</span>
+                    <span>{formatSignalStrength(review.strength ?? null)}</span>
                   </div>
                   <div className="text-xs text-slate-500">
-                    生成时间: {signal ? formatCompactDateTime(signal.generated_at) : '暂无'}
+                    生成时间: {formatCompactDateTime(review.generated_at)}
                   </div>
-                  <div className="text-xs text-slate-500">{signal?.note ?? '当前没有可确认的最新信号。'}</div>
+                  <div className="text-xs text-slate-500">来源: {review.source}</div>
+                  <div className="text-xs text-slate-500">状态: {review.confirmation_state}</div>
+                  <div className="text-xs text-slate-500">{review.note}</div>
+                  {review.user_note && (
+                    <div className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                      备注: {review.user_note}
+                    </div>
+                  )}
                 </div>
 
-                <div className="mt-4 flex items-center justify-between gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setFocusedStrategyId(strategy.id)}
-                    className="rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-900 hover:bg-amber-50"
-                  >
-                    设为当前策略
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!draft}
-                    onClick={() => signal && prefillOrderFromSignal(signal)}
-                    className="rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-amber-200"
-                  >
-                    按此信号预填订单
-                  </button>
+                <div className="mt-4 space-y-3">
+                  <div>
+                    <label htmlFor={`review-note-${review.id}`} className="mb-1 block text-xs font-medium text-slate-600">
+                      备注
+                    </label>
+                    <textarea
+                      id={`review-note-${review.id}`}
+                      value={noteDraft}
+                      onChange={(event) =>
+                        setReviewNoteDrafts((current) => ({
+                          ...current,
+                          [review.id]: event.target.value,
+                        }))
+                      }
+                      rows={3}
+                      className="w-full rounded-md border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-amber-400"
+                      placeholder="填写人工备注，方便后续复盘"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextNote = noteDraft.trim();
+                        updateSignalReviewNoteMutation.mutate({
+                          reviewId: review.id,
+                          userNote: nextNote ? nextNote : null,
+                        });
+                      }}
+                      disabled={updateSignalReviewNoteMutation.isPending}
+                      className="rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-900 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      保存备注
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!draft) {
+                          return;
+                        }
+                        prefillOrderFromReview(review);
+                      }}
+                      disabled={!draft}
+                      className="rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-amber-200"
+                    >
+                      按此信号预填订单
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => confirmSignalReviewMutation.mutate(review.id)}
+                      disabled={confirmSignalReviewMutation.isPending || ignoreSignalReviewMutation.isPending}
+                      className="rounded-md border border-emerald-300 px-3 py-2 text-sm text-emerald-900 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      标记已确认
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => ignoreSignalReviewMutation.mutate(review.id)}
+                      disabled={confirmSignalReviewMutation.isPending || ignoreSignalReviewMutation.isPending}
+                      className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      忽略
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFocusedStrategyId(review.strategy_id)}
+                      className="rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-900 hover:bg-amber-50"
+                    >
+                      设为当前策略
+                    </button>
+                  </div>
                 </div>
               </div>
             );
           })}
 
-          {pendingSignalCards.length === 0 && (
+          {signalReviewCards.length === 0 && (
             <div className="rounded-2xl border border-dashed border-amber-200 bg-white/80 p-6 text-sm text-slate-500">
-              当前没有活跃策略可展示待确认信号。
+              当前没有待处理信号，人工确认边界依旧保留。可以点击右上角刷新当前策略，重新生成最新队列。
             </div>
           )}
         </div>

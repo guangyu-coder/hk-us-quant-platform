@@ -372,6 +372,25 @@ export interface StrategySignalSnapshot {
   suggested_order?: StrategySuggestedOrderDraft | null;
 }
 
+export interface SignalReviewRecord {
+  id: string;
+  strategy_id: string;
+  strategy_name?: string | null;
+  symbol?: string | null;
+  timeframe?: string | null;
+  signal_type?: SignalType | null;
+  strength?: number | null;
+  generated_at: string;
+  source: string;
+  confirmation_state: string;
+  note: string;
+  status: string;
+  user_note?: string | null;
+  suggested_order?: StrategySuggestedOrderDraft | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface StrategyExecutionOverview {
   strategy_id: string;
   strategy_name?: string | null;

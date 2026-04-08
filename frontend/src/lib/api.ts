@@ -20,6 +20,7 @@ import type {
   BacktestListFilters,
   StrategyExecutionOverview,
   StrategySignalSnapshot,
+  SignalReviewRecord,
   ApiResponse,
   RiskMetrics,
   RiskLimitsSnapshot,
@@ -268,6 +269,27 @@ export const signalApi = {
 
   refreshStrategySignal: async (strategyId: string): Promise<StrategySignalSnapshot> => {
     return api.post(`/v1/strategies/${strategyId}/signals/refresh`);
+  },
+
+  listSignalReviews: async (
+    filters: { status?: string; strategy_id?: string; limit?: number } = {}
+  ): Promise<SignalReviewRecord[]> => {
+    return api.get('/v1/signals/reviews', { params: filters });
+  },
+
+  confirmSignalReview: async (reviewId: string): Promise<SignalReviewRecord> => {
+    return api.post(`/v1/signals/reviews/${reviewId}/confirm`);
+  },
+
+  ignoreSignalReview: async (reviewId: string): Promise<SignalReviewRecord> => {
+    return api.post(`/v1/signals/reviews/${reviewId}/ignore`);
+  },
+
+  updateSignalReviewNote: async (
+    reviewId: string,
+    user_note: string | null
+  ): Promise<SignalReviewRecord> => {
+    return api.put(`/v1/signals/reviews/${reviewId}/note`, { user_note });
   },
 };
 
