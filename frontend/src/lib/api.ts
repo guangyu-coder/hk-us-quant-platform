@@ -19,6 +19,7 @@ import type {
   BacktestExperimentMetadata,
   BacktestListFilters,
   StrategyExecutionOverview,
+  StrategySignalSnapshot,
   ApiResponse,
   RiskMetrics,
   RiskLimitsSnapshot,
@@ -257,6 +258,16 @@ export const strategyApi = {
 
   getStrategyState: async (strategyId: string): Promise<StrategyExecutionOverview> => {
     return api.get(`/v1/strategies/${strategyId}/state`);
+  },
+};
+
+export const signalApi = {
+  listLatestSignals: async (): Promise<StrategySignalSnapshot[]> => {
+    return api.get('/v1/signals/latest');
+  },
+
+  refreshStrategySignal: async (strategyId: string): Promise<StrategySignalSnapshot> => {
+    return api.post(`/v1/strategies/${strategyId}/signals/refresh`);
   },
 };
 

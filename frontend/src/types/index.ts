@@ -349,6 +349,27 @@ export interface StrategyRecentSignalSummary {
   note: string;
 }
 
+export interface StrategySuggestedOrderDraft {
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  strategy_id: string;
+}
+
+export interface StrategySignalSnapshot {
+  strategy_id: string;
+  strategy_name?: string | null;
+  symbol?: string | null;
+  timeframe?: string | null;
+  signal_type?: SignalType | null;
+  strength?: number | null;
+  generated_at: string;
+  source: string;
+  confirmation_state: string;
+  note: string;
+  suggested_order?: StrategySuggestedOrderDraft | null;
+}
+
 export interface StrategyExecutionOverview {
   strategy_id: string;
   strategy_name?: string | null;

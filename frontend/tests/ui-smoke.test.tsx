@@ -13,6 +13,14 @@ const apiMocks = vi.hoisted(() => ({
   runBacktestBatch: vi.fn(),
   listBacktestsWithFilters: vi.fn(),
   getStrategyState: vi.fn(),
+  listLatestSignals: vi.fn(),
+  refreshStrategySignal: vi.fn(),
+  getOrders: vi.fn(),
+  createOrder: vi.fn(),
+  cancelOrder: vi.fn(),
+  getOrderStatus: vi.fn(),
+  getOrderAudit: vi.fn(),
+  simulateOrders: vi.fn(),
   listTrades: vi.fn(),
   searchSymbols: vi.fn(),
 }));
@@ -29,6 +37,18 @@ vi.mock('@/lib/api', () => ({
     runBacktestBatch: apiMocks.runBacktestBatch,
     listBacktestsWithFilters: apiMocks.listBacktestsWithFilters,
     getStrategyState: apiMocks.getStrategyState,
+  },
+  signalApi: {
+    listLatestSignals: apiMocks.listLatestSignals,
+    refreshStrategySignal: apiMocks.refreshStrategySignal,
+  },
+  orderApi: {
+    getOrders: apiMocks.getOrders,
+    createOrder: apiMocks.createOrder,
+    cancelOrder: apiMocks.cancelOrder,
+    getOrderStatus: apiMocks.getOrderStatus,
+    getOrderAudit: apiMocks.getOrderAudit,
+    simulateOrders: apiMocks.simulateOrders,
   },
   tradeApi: {
     listTrades: apiMocks.listTrades,
@@ -60,6 +80,7 @@ vi.mock('recharts', () => {
 
 import StrategiesPage from '../src/app/strategies/page';
 import BacktestPage from '../src/app/backtest/page';
+import TradingPage from '../src/app/trading/page';
 
 const strategy = {
   id: 'strategy-001',
@@ -189,6 +210,25 @@ const strategyState = {
   generated_at: '2026-04-02T03:00:00Z',
 };
 
+const latestSignalSnapshot = {
+  strategy_id: strategy.id,
+  strategy_name: strategy.display_name,
+  symbol: 'AAPL',
+  timeframe: '1d',
+  signal_type: 'Buy',
+  strength: 0.82,
+  generated_at: '2026-04-02T04:00:00Z',
+  source: 'strategy_engine_latest_snapshot',
+  confirmation_state: 'manual_review_only',
+  note: '研究信号仅用于人工确认，不会自动下单。',
+  suggested_order: {
+    symbol: 'AAPL',
+    side: 'Buy',
+    quantity: 100,
+    strategy_id: strategy.id,
+  },
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -218,6 +258,22 @@ describe('UI smoke', () => {
     apiMocks.runBacktestBatch.mockResolvedValue({ count: 2, results: [backtestResult, backtestResult] });
     apiMocks.listBacktestsWithFilters.mockResolvedValue([backtestResult, siblingBacktestResult]);
     apiMocks.getStrategyState.mockResolvedValue(strategyState);
+    apiMocks.listLatestSignals.mockResolvedValue([latestSignalSnapshot]);
+    apiMocks.refreshStrategySignal.mockResolvedValue(latestSignalSnapshot);
+    apiMocks.getOrders.mockResolvedValue([]);
+    apiMocks.createOrder.mockResolvedValue({ accepted: true });
+    apiMocks.cancelOrder.mockResolvedValue(undefined);
+    apiMocks.getOrderStatus.mockResolvedValue([]);
+    apiMocks.getOrderAudit.mockResolvedValue({ order_id: 'order-001', entries: [] });
+    apiMocks.simulateOrders.mockResolvedValue({
+      processed: 0,
+      filled: 0,
+      partially_filled: 0,
+      submitted: 0,
+      untouched: 0,
+      unsupported: 0,
+      results: [],
+    });
     apiMocks.listTrades.mockResolvedValue([]);
     apiMocks.searchSymbols.mockResolvedValue([]);
 
@@ -325,6 +381,20 @@ describe('UI smoke', () => {
       expect(URL.createObjectURL).toHaveBeenCalled();
       expect(HTMLAnchorElement.prototype.click).toHaveBeenCalled();
       expect(screen.getByText(/当前导出的是同一实验批次/)).toBeTruthy();
+    });
+  });
+
+  it('shows the pending signal panel on the trading page', async () => {
+    const user = userEvent.setup();
+    renderWithQueryClient(React.createElement(TradingPage));
+
+    await screen.findByText('待确认信号');
+    await screen.findByText(/按此信号预填订单/);
+    await user.click(screen.getByRole('button', { name: /按此信号预填订单/ }));
+
+    await waitFor(() => {
+      expect(apiMocks.listLatestSignals).toHaveBeenCalled();
+      expect(apiMocks.refreshStrategySignal).toHaveBeenCalled();
     });
   });
 });
