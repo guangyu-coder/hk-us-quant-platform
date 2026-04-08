@@ -3,7 +3,7 @@ use crate::events::{EventBus, PlatformEvent};
 use crate::types::{
     BacktestAssumptions, BacktestDataGap, BacktestDataQuality, BacktestEquityPoint,
     BacktestExecutionLink, BacktestExperimentMetadata, BacktestResult, BacktestTrade, MarketData,
-    Signal, StrategyConfig,
+    Signal, SignalType, StrategyConfig, StrategySignalSnapshot, StrategySuggestedOrderDraft,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -997,6 +997,159 @@ impl MeanReversionStrategy {
     pub fn new(config: StrategyConfig) -> AppResult<Self> {
         Ok(Self { config })
     }
+}
+
+fn signal_side_label(signal_type: SignalType) -> Option<&'static str> {
+    match signal_type {
+        SignalType::Buy => Some("Buy"),
+        SignalType::Sell => Some("Sell"),
+        SignalType::Hold => None,
+    }
+}
+
+fn estimate_signal_strength(
+    kind: &str,
+    signal_type: SignalType,
+    config: &StrategyConfig,
+    closes: &[Decimal],
+) -> f64 {
+    match (kind, signal_type) {
+        ("simple_moving_average" | "dual_ma" | "ma_crossover", SignalType::Buy | SignalType::Sell) => {
+            let short_period = config
+                .parameters
+                .get("short_period")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(5) as usize;
+            let long_period = config
+                .parameters
+                .get("long_period")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(20) as usize;
+            if let (Some(short_sma), Some(long_sma)) =
+                (sma(closes, short_period), sma(closes, long_period))
+            {
+                if long_sma > Decimal::ZERO {
+                    let normalized = ((short_sma - long_sma).abs() / long_sma)
+                        .to_f64()
+                        .unwrap_or(0.0);
+                    return (0.5 + normalized).clamp(0.1, 1.0);
+                }
+            }
+            0.75
+        }
+        ("rsi" | "rsi_strategy", SignalType::Buy | SignalType::Sell) => 0.8,
+        ("macd" | "macd_strategy", SignalType::Buy | SignalType::Sell) => 0.78,
+        ("bollinger" | "bollinger_bands", SignalType::Buy | SignalType::Sell) => 0.76,
+        ("mean_reversion", SignalType::Buy | SignalType::Sell) => 0.74,
+        ("pairs_trading" | "statistical_arbitrage", SignalType::Buy | SignalType::Sell) => 0.72,
+        _ => 0.75,
+    }
+}
+
+fn build_empty_strategy_signal_snapshot(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    note: String,
+) -> StrategySignalSnapshot {
+    StrategySignalSnapshot {
+        strategy_id,
+        strategy_name,
+        symbol,
+        timeframe,
+        signal_type: None,
+        strength: None,
+        generated_at: Utc::now(),
+        source: "strategy_engine_latest_snapshot".to_string(),
+        confirmation_state: "manual_review_only".to_string(),
+        note,
+        suggested_order: None,
+    }
+}
+
+pub fn build_strategy_signal_snapshot(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    timeframe: Option<String>,
+    signal: Signal,
+) -> StrategySignalSnapshot {
+    let suggested_order = signal_side_label(signal.signal_type).map(|side| StrategySuggestedOrderDraft {
+        symbol: signal.symbol.clone(),
+        side: side.to_string(),
+        quantity: 100,
+        strategy_id: strategy_id.clone(),
+    });
+
+    StrategySignalSnapshot {
+        strategy_id,
+        strategy_name,
+        symbol: Some(signal.symbol),
+        timeframe,
+        signal_type: Some(signal.signal_type),
+        strength: Some(signal.strength),
+        generated_at: signal.timestamp,
+        source: "strategy_engine_latest_snapshot".to_string(),
+        confirmation_state: "manual_review_only".to_string(),
+        note: "研究信号仅用于人工确认，不会自动下单。".to_string(),
+        suggested_order,
+    }
+}
+
+pub fn build_latest_strategy_signal_snapshot(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    config: &StrategyConfig,
+    timeframe: Option<String>,
+    bars: &[MarketData],
+) -> StrategySignalSnapshot {
+    let kind = normalize_strategy_kind(&config.name);
+    let closes = bars.iter().map(|bar| bar.price).collect::<Vec<_>>();
+    let symbol = config
+        .parameters
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| bars.last().map(|bar| bar.symbol.clone()));
+    let timeframe = timeframe.or_else(|| {
+        config
+            .parameters
+            .get("timeframe")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    });
+
+    let signal_type = if backtest_buy_signal(&kind, config, &closes) {
+        Some(SignalType::Buy)
+    } else if backtest_sell_signal(&kind, config, &closes) {
+        Some(SignalType::Sell)
+    } else {
+        None
+    };
+
+    let Some(signal_type) = signal_type else {
+        let note = if closes.is_empty() {
+            "行情不足，当前仅保留人工确认边界，不会自动下单。".to_string()
+        } else {
+            "当前没有可确认的最新信号，继续等待人工确认，不会自动下单。".to_string()
+        };
+        return build_empty_strategy_signal_snapshot(
+            strategy_id,
+            strategy_name,
+            symbol,
+            timeframe,
+            note,
+        );
+    };
+
+    let signal = Signal::new(
+        strategy_id.clone(),
+        symbol.unwrap_or_else(|| "AAPL".to_string()),
+        signal_type,
+        estimate_signal_strength(&kind, signal_type, config, &closes),
+    );
+
+    build_strategy_signal_snapshot(strategy_id, strategy_name, timeframe, signal)
 }
 
 fn normalize_strategy_kind(name: &str) -> String {
@@ -2381,6 +2534,33 @@ mod tests {
         assert!(tables.contains(&"performance_metrics"));
         assert!(tables.contains(&"trades"));
         assert!(tables.contains(&"orders"));
+    }
+
+    #[test]
+    fn build_signal_snapshot_marks_manual_review_and_suggested_order() {
+        let signal = Signal::new(
+            "strategy-1".to_string(),
+            "AAPL".to_string(),
+            crate::types::SignalType::Buy,
+            0.82,
+        );
+
+        let snapshot = build_strategy_signal_snapshot(
+            "strategy-1".to_string(),
+            Some("SMA Alpha".to_string()),
+            Some("1d".to_string()),
+            signal,
+        );
+
+        let suggested_order = snapshot
+            .suggested_order
+            .as_ref()
+            .expect("buy signal should produce a suggested order");
+
+        assert_eq!(suggested_order.side, "Buy");
+        assert_eq!(suggested_order.quantity, 100);
+        assert_eq!(snapshot.confirmation_state, "manual_review_only");
+        assert!(snapshot.note.contains("人工确认"));
     }
 
     #[test]

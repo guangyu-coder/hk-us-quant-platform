@@ -43,11 +43,11 @@ use crate::portfolio::{PortfolioExecutionHandler, PortfolioService};
 use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
 use crate::strategy::StrategyService;
+use crate::strategy::build_latest_strategy_signal_snapshot;
 use crate::types::{
     BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
-    RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
+    MarketData, RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
     StrategyLatestRealTradeSummary, StrategyRecentSignalSummary, StrategySignalSnapshot,
-    StrategySuggestedOrderDraft,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -1052,19 +1052,29 @@ async fn get_strategy_state(
         .into_iter()
         .next();
 
-    let strategy_name = state
-        .strategy_service
-        .get_strategy_config(&strategy_id)
-        .await
-        .ok()
-        .and_then(|config| config.display_name.or(Some(config.name)));
+    let strategy_config = state.strategy_service.get_strategy_config(&strategy_id).await.ok();
+    let strategy_name = strategy_config
+        .as_ref()
+        .and_then(|config| config.display_name.clone().or(Some(config.name.clone())));
 
-    let overview = build_strategy_execution_overview(
+    let mut overview = build_strategy_execution_overview(
         strategy_id,
-        strategy_name,
+        strategy_name.clone(),
         latest_backtest,
         latest_real_trade,
     );
+
+    if let Some(config) = strategy_config.as_ref() {
+        let snapshot = load_latest_signal_snapshot_for_strategy(config).await;
+        let status = if snapshot.signal_type.is_some() {
+            "live"
+        } else if snapshot.note.contains("失败") || snapshot.note.contains("不足") {
+            "error"
+        } else {
+            "empty"
+        };
+        overview.recent_signal = build_recent_signal_summary_from_snapshot(&snapshot, status);
+    }
 
     Ok(Json(json!(overview)))
 }
@@ -1717,6 +1727,109 @@ fn strategy_signal_snapshot_to_json(snapshot: StrategySignalSnapshot) -> Value {
     })
 }
 
+fn signal_history_window(timeframe: &str) -> chrono::Duration {
+    match normalize_history_interval(Some(timeframe)) {
+        "1m" => chrono::Duration::days(7),
+        "5m" => chrono::Duration::days(30),
+        "15m" => chrono::Duration::days(60),
+        "30m" => chrono::Duration::days(90),
+        "1h" => chrono::Duration::days(180),
+        "1wk" => chrono::Duration::days(730),
+        "1mo" => chrono::Duration::days(1825),
+        _ => chrono::Duration::days(365),
+    }
+}
+
+async fn fetch_signal_history(symbol: &str, timeframe: &str) -> Result<Vec<MarketData>, AppError> {
+    use crate::market_data::yahoo_finance::YahooFinanceClient;
+
+    let client = YahooFinanceClient::new();
+    let normalized_symbol = normalize_market_symbol(symbol);
+    let interval = normalize_history_interval(Some(timeframe));
+    let end = Utc::now();
+    let start = end - signal_history_window(timeframe);
+
+    client
+        .get_historical_bars(&normalized_symbol, start, end, interval)
+        .await
+}
+
+fn build_signal_snapshot_failure(
+    strategy_id: String,
+    strategy_name: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    reason: String,
+) -> StrategySignalSnapshot {
+    StrategySignalSnapshot {
+        strategy_id,
+        strategy_name,
+        symbol,
+        timeframe,
+        signal_type: None,
+        strength: None,
+        generated_at: Utc::now(),
+        source: "strategy_signal_refresh_failed".to_string(),
+        confirmation_state: "manual_review_only".to_string(),
+        note: reason,
+        suggested_order: None,
+    }
+}
+
+fn build_recent_signal_summary_from_snapshot(
+    snapshot: &StrategySignalSnapshot,
+    status: &str,
+) -> StrategyRecentSignalSummary {
+    StrategyRecentSignalSummary {
+        source: snapshot.source.clone(),
+        status: status.to_string(),
+        confirmation_state: snapshot.confirmation_state.clone(),
+        strategy_id: snapshot.strategy_id.clone(),
+        strategy_name: snapshot.strategy_name.clone(),
+        symbol: snapshot.symbol.clone(),
+        timeframe: snapshot.timeframe.clone(),
+        latest_signal_at: Some(snapshot.generated_at),
+        signal_type: snapshot.signal_type,
+        strength: snapshot.strength,
+        note: snapshot.note.clone(),
+    }
+}
+
+async fn load_latest_signal_snapshot_for_strategy(
+    config: &StrategyConfig,
+) -> StrategySignalSnapshot {
+    let strategy_name = config.display_name.clone().or_else(|| Some(config.name.clone()));
+    let symbol = config
+        .parameters
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "AAPL".to_string());
+    let timeframe = config
+        .parameters
+        .get("timeframe")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "1d".to_string());
+
+    match fetch_signal_history(&symbol, &timeframe).await {
+        Ok(bars) => build_latest_strategy_signal_snapshot(
+            config.id.clone(),
+            strategy_name,
+            config,
+            Some(timeframe),
+            &bars,
+        ),
+        Err(error) => build_signal_snapshot_failure(
+            config.id.clone(),
+            strategy_name,
+            Some(symbol),
+            Some(timeframe),
+            format!("行情不足或策略生成失败，不会自动下单：{}", error),
+        ),
+    }
+}
+
 fn build_backtest_experiment_metadata(
     experiment_label: Option<String>,
     experiment_note: Option<String>,
@@ -1734,34 +1847,25 @@ fn build_backtest_experiment_metadata(
     })
 }
 
-async fn list_latest_signals(State(_state): State<AppState>) -> Result<Json<Value>, AppError> {
-    Ok(Json(json!([])))
+async fn list_latest_signals(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let strategies = state.strategy_service.list_strategies().await?;
+    let mut snapshots = Vec::new();
+
+    for config in strategies.into_iter().filter(|config| config.is_active) {
+        let snapshot = load_latest_signal_snapshot_for_strategy(&config).await;
+        snapshots.push(strategy_signal_snapshot_to_json(snapshot));
+    }
+
+    Ok(Json(json!(snapshots)))
 }
 
 async fn refresh_strategy_signal(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(strategy_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    Ok(Json(json!(strategy_signal_snapshot_to_json(
-        StrategySignalSnapshot {
-            strategy_id: strategy_id.clone(),
-            strategy_name: None,
-            symbol: None,
-            timeframe: None,
-            signal_type: None,
-            strength: None,
-            generated_at: Utc::now(),
-            source: "manual_refresh_stub".to_string(),
-            confirmation_state: "manual_review_only".to_string(),
-            note: "信号快照刷新占位，当前仅保留人工确认边界。".to_string(),
-            suggested_order: Some(StrategySuggestedOrderDraft {
-                symbol: String::new(),
-                side: String::new(),
-                quantity: 0,
-                strategy_id,
-            }),
-        }
-    ))))
+    let config = state.strategy_service.get_strategy_config(&strategy_id).await?;
+    let snapshot = load_latest_signal_snapshot_for_strategy(&config).await;
+    Ok(Json(strategy_signal_snapshot_to_json(snapshot)))
 }
 
 async fn list_strategies(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
