@@ -3,7 +3,8 @@ use crate::events::{EventBus, PlatformEvent};
 use crate::types::{
     BacktestAssumptions, BacktestDataGap, BacktestDataQuality, BacktestEquityPoint,
     BacktestExecutionLink, BacktestExperimentMetadata, BacktestResult, BacktestTrade, MarketData,
-    Signal, SignalType, StrategyConfig, StrategySignalSnapshot, StrategySuggestedOrderDraft,
+    Signal, SignalReviewRecord, SignalType, StrategyConfig, StrategySignalSnapshot,
+    StrategySuggestedOrderDraft,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -840,6 +841,138 @@ impl StrategyService {
 
         Ok(())
     }
+
+    pub async fn upsert_pending_signal_review(
+        &self,
+        snapshot: &StrategySignalSnapshot,
+    ) -> AppResult<SignalReviewRecord> {
+        let signal_type = snapshot.signal_type.map(signal_type_to_storage);
+        let suggested_order =
+            serde_json::to_value(&snapshot.suggested_order).map_err(AppError::Serialization)?;
+        let existing = sqlx::query_as::<_, SignalReviewRow>(
+            r#"
+            SELECT id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                   generated_at, source, confirmation_state, note, status, user_note,
+                   suggested_order, created_at, updated_at
+            FROM signal_reviews
+            WHERE strategy_id = $1
+              AND status = 'pending'
+              AND COALESCE(symbol, '') = COALESCE($2, '')
+              AND COALESCE(timeframe, '') = COALESCE($3, '')
+              AND COALESCE(signal_type, '') = COALESCE($4, '')
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&snapshot.strategy_id)
+        .bind(&snapshot.symbol)
+        .bind(&snapshot.timeframe)
+        .bind(&signal_type)
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        if let Some(existing) = existing {
+            let row = sqlx::query_as::<_, SignalReviewRow>(
+                r#"
+                UPDATE signal_reviews
+                SET strategy_name = $2,
+                    symbol = $3,
+                    timeframe = $4,
+                    signal_type = $5,
+                    strength = $6,
+                    generated_at = $7,
+                    source = $8,
+                    confirmation_state = $9,
+                    note = $10,
+                    suggested_order = $11,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                          generated_at, source, confirmation_state, note, status, user_note,
+                          suggested_order, created_at, updated_at
+                "#,
+            )
+            .bind(existing.id)
+            .bind(&snapshot.strategy_name)
+            .bind(&snapshot.symbol)
+            .bind(&snapshot.timeframe)
+            .bind(&signal_type)
+            .bind(snapshot.strength)
+            .bind(snapshot.generated_at)
+            .bind(&snapshot.source)
+            .bind(&snapshot.confirmation_state)
+            .bind(&snapshot.note)
+            .bind(&suggested_order)
+            .fetch_one(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
+
+            return row.try_into();
+        }
+
+        let row = sqlx::query_as::<_, SignalReviewRow>(
+            r#"
+            INSERT INTO signal_reviews (
+                id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                generated_at, source, confirmation_state, note, status, user_note,
+                suggested_order, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, 'pending', NULL,
+                $12, NOW(), NOW()
+            )
+            RETURNING id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                      generated_at, source, confirmation_state, note, status, user_note,
+                      suggested_order, created_at, updated_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(&snapshot.strategy_id)
+        .bind(&snapshot.strategy_name)
+        .bind(&snapshot.symbol)
+        .bind(&snapshot.timeframe)
+        .bind(&signal_type)
+        .bind(snapshot.strength)
+        .bind(snapshot.generated_at)
+        .bind(&snapshot.source)
+        .bind(&snapshot.confirmation_state)
+        .bind(&snapshot.note)
+        .bind(&suggested_order)
+        .fetch_one(&self.db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        row.try_into()
+    }
+
+    pub async fn list_signal_reviews(
+        &self,
+        status: Option<&str>,
+        strategy_id: Option<&str>,
+        limit: i64,
+    ) -> AppResult<Vec<SignalReviewRecord>> {
+        let rows = sqlx::query_as::<_, SignalReviewRow>(
+            r#"
+            SELECT id, strategy_id, strategy_name, symbol, timeframe, signal_type, strength,
+                   generated_at, source, confirmation_state, note, status, user_note,
+                   suggested_order, created_at, updated_at
+            FROM signal_reviews
+            WHERE ($1::TEXT IS NULL OR status = $1)
+              AND ($2::TEXT IS NULL OR strategy_id = $2)
+            ORDER BY updated_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(status)
+        .bind(strategy_id)
+        .bind(limit.max(1))
+        .fetch_all(&self.db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
 }
 
 fn strategy_related_cleanup_tables() -> &'static [&'static str] {
@@ -863,6 +996,77 @@ struct StrategyRow {
     is_active: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SignalReviewRow {
+    id: Uuid,
+    strategy_id: String,
+    strategy_name: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    signal_type: Option<String>,
+    strength: Option<f64>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    source: String,
+    confirmation_state: String,
+    note: String,
+    status: String,
+    user_note: Option<String>,
+    suggested_order: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn signal_type_to_storage(signal_type: SignalType) -> String {
+    match signal_type {
+        SignalType::Buy => "Buy",
+        SignalType::Sell => "Sell",
+        SignalType::Hold => "Hold",
+    }
+    .to_string()
+}
+
+fn signal_type_from_storage(value: Option<String>) -> Option<SignalType> {
+    match value.as_deref() {
+        Some("Buy") => Some(SignalType::Buy),
+        Some("Sell") => Some(SignalType::Sell),
+        Some("Hold") => Some(SignalType::Hold),
+        _ => None,
+    }
+}
+
+impl TryFrom<SignalReviewRow> for SignalReviewRecord {
+    type Error = AppError;
+
+    fn try_from(row: SignalReviewRow) -> Result<Self, Self::Error> {
+        let suggested_order = match row.suggested_order {
+            Some(value) => {
+                serde_json::from_value::<Option<StrategySuggestedOrderDraft>>(value)
+                    .map_err(AppError::Serialization)?
+            }
+            None => None,
+        };
+
+        Ok(SignalReviewRecord {
+            id: row.id,
+            strategy_id: row.strategy_id,
+            strategy_name: row.strategy_name,
+            symbol: row.symbol,
+            timeframe: row.timeframe,
+            signal_type: signal_type_from_storage(row.signal_type),
+            strength: row.strength,
+            generated_at: row.generated_at,
+            source: row.source,
+            confirmation_state: row.confirmation_state,
+            note: row.note,
+            status: row.status,
+            user_note: row.user_note,
+            suggested_order,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
 }
 
 impl From<StrategyRow> for StrategyConfig {

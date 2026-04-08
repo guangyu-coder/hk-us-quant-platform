@@ -47,8 +47,8 @@ use crate::strategy::build_latest_strategy_signal_snapshot;
 use crate::types::{
     BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
     MarketData, RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
-    StrategyLatestRealTradeSummary, StrategyRecentSignalSummary, StrategySignalSnapshot,
-    SignalReviewRecord,
+    SignalReviewRecord, StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
+    StrategySignalSnapshot,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -129,6 +129,13 @@ pub struct PaperSimulationQuery {
 pub struct OrderAuditQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalReviewListQuery {
+    pub status: Option<String>,
+    pub strategy_id: Option<String>,
+    pub limit: Option<i64>,
 }
 
 fn normalize_history_interval(interval: Option<&str>) -> &'static str {
@@ -419,6 +426,7 @@ fn create_router(state: AppState) -> Router {
             get(get_strategy_state),
         )
         .route("/api/v1/signals/latest", get(list_latest_signals))
+        .route("/api/v1/signals/reviews", get(list_signal_reviews))
         .route(
             "/api/v1/strategies/:strategy_id/signals/refresh",
             post(refresh_strategy_signal),
@@ -1754,6 +1762,13 @@ fn signal_review_record_to_json(review: SignalReviewRecord) -> Value {
     })
 }
 
+fn signal_review_list_to_json(reviews: Vec<SignalReviewRecord>) -> Value {
+    json!(reviews
+        .into_iter()
+        .map(signal_review_record_to_json)
+        .collect::<Vec<_>>())
+}
+
 fn signal_history_window(timeframe: &str) -> chrono::Duration {
     match normalize_history_interval(Some(timeframe)) {
         "1m" => chrono::Duration::days(7),
@@ -1880,10 +1895,30 @@ async fn list_latest_signals(State(state): State<AppState>) -> Result<Json<Value
 
     for config in strategies.into_iter().filter(|config| config.is_active) {
         let snapshot = load_latest_signal_snapshot_for_strategy(&config).await;
+        state
+            .strategy_service
+            .upsert_pending_signal_review(&snapshot)
+            .await?;
         snapshots.push(strategy_signal_snapshot_to_json(snapshot));
     }
 
     Ok(Json(json!(snapshots)))
+}
+
+async fn list_signal_reviews(
+    State(state): State<AppState>,
+    Query(query): Query<SignalReviewListQuery>,
+) -> Result<Json<Value>, AppError> {
+    let reviews = state
+        .strategy_service
+        .list_signal_reviews(
+            query.status.as_deref(),
+            query.strategy_id.as_deref(),
+            query.limit.unwrap_or(20),
+        )
+        .await?;
+
+    Ok(Json(signal_review_list_to_json(reviews)))
 }
 
 async fn refresh_strategy_signal(
@@ -1892,6 +1927,10 @@ async fn refresh_strategy_signal(
 ) -> Result<Json<Value>, AppError> {
     let config = state.strategy_service.get_strategy_config(&strategy_id).await?;
     let snapshot = load_latest_signal_snapshot_for_strategy(&config).await;
+    state
+        .strategy_service
+        .upsert_pending_signal_review(&snapshot)
+        .await?;
     Ok(Json(strategy_signal_snapshot_to_json(snapshot)))
 }
 
