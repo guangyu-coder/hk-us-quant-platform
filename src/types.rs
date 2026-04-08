@@ -747,6 +747,31 @@ pub struct StrategyLatestRealTradeSummary {
     pub note: String,
 }
 
+/// Minimal draft for a manually reviewed order suggestion derived from a signal snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategySuggestedOrderDraft {
+    pub symbol: String,
+    pub side: String,
+    pub quantity: i64,
+    pub strategy_id: String,
+}
+
+/// Minimal latest signal snapshot that keeps the manual confirmation boundary explicit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrategySignalSnapshot {
+    pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub signal_type: Option<SignalType>,
+    pub strength: Option<f64>,
+    pub generated_at: DateTime<Utc>,
+    pub source: String,
+    pub confirmation_state: String,
+    pub note: String,
+    pub suggested_order: Option<StrategySuggestedOrderDraft>,
+}
+
 /// Placeholder for the recent signal summary that will later power a confirmation table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StrategyRecentSignalSummary {

@@ -46,7 +46,8 @@ use crate::strategy::StrategyService;
 use crate::types::{
     BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
     RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
-    StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
+    StrategyLatestRealTradeSummary, StrategyRecentSignalSummary, StrategySignalSnapshot,
+    StrategySuggestedOrderDraft,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -415,6 +416,11 @@ fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/strategies/:strategy_id/state",
             get(get_strategy_state),
+        )
+        .route("/api/v1/signals/latest", get(list_latest_signals))
+        .route(
+            "/api/v1/strategies/:strategy_id/signals/refresh",
+            post(refresh_strategy_signal),
         )
         .route(
             "/api/v1/strategies/:strategy_id/backtest",
@@ -1690,6 +1696,27 @@ fn build_recent_signal_placeholder(
     }
 }
 
+fn strategy_signal_snapshot_to_json(snapshot: StrategySignalSnapshot) -> Value {
+    json!({
+        "strategy_id": snapshot.strategy_id,
+        "strategy_name": snapshot.strategy_name,
+        "symbol": snapshot.symbol,
+        "timeframe": snapshot.timeframe,
+        "signal_type": snapshot.signal_type.map(|value| format!("{:?}", value)),
+        "strength": snapshot.strength,
+        "generated_at": snapshot.generated_at.to_rfc3339(),
+        "source": snapshot.source,
+        "confirmation_state": snapshot.confirmation_state,
+        "note": snapshot.note,
+        "suggested_order": snapshot.suggested_order.map(|draft| json!({
+            "symbol": draft.symbol,
+            "side": draft.side,
+            "quantity": draft.quantity,
+            "strategy_id": draft.strategy_id,
+        })),
+    })
+}
+
 fn build_backtest_experiment_metadata(
     experiment_label: Option<String>,
     experiment_note: Option<String>,
@@ -1705,6 +1732,36 @@ fn build_backtest_experiment_metadata(
         experiment_note,
         parameter_version,
     })
+}
+
+async fn list_latest_signals(State(_state): State<AppState>) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!([])))
+}
+
+async fn refresh_strategy_signal(
+    State(_state): State<AppState>,
+    Path(strategy_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!(strategy_signal_snapshot_to_json(
+        StrategySignalSnapshot {
+            strategy_id: strategy_id.clone(),
+            strategy_name: None,
+            symbol: None,
+            timeframe: None,
+            signal_type: None,
+            strength: None,
+            generated_at: Utc::now(),
+            source: "manual_refresh_stub".to_string(),
+            confirmation_state: "manual_review_only".to_string(),
+            note: "信号快照刷新占位，当前仅保留人工确认边界。".to_string(),
+            suggested_order: Some(StrategySuggestedOrderDraft {
+                symbol: String::new(),
+                side: String::new(),
+                quantity: 0,
+                strategy_id,
+            }),
+        }
+    ))))
 }
 
 async fn list_strategies(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -2389,6 +2446,40 @@ mod http_e2e_tests {
             Some(8)
         );
         assert_eq!(config.is_active, false);
+    }
+
+    #[test]
+    fn strategy_signal_snapshot_json_keeps_manual_confirmation_boundary() {
+        let snapshot = crate::types::StrategySignalSnapshot {
+            strategy_id: "strategy-1".to_string(),
+            strategy_name: Some("SMA Alpha".to_string()),
+            symbol: Some("AAPL".to_string()),
+            timeframe: Some("1d".to_string()),
+            signal_type: Some(crate::types::SignalType::Buy),
+            strength: Some(0.82),
+            generated_at: Utc::now(),
+            source: "strategy_engine_latest_snapshot".to_string(),
+            confirmation_state: "manual_review_only".to_string(),
+            note: "信号已生成，需人工确认后才可下单".to_string(),
+            suggested_order: Some(crate::types::StrategySuggestedOrderDraft {
+                symbol: "AAPL".to_string(),
+                side: "Buy".to_string(),
+                quantity: 100,
+                strategy_id: "strategy-1".to_string(),
+            }),
+        };
+
+        let response = strategy_signal_snapshot_to_json(snapshot);
+
+        assert_eq!(response["strategy_id"], json!("strategy-1"));
+        assert_eq!(response["signal_type"], json!("Buy"));
+        assert_eq!(response["confirmation_state"], json!("manual_review_only"));
+        assert_eq!(
+            response["note"],
+            json!("信号已生成，需人工确认后才可下单")
+        );
+        assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
+        assert_ne!(response["confirmation_state"], json!("auto_execute"));
     }
 
     #[test]
