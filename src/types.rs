@@ -772,6 +772,27 @@ pub struct StrategySignalSnapshot {
     pub suggested_order: Option<StrategySuggestedOrderDraft>,
 }
 
+/// Minimal persisted signal review record for a manually processed signal queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignalReviewRecord {
+    pub id: Uuid,
+    pub strategy_id: String,
+    pub strategy_name: Option<String>,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub signal_type: Option<SignalType>,
+    pub strength: Option<f64>,
+    pub generated_at: DateTime<Utc>,
+    pub source: String,
+    pub confirmation_state: String,
+    pub note: String,
+    pub status: String,
+    pub user_note: Option<String>,
+    pub suggested_order: Option<StrategySuggestedOrderDraft>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Placeholder for the recent signal summary that will later power a confirmation table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StrategyRecentSignalSummary {

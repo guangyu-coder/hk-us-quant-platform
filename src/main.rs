@@ -48,6 +48,7 @@ use crate::types::{
     BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
     MarketData, RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
     StrategyLatestRealTradeSummary, StrategyRecentSignalSummary, StrategySignalSnapshot,
+    SignalReviewRecord,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -1727,6 +1728,32 @@ fn strategy_signal_snapshot_to_json(snapshot: StrategySignalSnapshot) -> Value {
     })
 }
 
+fn signal_review_record_to_json(review: SignalReviewRecord) -> Value {
+    json!({
+        "id": review.id.to_string(),
+        "strategy_id": review.strategy_id,
+        "strategy_name": review.strategy_name,
+        "symbol": review.symbol,
+        "timeframe": review.timeframe,
+        "signal_type": review.signal_type.map(|value| format!("{:?}", value)),
+        "strength": review.strength,
+        "generated_at": review.generated_at.to_rfc3339(),
+        "source": review.source,
+        "confirmation_state": review.confirmation_state,
+        "note": review.note,
+        "status": review.status,
+        "user_note": review.user_note,
+        "suggested_order": review.suggested_order.map(|draft| json!({
+            "symbol": draft.symbol,
+            "side": draft.side,
+            "quantity": draft.quantity,
+            "strategy_id": draft.strategy_id,
+        })),
+        "created_at": review.created_at.to_rfc3339(),
+        "updated_at": review.updated_at.to_rfc3339(),
+    })
+}
+
 fn signal_history_window(timeframe: &str) -> chrono::Duration {
     match normalize_history_interval(Some(timeframe)) {
         "1m" => chrono::Duration::days(7),
@@ -2582,6 +2609,43 @@ mod http_e2e_tests {
             response["note"],
             json!("信号已生成，需人工确认后才可下单")
         );
+        assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
+        assert_ne!(response["confirmation_state"], json!("auto_execute"));
+    }
+
+    #[test]
+    fn signal_review_record_json_keeps_manual_boundary_and_status() {
+        let now = Utc::now();
+        let review = crate::types::SignalReviewRecord {
+            id: Uuid::new_v4(),
+            strategy_id: "strategy-1".to_string(),
+            strategy_name: Some("SMA Alpha".to_string()),
+            symbol: Some("AAPL".to_string()),
+            timeframe: Some("1d".to_string()),
+            signal_type: Some(crate::types::SignalType::Buy),
+            strength: Some(0.81),
+            generated_at: now,
+            source: "strategy_signal_review_queue".to_string(),
+            confirmation_state: "manual_review_only".to_string(),
+            note: "研究信号进入待处理队列，需人工确认。".to_string(),
+            status: "pending".to_string(),
+            user_note: Some("观察开盘后再决定".to_string()),
+            suggested_order: Some(crate::types::StrategySuggestedOrderDraft {
+                symbol: "AAPL".to_string(),
+                side: "Buy".to_string(),
+                quantity: 100,
+                strategy_id: "strategy-1".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = signal_review_record_to_json(review);
+
+        assert_eq!(response["strategy_id"], json!("strategy-1"));
+        assert_eq!(response["signal_type"], json!("Buy"));
+        assert_eq!(response["status"], json!("pending"));
+        assert_eq!(response["confirmation_state"], json!("manual_review_only"));
         assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
         assert_ne!(response["confirmation_state"], json!("auto_execute"));
     }
