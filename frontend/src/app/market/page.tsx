@@ -7,9 +7,12 @@ import { formatMarketNumber, formatMarketPrice, getMarketStatusLabel, inferCurre
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { Search, Loader2, TrendingUp, TrendingDown, RefreshCw } from 'lucide-react';
 import type { MarketData, MarketDataMeta, MarketQuoteResult } from '@/types';
-
-// 默认热门股票列表
-const defaultPopularStocks = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', '0700.HK', '0941.HK', 'AMZN'];
+import {
+  filterSearchResultsByMarket,
+  sortStocksByBoardMode,
+  type BoardMode,
+  type MarketTab,
+} from './market-page-helpers';
 
 interface StockData {
   symbol: string;
@@ -34,6 +37,11 @@ interface ChartPoint {
   time: string;
   price: number;
   volume: number;
+}
+
+interface MarketListResponse {
+  count?: number;
+  data?: SearchResult[];
 }
 
 const toFiniteNumber = (value: unknown, fallback = 0): number => {
@@ -184,7 +192,9 @@ export default function MarketPage() {
   const selectedSymbolRef = useRef('AAPL');
   const [selectedTimeframe, setSelectedTimeframe] = useState('1D');
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL');
-  const [stockData, setStockData] = useState<StockData[]>([]);
+  const [selectedMarket, setSelectedMarket] = useState<MarketTab>('US');
+  const [selectedBoardMode, setSelectedBoardMode] = useState<BoardMode>('all');
+  const [marketStocks, setMarketStocks] = useState<StockData[]>([]);
   const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [selectedQuote, setSelectedQuote] = useState<MarketQuoteResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -202,51 +212,85 @@ export default function MarketPage() {
   const [showSearchResults, setShowSearchResults] = useState(false);
 
   useEffect(() => {
-    const fetchStockData = async () => {
-      const stocks: StockData[] = [];
+    let cancelled = false;
+
+    const fetchMarketStocks = async () => {
+      setLoading(true);
 
       try {
-        const data = await marketDataApi.getMultipleSymbols(defaultPopularStocks);
+        const payload = (await marketDataApi.getMarketList(selectedMarket)) as MarketListResponse;
+        const symbols = Array.isArray(payload.data)
+          ? payload.data
+              .map((item) => normalizeSearchSymbol(item))
+              .filter((value, index, all) => value && all.indexOf(value) === index)
+          : [];
 
-        if (Array.isArray(data)) {
-          data.forEach((item) => {
-            if (item.success && item.data) {
-              const quote = item.data;
-              const stockNames: Record<string, string> = {
-                'AAPL': 'Apple Inc.',
-                'GOOGL': 'Alphabet Inc.',
-                'MSFT': 'Microsoft Corp.',
-                'TSLA': 'Tesla Inc.',
-                '0700.HK': 'Tencent Holdings',
-                '0941.HK': 'China Mobile',
-                'AMZN': 'Amazon.com',
-              };
+        if (symbols.length === 0) {
+          if (!cancelled) {
+            setMarketStocks([]);
+          }
+          return;
+        }
 
-              stocks.push({
-                symbol: quote.symbol ?? item.meta.normalized_symbol,
-                name: stockNames[quote.symbol ?? item.meta.normalized_symbol] || quote.symbol || item.meta.normalized_symbol,
-                price: toFiniteNumber(quote.price),
-                change: toFiniteNumber(quote.change),
-                changePercent: toFiniteNumber(quote.change_percent),
-                currency: typeof quote.currency === 'string' ? quote.currency : undefined,
-                exchange: typeof quote.exchange === 'string' ? quote.exchange : undefined,
-              });
-            }
+        const quotes = await marketDataApi.getMultipleSymbols(symbols);
+        const detailsBySymbol = new Map(
+          (payload.data ?? []).map((item) => [normalizeSearchSymbol(item), item] as const)
+        );
+
+        const stocks = quotes
+          .filter((item) => item.success)
+          .map((item) => {
+            const normalizedSymbol = item.data?.symbol ?? item.meta.normalized_symbol;
+            const detail = detailsBySymbol.get(normalizedSymbol);
+
+            return {
+              symbol: normalizedSymbol,
+              name: detail?.instrument_name || normalizedSymbol,
+              price: toFiniteNumber(item.data?.price),
+              change: toFiniteNumber(item.data?.change),
+              changePercent: toFiniteNumber(item.data?.change_percent),
+              currency: typeof item.data?.currency === 'string' ? item.data.currency : undefined,
+              exchange:
+                typeof item.data?.exchange === 'string'
+                  ? item.data.exchange
+                  : detail?.exchange,
+            };
           });
+
+        if (!cancelled) {
+          setMarketStocks(stocks);
         }
       } catch (error) {
         console.error("Failed to fetch market data", error);
+        if (!cancelled) {
+          setMarketStocks([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
-
-      setStockData(stocks);
-      setLoading(false);
     };
 
-    fetchStockData();
+    fetchMarketStocks();
     // 每30秒刷新一次数据
-    const interval = setInterval(fetchStockData, 30000);
-    return () => clearInterval(interval);
-  }, [refreshNonce]);
+    const interval = setInterval(fetchMarketStocks, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [refreshNonce, selectedMarket]);
+
+  useEffect(() => {
+    if (marketStocks.length === 0) {
+      return;
+    }
+
+    const currentSymbolExists = marketStocks.some((stock) => stock.symbol === selectedSymbol);
+    if (!currentSymbolExists) {
+      setSelectedSymbol(marketStocks[0]?.symbol ?? 'AAPL');
+    }
+  }, [marketStocks, selectedSymbol]);
 
   // 处理搜索
   useEffect(() => {
@@ -256,8 +300,14 @@ export default function MarketPage() {
         setShowSearchResults(true);
         try {
           const response = await marketDataApi.searchSymbols(searchQuery);
-          if (response && response.data) {
-             setSearchResults(response.data);
+          const rawResults = Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response)
+              ? response
+              : [];
+
+          if (rawResults.length > 0) {
+             setSearchResults(filterSearchResultsByMarket(rawResults, selectedMarket));
           } else {
              setSearchResults([]);
           }
@@ -274,12 +324,11 @@ export default function MarketPage() {
     }, 500);
 
     return () => clearTimeout(delayDebounceFn);
-  }, [searchQuery]);
+  }, [searchQuery, selectedMarket]);
 
   // 选择搜索结果
   const handleSelectSymbol = (result: SearchResult) => {
     const normalizedSymbol = normalizeSearchSymbol(result);
-    console.log('Selected symbol:', result.symbol, 'normalized to:', normalizedSymbol);
     setSelectedSymbol(normalizedSymbol);
     setSearchQuery('');
     setShowSearchResults(false);
@@ -458,7 +507,7 @@ export default function MarketPage() {
     setChartData((currentData) => applyQuoteToChartData(currentData, selectedQuote?.data ?? null));
   }, [selectedQuote]);
 
-  const selectedStock = stockData.find(s => s.symbol === selectedSymbol);
+  const selectedStock = marketStocks.find(s => s.symbol === selectedSymbol);
   const selectedMarketData = selectedQuote?.data
     ? {
         symbol: selectedQuote.data.symbol,
@@ -485,13 +534,24 @@ export default function MarketPage() {
   );
   const isPositive = selectedMarketData ? selectedMarketData.change >= 0 : true;
   const quoteMeta = selectedQuote?.meta;
+  const displayedStocks = sortStocksByBoardMode(marketStocks, selectedBoardMode);
+  const marketLabel = selectedMarket === 'US' ? '美股市场' : '港股市场';
+  const boardOptions: Array<{ value: BoardMode; label: string }> = [
+    { value: 'all', label: '全部' },
+    { value: 'gainers', label: '涨幅榜' },
+    { value: 'losers', label: '跌幅榜' },
+  ];
+  const marketTabs: Array<{ value: MarketTab; label: string }> = [
+    { value: 'US', label: '美股' },
+    { value: 'HK', label: '港股' },
+  ];
 
   return (
     <div className="p-6 space-y-6 max-w-[1600px] mx-auto">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-foreground">市场概览</h1>
-          <p className="text-muted-foreground mt-1">实时市场数据与分析</p>
+          <p className="text-muted-foreground mt-1">按市场切换查看实时行情、涨幅榜和跌幅榜</p>
         </div>
         
         {/* 搜索框 */}
@@ -531,6 +591,11 @@ export default function MarketPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+          {showSearchResults && !isSearching && searchResults.length === 0 && searchQuery.trim().length > 1 && (
+            <div className="absolute z-50 mt-2 w-full bg-popover text-popover-foreground shadow-xl rounded-lg px-4 py-3 ring-1 ring-black ring-opacity-5 text-sm text-muted-foreground">
+              当前市场没有匹配标的
             </div>
           )}
         </div>
@@ -692,15 +757,59 @@ export default function MarketPage() {
         {/* 右侧列表区域 */}
         <div className="space-y-6">
           <div className="bg-card text-card-foreground p-6 rounded-xl shadow-sm border border-border">
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-lg font-bold">热门资产</h3>
+            <div className="flex items-center justify-between gap-3 mb-6">
+              <div>
+                <h3 className="text-lg font-bold">{marketLabel}</h3>
+                <p className="text-xs text-muted-foreground mt-1">按当前市场查看全部股票、涨幅榜和跌幅榜</p>
+              </div>
               <button 
                 onClick={() => setRefreshNonce((value) => value + 1)}
                 disabled={loading}
                 className="p-2 hover:bg-secondary rounded-full transition-colors text-muted-foreground hover:text-foreground"
+                aria-label="刷新市场列表"
               >
                 <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
               </button>
+            </div>
+
+            <div
+              role="tablist"
+              aria-label="市场切换"
+              className="flex items-center gap-2 rounded-lg bg-secondary/40 p-1 mb-4"
+            >
+              {marketTabs.map((tab) => (
+                <button
+                  key={tab.value}
+                  role="tab"
+                  type="button"
+                  aria-selected={selectedMarket === tab.value}
+                  onClick={() => setSelectedMarket(tab.value)}
+                  className={`flex-1 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                    selectedMarket === tab.value
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:bg-background/60 hover:text-foreground'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2 mb-6">
+              {boardOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setSelectedBoardMode(option.value)}
+                  className={`rounded-full px-3 py-1.5 text-sm font-medium transition-colors ${
+                    selectedBoardMode === option.value
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-secondary/70 text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
             </div>
             
             {loading ? (
@@ -718,10 +827,11 @@ export default function MarketPage() {
                   </div>
                 ))}
               </div>
-            ) : (
+            ) : displayedStocks.length > 0 ? (
               <div className="space-y-2">
-                {stockData.map((stock) => (
-                  <div 
+                {displayedStocks.map((stock) => (
+                  <button
+                    type="button"
                     key={stock.symbol} 
                     className={`flex items-center justify-between p-3 rounded-lg cursor-pointer transition-all border border-transparent ${
                       selectedSymbol === stock.symbol 
@@ -729,6 +839,7 @@ export default function MarketPage() {
                         : 'hover:bg-secondary/50'
                     }`}
                     onClick={() => setSelectedSymbol(stock.symbol)}
+                    aria-label={`选择股票 ${stock.symbol}`}
                   >
                     <div>
                       <div className="font-bold">{stock.symbol}</div>
@@ -746,8 +857,12 @@ export default function MarketPage() {
                         {stock.change >= 0 ? '+' : ''}{stock.changePercent.toFixed(2)}%
                       </div>
                     </div>
-                  </div>
+                  </button>
                 ))}
+              </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
+                当前市场暂无可展示股票
               </div>
             )}
           </div>

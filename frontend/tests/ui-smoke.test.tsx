@@ -5,6 +5,10 @@ import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 const apiMocks = vi.hoisted(() => ({
+  getRealTimeData: vi.fn(),
+  getHistoricalData: vi.fn(),
+  getMultipleSymbols: vi.fn(),
+  getMarketList: vi.fn(),
   getStrategies: vi.fn(),
   createStrategy: vi.fn(),
   updateStrategy: vi.fn(),
@@ -62,8 +66,31 @@ vi.mock('@/lib/api', () => ({
     listTrades: apiMocks.listTrades,
   },
   marketDataApi: {
+    getRealTimeData: apiMocks.getRealTimeData,
+    getHistoricalData: apiMocks.getHistoricalData,
+    getMultipleSymbols: apiMocks.getMultipleSymbols,
+    getMarketList: apiMocks.getMarketList,
     searchSymbols: apiMocks.searchSymbols,
   },
+  WebSocketManager: class {
+    connect(
+      _url: string,
+      _onMessage: (data: unknown) => void,
+      _onError?: (error: Event) => void,
+      onStatusChange?: (connected: boolean) => void
+    ) {
+      onStatusChange?.(false);
+    }
+
+    send() {}
+
+    disconnect() {}
+  },
+}));
+
+vi.mock('@/components/market/MarketDataWidget', () => ({
+  MarketDataWidget: ({ symbol = 'AAPL' }: { symbol?: string }) =>
+    React.createElement('div', { 'data-testid': 'market-data-widget' }, `订单簿详情:${symbol}`),
 }));
 
 vi.mock('recharts', () => {
@@ -75,8 +102,10 @@ vi.mock('recharts', () => {
   return {
     ResponsiveContainer: passthrough('responsive-container'),
     LineChart: passthrough('line-chart'),
+    AreaChart: passthrough('area-chart'),
     BarChart: passthrough('bar-chart'),
     Line: passthrough('line'),
+    Area: passthrough('area'),
     Bar: passthrough('bar'),
     XAxis: passthrough('x-axis'),
     YAxis: passthrough('y-axis'),
@@ -89,6 +118,7 @@ vi.mock('recharts', () => {
 import StrategiesPage from '../src/app/strategies/page';
 import BacktestPage from '../src/app/backtest/page';
 import TradingPage from '../src/app/trading/page';
+import MarketPage from '../src/app/market/page';
 
 const strategy = {
   id: 'strategy-001',
@@ -384,6 +414,33 @@ const ignoredReview = {
   updated_at: '2026-04-02T05:05:00Z',
 };
 
+const usMarketList = {
+  count: 3,
+  data: [
+    { symbol: 'AAPL', instrument_name: 'Apple Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
+    { symbol: 'TSLA', instrument_name: 'Tesla Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
+    { symbol: 'MSFT', instrument_name: 'Microsoft Corp.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
+  ],
+};
+
+const hkMarketList = {
+  count: 3,
+  data: [
+    { symbol: '0700.HK', instrument_name: 'Tencent Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
+    { symbol: '0941.HK', instrument_name: 'China Mobile', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
+    { symbol: '0005.HK', instrument_name: 'HSBC Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
+  ],
+};
+
+const batchQuotes = {
+  AAPL: { symbol: 'AAPL', price: 185, change: 4.1, change_percent: 2.27, exchange: 'NASDAQ', currency: 'USD' },
+  TSLA: { symbol: 'TSLA', price: 170, change: -6.8, change_percent: -3.85, exchange: 'NASDAQ', currency: 'USD' },
+  MSFT: { symbol: 'MSFT', price: 415, change: 1.9, change_percent: 0.46, exchange: 'NASDAQ', currency: 'USD' },
+  '0700.HK': { symbol: '0700.HK', price: 320, change: 18, change_percent: 5.96, exchange: 'HKEX', currency: 'HKD' },
+  '0941.HK': { symbol: '0941.HK', price: 72, change: -3.5, change_percent: -4.64, exchange: 'HKEX', currency: 'HKD' },
+  '0005.HK': { symbol: '0005.HK', price: 64, change: 1.2, change_percent: 1.91, exchange: 'HKEX', currency: 'HKD' },
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -405,6 +462,56 @@ describe('UI smoke', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
+    apiMocks.getRealTimeData.mockImplementation(async (symbol: string) => ({
+      success: true,
+      data: batchQuotes[symbol as keyof typeof batchQuotes] ?? batchQuotes.AAPL,
+      meta: {
+        status: 'live',
+        source: 'mock',
+        fallback_used: false,
+        is_stale: false,
+        degraded: false,
+        requested_symbol: symbol,
+        normalized_symbol: symbol,
+      },
+      error: null,
+    }));
+    apiMocks.getHistoricalData.mockResolvedValue({
+      success: true,
+      data: [
+        { timestamp: '2026-04-01T09:30:00Z', close: 180, volume: 1000 },
+        { timestamp: '2026-04-01T10:30:00Z', close: 182, volume: 1200 },
+      ],
+      meta: {
+        status: 'live',
+        source: 'mock',
+        fallback_used: false,
+        is_stale: false,
+        degraded: false,
+        requested_symbol: 'AAPL',
+        normalized_symbol: 'AAPL',
+      },
+      error: null,
+    });
+    apiMocks.getMultipleSymbols.mockImplementation(async (symbols: string[]) =>
+      symbols.map((symbol) => ({
+        success: true,
+        data: batchQuotes[symbol as keyof typeof batchQuotes] ?? { symbol, price: 0, change: 0, change_percent: 0 },
+        meta: {
+          status: 'live',
+          source: 'mock',
+          fallback_used: false,
+          is_stale: false,
+          degraded: false,
+          requested_symbol: symbol,
+          normalized_symbol: symbol,
+        },
+        error: null,
+      }))
+    );
+    apiMocks.getMarketList.mockImplementation(async (market?: string) =>
+      market === 'HK' ? hkMarketList : usMarketList
+    );
     apiMocks.getStrategies.mockResolvedValue([strategy, secondStrategy]);
     apiMocks.createStrategy.mockResolvedValue({ id: 'created-strategy' });
     apiMocks.updateStrategy.mockResolvedValue({ id: strategy.id });
@@ -448,7 +555,12 @@ describe('UI smoke', () => {
       results: [],
     });
     apiMocks.listTrades.mockResolvedValue([]);
-    apiMocks.searchSymbols.mockResolvedValue([]);
+    apiMocks.searchSymbols.mockResolvedValue({
+      data: [
+        ...usMarketList.data,
+        hkMarketList.data[0],
+      ],
+    });
 
     vi.stubGlobal('alert', vi.fn());
     vi.stubGlobal('confirm', vi.fn(() => true));
@@ -618,5 +730,49 @@ describe('UI smoke', () => {
     await user.selectOptions(screen.getByLabelText('当前关注策略'), secondStrategy.id);
     await screen.findByText('已忽略');
     await screen.findByText(/财报窗口内先忽略/);
+  });
+
+  it('switches market tabs, board modes, and current-market search on the market page', async () => {
+    const user = userEvent.setup();
+    renderWithQueryClient(React.createElement(MarketPage));
+
+    await screen.findByRole('tab', { name: '美股' });
+    await screen.findByRole('tab', { name: '港股' });
+    await screen.findByRole('button', { name: '全部' });
+    await screen.findByRole('button', { name: '涨幅榜' });
+    await screen.findByRole('button', { name: '跌幅榜' });
+
+    expect(await screen.findByText('美股市场')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /选择股票/ })[0]?.textContent ?? '').toContain('AAPL');
+
+    await user.click(screen.getByRole('button', { name: '涨幅榜' }));
+    const usCards = screen.getAllByRole('button', { name: /选择股票/ });
+    expect(usCards[0]?.textContent ?? '').toContain('AAPL');
+
+    await user.click(screen.getByRole('tab', { name: '港股' }));
+    expect(await screen.findByText('港股市场')).toBeTruthy();
+
+    await user.click(screen.getByRole('button', { name: '跌幅榜' }));
+    const hkCards = screen.getAllByRole('button', { name: /选择股票/ });
+    expect(hkCards[0]?.textContent ?? '').toContain('0941.HK');
+
+    const searchInput = screen.getByPlaceholderText('搜索代码 (例如: AAPL)');
+    await user.clear(searchInput);
+    await user.type(searchInput, 'ten');
+
+    await waitFor(() => {
+      expect(apiMocks.searchSymbols).toHaveBeenCalledWith('ten');
+    });
+    const tencentMatches = await screen.findAllByText('Tencent Holdings');
+    expect(tencentMatches.length).toBeGreaterThan(0);
+    expect(screen.queryByText('Apple Inc.')).toBeNull();
+
+    const searchResultRow = tencentMatches[0]?.closest('div[class*="cursor-pointer"]');
+    expect(searchResultRow).not.toBeNull();
+    fireEvent.mouseDown(searchResultRow as HTMLDivElement);
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '0700.HK' })).toBeTruthy();
+    });
+    expect(screen.getByTestId('market-data-widget').textContent ?? '').toContain('0700.HK');
   });
 });

@@ -192,9 +192,14 @@ export const marketDataApi = {
   },
 
   // 获取市场标的列表
-  getMarketList: async (exchange?: string, country?: string, type?: string): Promise<any> => {
+  getMarketList: async (
+    market?: 'US' | 'HK',
+    exchange?: string,
+    country?: string,
+    type?: string
+  ): Promise<any> => {
     return api.get('/v1/market-data/list', {
-      params: { exchange, country, instrument_type: type }
+      params: { market, exchange, country, instrument_type: type }
     });
   },
 };
