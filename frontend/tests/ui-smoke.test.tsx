@@ -368,6 +368,22 @@ const pendingReviewTwo = {
   updated_at: '2026-04-02T04:05:00Z',
 };
 
+const confirmedReview = {
+  ...pendingReviewOne,
+  id: 'review-101',
+  status: 'confirmed',
+  user_note: '已确认并等待人工下单',
+  updated_at: '2026-04-02T05:00:00Z',
+};
+
+const ignoredReview = {
+  ...pendingReviewTwo,
+  id: 'review-102',
+  status: 'ignored',
+  user_note: '财报窗口内先忽略',
+  updated_at: '2026-04-02T05:05:00Z',
+};
+
 function renderWithQueryClient(ui: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -403,7 +419,17 @@ describe('UI smoke', () => {
     apiMocks.refreshStrategySignal.mockImplementation(async (strategyId: string) =>
       strategyId === secondStrategy.id ? refreshedSecondSignalSnapshot : latestSignalSnapshot
     );
-    apiMocks.listSignalReviews.mockResolvedValue([pendingReviewOne, pendingReviewTwo]);
+    apiMocks.listSignalReviews.mockImplementation(async (filters?: { status?: string }) => {
+      switch (filters?.status) {
+        case 'confirmed':
+          return [confirmedReview];
+        case 'ignored':
+          return [ignoredReview];
+        case 'pending':
+        default:
+          return [pendingReviewOne, pendingReviewTwo];
+      }
+    });
     apiMocks.confirmSignalReview.mockResolvedValue(pendingReviewOne);
     apiMocks.ignoreSignalReview.mockResolvedValue(pendingReviewTwo);
     apiMocks.updateSignalReviewNote.mockResolvedValue(pendingReviewTwo);
@@ -577,5 +603,20 @@ describe('UI smoke', () => {
     await waitFor(() => {
       expect(apiMocks.ignoreSignalReview).toHaveBeenCalledWith(pendingReviewTwo.id);
     });
+
+    await screen.findByText('已处理信号历史');
+    await screen.findByText('已确认');
+    await screen.findByText(/已确认并等待人工下单/);
+
+    expect(apiMocks.listSignalReviews).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'confirmed' })
+    );
+    expect(apiMocks.listSignalReviews).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'ignored' })
+    );
+
+    await user.selectOptions(screen.getByLabelText('当前关注策略'), secondStrategy.id);
+    await screen.findByText('已忽略');
+    await screen.findByText(/财报窗口内先忽略/);
   });
 });

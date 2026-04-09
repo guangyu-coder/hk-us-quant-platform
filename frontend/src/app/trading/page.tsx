@@ -99,11 +99,36 @@ export default function TradingPage() {
   });
   const signalReviews = signalReviewsData ?? EMPTY_SIGNAL_REVIEWS;
 
+  const {
+    data: confirmedReviewsData,
+    isError: isConfirmedReviewError,
+    error: confirmedReviewError,
+  } = useQuery({
+    queryKey: ['signal-review-history', 'confirmed'],
+    queryFn: () => signalApi.listSignalReviews({ status: 'confirmed', limit: 12 }),
+    enabled: trackedStrategies.length > 0,
+    staleTime: 10000,
+  });
+  const confirmedReviews = confirmedReviewsData ?? EMPTY_SIGNAL_REVIEWS;
+
+  const {
+    data: ignoredReviewsData,
+    isError: isIgnoredReviewError,
+    error: ignoredReviewError,
+  } = useQuery({
+    queryKey: ['signal-review-history', 'ignored'],
+    queryFn: () => signalApi.listSignalReviews({ status: 'ignored', limit: 12 }),
+    enabled: trackedStrategies.length > 0,
+    staleTime: 10000,
+  });
+  const ignoredReviews = ignoredReviewsData ?? EMPTY_SIGNAL_REVIEWS;
+
   const refreshSignalMutation = useMutation({
     mutationFn: (strategyId: string) => signalApi.refreshStrategySignal(strategyId),
     onSuccess: async () => {
       await refetchSignalReviews();
       queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+      queryClient.invalidateQueries({ queryKey: ['signal-review-history'] });
     },
   });
 
@@ -114,6 +139,7 @@ export default function TradingPage() {
         current.filter((review) => review.id !== reviewId)
       );
       queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+      queryClient.invalidateQueries({ queryKey: ['signal-review-history'] });
     },
   });
 
@@ -124,6 +150,7 @@ export default function TradingPage() {
         current.filter((review) => review.id !== reviewId)
       );
       queryClient.invalidateQueries({ queryKey: ['strategy-state-overview'] });
+      queryClient.invalidateQueries({ queryKey: ['signal-review-history'] });
     },
   });
 
@@ -341,6 +368,16 @@ export default function TradingPage() {
     }));
   }, [focusedStrategyId, signalReviews]);
 
+  const processedReviewCards = useMemo(() => {
+    return [...confirmedReviews, ...ignoredReviews]
+      .filter((review) => !focusedStrategyId || review.strategy_id === focusedStrategyId)
+      .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
+      .map((review) => ({
+        review,
+        focused: review.strategy_id === focusedStrategyId,
+      }));
+  }, [confirmedReviews, focusedStrategyId, ignoredReviews]);
+
   useEffect(() => {
     if (signalReviews.length === 0) {
       return;
@@ -360,6 +397,35 @@ export default function TradingPage() {
   const signalReviewErrorMessage = isSignalReviewError
     ? getApiErrorMessage(signalReviewError, '待处理信号队列加载失败')
     : null;
+
+  const processedReviewErrorMessage = isConfirmedReviewError || isIgnoredReviewError
+    ? getApiErrorMessage(confirmedReviewError ?? ignoredReviewError, '已处理信号历史加载失败')
+    : null;
+
+  const getReviewStatusLabel = (status: string): string => {
+    switch (status) {
+      case 'confirmed':
+        return '已确认';
+      case 'ignored':
+        return '已忽略';
+      case 'pending':
+        return '待处理';
+      default:
+        return status;
+    }
+  };
+
+  const getReviewStatusBadgeClass = (status: string): string => {
+    switch (status) {
+      case 'confirmed':
+        return 'bg-emerald-100 text-emerald-900';
+      case 'ignored':
+        return 'bg-slate-100 text-slate-700';
+      case 'pending':
+      default:
+        return 'bg-amber-100 text-amber-900';
+    }
+  };
 
   const getLifecycleStep = (order: Order): string => {
     switch (order.status) {
@@ -977,6 +1043,74 @@ export default function TradingPage() {
           {signalReviewCards.length === 0 && (
             <div className="rounded-2xl border border-dashed border-amber-200 bg-white/80 p-6 text-sm text-slate-500">
               当前没有待处理信号，人工确认边界依旧保留。可以点击右上角刷新当前策略，重新生成最新队列。
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-slate-200 bg-white shadow">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 px-6 py-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-900">已处理信号历史</h3>
+            <p className="mt-1 text-sm text-slate-500">
+              展示最近已确认和已忽略的信号留痕，方便复盘人工处理结果。当前会跟随上方关注策略过滤。
+            </p>
+          </div>
+          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+            {processedReviewCards.length} 条历史
+          </span>
+        </div>
+
+        {processedReviewErrorMessage && (
+          <div className="border-b border-rose-100 bg-rose-50 px-6 py-3 text-sm text-rose-900">
+            已处理信号历史加载失败: {processedReviewErrorMessage}
+          </div>
+        )}
+
+        <div className="grid gap-4 p-6 lg:grid-cols-2 xl:grid-cols-3">
+          {processedReviewCards.map(({ review, focused }) => (
+            <div
+              key={review.id}
+              className={`rounded-2xl border p-4 ${focused ? 'border-sky-300 bg-sky-50/50' : 'border-slate-200 bg-slate-50'}`}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h4 className="text-base font-semibold text-slate-900">
+                    {review.strategy_name || review.strategy_id}
+                  </h4>
+                  <p className="mt-1 font-mono text-xs text-slate-500">{review.strategy_id}</p>
+                </div>
+                <span className={`rounded-full px-3 py-1 text-xs font-medium ${getReviewStatusBadgeClass(review.status)}`}>
+                  {getReviewStatusLabel(review.status)}
+                </span>
+              </div>
+
+              <div className="mt-4 space-y-2 text-sm text-slate-700">
+                <div className="flex items-center justify-between gap-3">
+                  <span>{review.symbol ?? '暂无标的'}</span>
+                  <span className="rounded-full bg-white px-2 py-1 text-xs text-slate-600">
+                    {review.timeframe ?? '暂无周期'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span>{getReviewDirectionLabel(review)}</span>
+                  <span>{formatSignalStrength(review.strength ?? null)}</span>
+                </div>
+                <div className="text-xs text-slate-500">
+                  处理时间: {formatCompactDateTime(review.updated_at)}
+                </div>
+                <div className="text-xs text-slate-500">来源: {review.source}</div>
+                <div className="text-xs text-slate-500">{review.note}</div>
+                <div className="rounded-lg bg-white px-3 py-2 text-xs text-slate-700">
+                  备注: {review.user_note || '暂无备注'}
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {processedReviewCards.length === 0 && !processedReviewErrorMessage && (
+            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6 text-sm text-slate-500">
+              当前还没有已处理的信号历史。等你确认或忽略过信号后，这里会保留最近留痕。
             </div>
           )}
         </div>
