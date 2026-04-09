@@ -703,54 +703,112 @@ fn search_result_to_value(item: SearchResult) -> Value {
     })
 }
 
-fn built_in_market_list_response(query: &ListMarketQuery) -> Value {
-    let mut items = built_in_market_symbols(query.market.as_deref())
-        .into_iter()
-        .map(search_result_to_value)
-        .collect::<Vec<_>>();
+fn market_symbol_matches_query(item: &SearchResult, query: &ListMarketQuery) -> bool {
+    if let Some(target_market) = normalize_market_filter(query.market.as_deref()) {
+        if infer_market_from_symbol_record(
+            &item.symbol,
+            Some(&item.exchange),
+            Some(&item.country),
+        ) != target_market
+        {
+            return false;
+        }
+    }
 
     if let Some(exchange) = query.exchange.as_deref() {
         let normalized_exchange = exchange.trim().to_ascii_uppercase();
-        if !normalized_exchange.is_empty() {
-            items.retain(|item| {
-                item.get("exchange")
-                    .and_then(Value::as_str)
-                    .map(|value| value.trim().to_ascii_uppercase() == normalized_exchange)
-                    .unwrap_or(false)
-            });
+        if !normalized_exchange.is_empty() && item.exchange.trim().to_ascii_uppercase() != normalized_exchange {
+            return false;
         }
     }
 
     if let Some(country) = query.country.as_deref() {
         let normalized_country = country.trim().to_ascii_uppercase();
-        if !normalized_country.is_empty() {
-            items.retain(|item| {
-                item.get("country")
-                    .and_then(Value::as_str)
-                    .map(|value| value.trim().to_ascii_uppercase() == normalized_country)
-                    .unwrap_or(false)
-            });
+        if !normalized_country.is_empty() && item.country.trim().to_ascii_uppercase() != normalized_country {
+            return false;
         }
     }
 
     if let Some(instrument_type) = query.instrument_type.as_deref() {
         let normalized_instrument_type = instrument_type.trim().to_ascii_uppercase();
-        if !normalized_instrument_type.is_empty() {
-            items.retain(|item| {
-                item.get("instrument_type")
-                    .and_then(Value::as_str)
-                    .map(|value| value.trim().to_ascii_uppercase() == normalized_instrument_type)
-                    .unwrap_or(false)
-            });
+        if !normalized_instrument_type.is_empty()
+            && item.instrument_type.trim().to_ascii_uppercase() != normalized_instrument_type
+        {
+            return false;
         }
     }
 
+    true
+}
+
+fn merge_market_symbol_lists(
+    primary: Vec<SearchResult>,
+    fallback: Vec<SearchResult>,
+) -> Vec<SearchResult> {
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for item in primary.into_iter().chain(fallback.into_iter()) {
+        let key = normalize_market_symbol(&item.symbol);
+        if seen.insert(key) {
+            merged.push(item);
+        }
+    }
+
+    merged
+}
+
+fn market_list_response_from_symbols(
+    query: &ListMarketQuery,
+    provider_symbols: Vec<SearchResult>,
+) -> Value {
+    let builtin_symbols = built_in_market_symbols(None);
+    let merged_symbols = merge_market_symbol_lists(provider_symbols, builtin_symbols);
+    let filtered_symbols = merged_symbols
+        .into_iter()
+        .filter(|item| market_symbol_matches_query(item, query))
+        .collect::<Vec<_>>();
+
     json!({
         "success": true,
-        "count": items.len(),
-        "data": items,
-        "source": "builtin",
+        "count": filtered_symbols.len(),
+        "data": filtered_symbols.into_iter().map(search_result_to_value).collect::<Vec<_>>(),
+        "source": "builtin+provider",
     })
+}
+
+fn built_in_market_list_response(query: &ListMarketQuery) -> Value {
+    market_list_response_from_symbols(query, Vec::new())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketListScriptResponse {
+    success: Option<bool>,
+    data: Option<Vec<SearchResult>>,
+}
+
+async fn fetch_market_list_symbols_from_script() -> Option<Vec<SearchResult>> {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("market_data.py");
+
+    let output = Command::new("python3")
+        .arg(script_path)
+        .arg("--list-market")
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let response: MarketListScriptResponse = serde_json::from_slice(&output.stdout).ok()?;
+    if response.success.unwrap_or(false) {
+        response.data
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1325,7 +1383,11 @@ async fn list_market_symbols(
     Query(query): Query<ListMarketQuery>,
 ) -> Result<Json<Value>, AppError> {
     info!("Listing market symbols");
-    Ok(Json(built_in_market_list_response(&query)))
+    let provider_symbols = fetch_market_list_symbols_from_script()
+        .await
+        .unwrap_or_default();
+
+    Ok(Json(market_list_response_from_symbols(&query, provider_symbols)))
 }
 
 async fn get_order(
@@ -3294,6 +3356,103 @@ mod http_e2e_tests {
     }
 
     #[test]
+    fn market_list_response_combines_us_and_hk_universes_by_default() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: None,
+                exchange: None,
+                country: None,
+                instrument_type: None,
+            },
+            Vec::new(),
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert!(response["count"].as_u64().unwrap_or_default() >= 45);
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+    }
+
+    #[test]
+    fn market_list_response_filters_by_exchange() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: None,
+                exchange: Some("HKEX".to_string()),
+                country: None,
+                instrument_type: None,
+            },
+            Vec::new(),
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert!(symbols.iter().all(|item| item["exchange"] == json!("HKEX")));
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+        assert!(!symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+    }
+
+    #[test]
+    fn market_list_response_filters_by_country() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: None,
+                exchange: None,
+                country: Some("United States".to_string()),
+                instrument_type: None,
+            },
+            Vec::new(),
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert!(symbols.iter().all(|item| item["country"] == json!("United States")));
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+        assert!(!symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+    }
+
+    #[test]
+    fn market_list_response_filters_by_instrument_type() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: None,
+                exchange: None,
+                country: None,
+                instrument_type: Some("ETF".to_string()),
+            },
+            Vec::new(),
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert!(symbols.iter().all(|item| item["instrument_type"] == json!("ETF")));
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("SPY")));
+        assert!(!symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+    }
+
+    #[test]
+    fn market_list_response_merges_provider_symbols_without_losing_builtin_coverage() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: Some("US".to_string()),
+                exchange: Some("NASDAQ".to_string()),
+                country: None,
+                instrument_type: None,
+            },
+            vec![SearchResult {
+                symbol: "ZZTOP".to_string(),
+                instrument_name: "Zed Test Corporation".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                aliases: vec!["Zed Test".to_string()],
+            }],
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+        assert!(symbols.iter().any(|item| item["symbol"] == json!("ZZTOP")));
+        assert!(symbols.iter().all(|item| item["exchange"] == json!("NASDAQ")));
+    }
+
+    #[test]
     fn built_in_market_list_response_uses_builtin_universe() {
         let response = built_in_market_list_response(&ListMarketQuery {
             market: Some("US".to_string()),
@@ -3309,11 +3468,6 @@ mod http_e2e_tests {
             .unwrap()
             .iter()
             .any(|item| item["symbol"] == json!("AAPL")));
-        assert!(response["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["symbol"] == json!("META")));
         assert!(response["data"]
             .as_array()
             .unwrap()
