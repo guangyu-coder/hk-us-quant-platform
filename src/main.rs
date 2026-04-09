@@ -180,6 +180,56 @@ fn is_hk_symbol(symbol: &str) -> bool {
     normalized.ends_with(".HK")
 }
 
+fn normalize_market_filter(market: Option<&str>) -> Option<&'static str> {
+    match market.unwrap_or_default().trim().to_ascii_uppercase().as_str() {
+        "HK" | "HONG KONG" | "HKEX" => Some("HK"),
+        "US" | "USA" | "UNITED STATES" | "UNITED STATES OF AMERICA" => Some("US"),
+        _ => None,
+    }
+}
+
+fn infer_market_from_symbol_record(
+    symbol: &str,
+    exchange: Option<&str>,
+    country: Option<&str>,
+) -> &'static str {
+    let normalized_symbol = normalize_market_symbol(symbol);
+    let exchange = exchange.unwrap_or_default().trim().to_ascii_uppercase();
+    let country = country.unwrap_or_default().trim().to_ascii_uppercase();
+
+    let is_hk = normalized_symbol.ends_with(".HK")
+        || exchange.contains("HK")
+        || exchange.contains("HONG KONG")
+        || exchange.contains("HKEX")
+        || country.contains("HONG KONG");
+
+    if is_hk {
+        "HK"
+    } else {
+        "US"
+    }
+}
+
+fn filter_market_symbol_items(items: &[Value], market: Option<&str>) -> Vec<Value> {
+    let Some(target_market) = normalize_market_filter(market) else {
+        return items.to_vec();
+    };
+
+    items
+        .iter()
+        .filter(|item| {
+            let symbol = item
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let exchange = item.get("exchange").and_then(Value::as_str);
+            let country = item.get("country").and_then(Value::as_str);
+            infer_market_from_symbol_record(symbol, exchange, country) == target_market
+        })
+        .cloned()
+        .collect()
+}
+
 fn market_currency_for_symbol(symbol: &str) -> &'static str {
     if is_hk_symbol(symbol) {
         "HKD"
@@ -235,6 +285,7 @@ pub struct SearchSymbolQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListMarketQuery {
+    pub market: Option<String>,
     pub exchange: Option<String>,
     pub country: Option<String>,
     pub instrument_type: Option<String>,
@@ -836,7 +887,7 @@ async fn list_market_symbols(
         })));
     }
 
-    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+    let mut data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         info!(
             "List market response parse failed: {}. Returning fallback response.",
             e
@@ -849,6 +900,16 @@ async fn list_market_symbols(
             "source": "fallback"
         })
     });
+
+    if let Some(target_market) = normalize_market_filter(query.market.as_deref()) {
+        if let Some(items) = data.get("data").and_then(Value::as_array) {
+            let filtered = filter_market_symbol_items(items, Some(target_market));
+            if let Some(object) = data.as_object_mut() {
+                object.insert("data".to_string(), json!(filtered));
+                object.insert("count".to_string(), json!(filtered.len()));
+            }
+        }
+    }
 
     Ok(Json(data))
 }
@@ -2701,6 +2762,60 @@ mod http_e2e_tests {
         );
         assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
         assert_ne!(response["confirmation_state"], json!("auto_execute"));
+    }
+
+    #[test]
+    fn market_symbol_classification_recognizes_hk_and_us_records() {
+        assert_eq!(
+            infer_market_from_symbol_record("0700.HK", Some("HKEX"), Some("Hong Kong")),
+            "HK"
+        );
+        assert_eq!(
+            infer_market_from_symbol_record("AAPL", Some("NASDAQ"), Some("United States")),
+            "US"
+        );
+        assert_eq!(
+            infer_market_from_symbol_record("0005", Some("Hong Kong"), Some("Hong Kong")),
+            "HK"
+        );
+        assert_eq!(infer_market_from_symbol_record("TSLA", None, None), "US");
+    }
+
+    #[test]
+    fn market_symbol_filter_applies_normalized_market_query() {
+        let items = vec![
+            json!({
+                "symbol": "AAPL",
+                "exchange": "NASDAQ",
+                "country": "United States"
+            }),
+            json!({
+                "symbol": "0700.HK",
+                "exchange": "HKEX",
+                "country": "Hong Kong"
+            }),
+            json!({
+                "symbol": "ZZZZ",
+                "exchange": Value::Null,
+                "country": Value::Null
+            }),
+        ];
+
+        let hk_items = filter_market_symbol_items(&items, Some("hk"));
+        assert_eq!(hk_items.len(), 1);
+        assert_eq!(hk_items[0]["symbol"], json!("0700.HK"));
+
+        let us_items = filter_market_symbol_items(&items, Some("US"));
+        assert_eq!(us_items.len(), 2);
+        assert_eq!(us_items[0]["symbol"], json!("AAPL"));
+        assert_eq!(us_items[1]["symbol"], json!("ZZZZ"));
+    }
+
+    #[test]
+    fn market_filter_normalization_accepts_case_insensitive_values() {
+        assert_eq!(normalize_market_filter(Some("us")), Some("US"));
+        assert_eq!(normalize_market_filter(Some("HK")), Some("HK"));
+        assert_eq!(normalize_market_filter(Some("eur")), None);
     }
 
     #[test]
