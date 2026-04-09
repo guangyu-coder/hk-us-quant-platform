@@ -774,5 +774,24 @@ describe('UI smoke', () => {
       expect(screen.getByRole('heading', { name: '0700.HK' })).toBeTruthy();
     });
     expect(screen.getByTestId('market-data-widget').textContent ?? '').toContain('0700.HK');
+
+    await user.type(screen.getByLabelText('最小涨跌幅'), '5');
+    await waitFor(() => {
+      const cards = screen.getAllByRole('button', { name: /选择股票/ });
+      expect(cards[0]?.textContent ?? '').toContain('0700.HK');
+      expect(screen.queryByText('China Mobile')).toBeNull();
+    });
+
+    await user.clear(screen.getByLabelText('最小涨跌幅'));
+    await user.type(screen.getByLabelText('最大涨跌幅'), '-3');
+    await waitFor(() => {
+      const cards = screen.getAllByRole('button', { name: /选择股票/ });
+      expect(cards[0]?.textContent ?? '').toContain('0941.HK');
+    });
+
+    await user.clear(screen.getByLabelText('最大涨跌幅'));
+    await user.type(screen.getByLabelText('最小涨跌幅'), '5');
+    await user.type(screen.getByLabelText('最大涨跌幅'), '1');
+    expect(await screen.findByText('最小涨跌幅不能大于最大涨跌幅')).toBeTruthy();
   });
 });

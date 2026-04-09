@@ -8,9 +8,12 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { Search, Loader2, TrendingUp, TrendingDown, RefreshCw } from 'lucide-react';
 import type { MarketData, MarketDataMeta, MarketQuoteResult } from '@/types';
 import {
+  filterStocksByChangePercentRange,
   filterSearchResultsByMarket,
+  getChangePercentRangeError,
   sortStocksByBoardMode,
   type BoardMode,
+  type ChangePercentRange,
   type MarketTab,
 } from './market-page-helpers';
 
@@ -88,6 +91,15 @@ const formatChartLabel = (timestamp: string): string => {
     minute: '2-digit',
     hour12: false,
   });
+};
+
+const parseOptionalNumber = (value: string): number | null => {
+  if (!value.trim()) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 };
 
 const getHistoryParams = (selectedTimeframe: string) => {
@@ -204,6 +216,8 @@ export default function MarketPage() {
   const [chartMeta, setChartMeta] = useState<MarketDataMeta | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const [minChangePercentInput, setMinChangePercentInput] = useState('');
+  const [maxChangePercentInput, setMaxChangePercentInput] = useState('');
   
   // 搜索相关状态
   const [searchQuery, setSearchQuery] = useState('');
@@ -534,7 +548,15 @@ export default function MarketPage() {
   );
   const isPositive = selectedMarketData ? selectedMarketData.change >= 0 : true;
   const quoteMeta = selectedQuote?.meta;
-  const displayedStocks = sortStocksByBoardMode(marketStocks, selectedBoardMode);
+  const changePercentRange: ChangePercentRange = {
+    min: parseOptionalNumber(minChangePercentInput),
+    max: parseOptionalNumber(maxChangePercentInput),
+  };
+  const changePercentRangeError = getChangePercentRangeError(changePercentRange);
+  const displayedStocks = filterStocksByChangePercentRange(
+    sortStocksByBoardMode(marketStocks, selectedBoardMode),
+    changePercentRange
+  );
   const marketLabel = selectedMarket === 'US' ? '美股市场' : '港股市场';
   const boardOptions: Array<{ value: BoardMode; label: string }> = [
     { value: 'all', label: '全部' },
@@ -811,6 +833,47 @@ export default function MarketPage() {
                 </button>
               ))}
             </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+              <label className="text-xs text-muted-foreground">
+                最小涨跌幅
+                <input
+                  aria-label="最小涨跌幅"
+                  type="number"
+                  value={minChangePercentInput}
+                  onChange={(e) => setMinChangePercentInput(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="例如 5"
+                />
+              </label>
+              <label className="text-xs text-muted-foreground">
+                最大涨跌幅
+                <input
+                  aria-label="最大涨跌幅"
+                  type="number"
+                  value={maxChangePercentInput}
+                  onChange={(e) => setMaxChangePercentInput(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="例如 -5"
+                />
+              </label>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMinChangePercentInput('');
+                setMaxChangePercentInput('');
+              }}
+              className="mb-4 text-xs text-muted-foreground hover:text-foreground"
+            >
+              重置筛选
+            </button>
+
+            {changePercentRangeError && (
+              <div className="mb-4 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                {changePercentRangeError}
+              </div>
+            )}
             
             {loading ? (
               <div className="space-y-4">
@@ -862,7 +925,7 @@ export default function MarketPage() {
               </div>
             ) : (
               <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
-                当前市场暂无可展示股票
+                {marketStocks.length === 0 ? '当前市场暂无可展示股票' : '当前筛选下暂无股票'}
               </div>
             )}
           </div>
