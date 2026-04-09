@@ -692,6 +692,67 @@ fn built_in_market_symbols(market: Option<&str>) -> Vec<SearchResult> {
     }
 }
 
+fn search_result_to_value(item: SearchResult) -> Value {
+    json!({
+        "symbol": item.symbol,
+        "instrument_name": item.instrument_name,
+        "exchange": item.exchange,
+        "country": item.country,
+        "instrument_type": item.instrument_type,
+        "aliases": item.aliases,
+    })
+}
+
+fn built_in_market_list_response(query: &ListMarketQuery) -> Value {
+    let mut items = built_in_market_symbols(query.market.as_deref())
+        .into_iter()
+        .map(search_result_to_value)
+        .collect::<Vec<_>>();
+
+    if let Some(exchange) = query.exchange.as_deref() {
+        let normalized_exchange = exchange.trim().to_ascii_uppercase();
+        if !normalized_exchange.is_empty() {
+            items.retain(|item| {
+                item.get("exchange")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().to_ascii_uppercase() == normalized_exchange)
+                    .unwrap_or(false)
+            });
+        }
+    }
+
+    if let Some(country) = query.country.as_deref() {
+        let normalized_country = country.trim().to_ascii_uppercase();
+        if !normalized_country.is_empty() {
+            items.retain(|item| {
+                item.get("country")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().to_ascii_uppercase() == normalized_country)
+                    .unwrap_or(false)
+            });
+        }
+    }
+
+    if let Some(instrument_type) = query.instrument_type.as_deref() {
+        let normalized_instrument_type = instrument_type.trim().to_ascii_uppercase();
+        if !normalized_instrument_type.is_empty() {
+            items.retain(|item| {
+                item.get("instrument_type")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().to_ascii_uppercase() == normalized_instrument_type)
+                    .unwrap_or(false)
+            });
+        }
+    }
+
+    json!({
+        "success": true,
+        "count": items.len(),
+        "data": items,
+        "source": "builtin",
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchMarketDataRequest {
     pub symbols: Vec<String>,
@@ -1264,83 +1325,7 @@ async fn list_market_symbols(
     Query(query): Query<ListMarketQuery>,
 ) -> Result<Json<Value>, AppError> {
     info!("Listing market symbols");
-
-    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("market_data.py");
-
-    let mut cmd = Command::new("python3");
-    cmd.arg(script_path).arg("--list-market");
-
-    if let Some(exchange) = query.exchange {
-        cmd.arg("--exchange").arg(exchange);
-    }
-    if let Some(country) = query.country {
-        cmd.arg("--country").arg(country);
-    }
-    if let Some(itype) = query.instrument_type {
-        cmd.arg("--type").arg(itype);
-    }
-
-    let output = cmd.output().await;
-
-    let output = match output {
-        Ok(output) => output,
-        Err(e) => {
-            info!(
-                "List market script execution failed: {}. Returning fallback response.",
-                e
-            );
-            return Ok(Json(json!({
-                "success": false,
-                "count": 0,
-                "data": [],
-                "error": format!("market list unavailable: {}", e),
-                "source": "fallback"
-            })));
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        info!(
-            "List market script failed: {}. Returning fallback response.",
-            stderr
-        );
-        return Ok(Json(json!({
-            "success": false,
-            "count": 0,
-            "data": [],
-            "error": format!("market list unavailable: {}", stderr),
-            "source": "fallback"
-        })));
-    }
-
-    let mut data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        info!(
-            "List market response parse failed: {}. Returning fallback response.",
-            e
-        );
-        json!({
-            "success": false,
-            "count": 0,
-            "data": [],
-            "error": format!("invalid market list response: {}", e),
-            "source": "fallback"
-        })
-    });
-
-    if let Some(target_market) = normalize_market_filter(query.market.as_deref()) {
-        if let Some(items) = data.get("data").and_then(Value::as_array) {
-            let filtered = filter_market_symbol_items(items, Some(target_market));
-            if let Some(object) = data.as_object_mut() {
-                object.insert("data".to_string(), json!(filtered));
-                object.insert("count".to_string(), json!(filtered.len()));
-            }
-        }
-    }
-
-    Ok(Json(data))
+    Ok(Json(built_in_market_list_response(&query)))
 }
 
 async fn get_order(
@@ -3276,6 +3261,64 @@ mod http_e2e_tests {
         assert!(hk_symbols.iter().any(|item| item.symbol == "0700.HK"));
         assert!(hk_symbols.iter().any(|item| item.symbol == "9988.HK"));
         assert!(hk_symbols.iter().all(|item| item.symbol.ends_with(".HK")));
+    }
+
+    #[test]
+    fn market_symbol_list_includes_plan_required_us_and_hk_tickers() {
+        let us_symbols = built_in_market_symbols(Some("US"));
+        let hk_symbols = built_in_market_symbols(Some("HK"));
+
+        let required_us = [
+            "AAPL", "AMZN", "GOOGL", "MSFT", "NVDA", "TSLA", "META", "NFLX", "AMD", "INTC", "CRM",
+            "ORCL", "ADBE", "QCOM", "AVGO", "JPM", "BAC", "WFC", "GS", "V", "MA", "KO", "PEP",
+            "MCD", "DIS", "NKE", "COST", "WMT", "SPY", "QQQ", "DIA", "IWM",
+        ];
+        let required_hk = [
+            "0001.HK", "0005.HK", "0011.HK", "0388.HK", "0700.HK", "0939.HK", "0941.HK", "1299.HK",
+            "1398.HK", "2318.HK", "2388.HK", "2628.HK", "3690.HK", "3988.HK", "9988.HK",
+        ];
+
+        for ticker in required_us {
+            assert!(
+                us_symbols.iter().any(|item| item.symbol == ticker),
+                "missing US ticker {ticker}"
+            );
+        }
+
+        for ticker in required_hk {
+            assert!(
+                hk_symbols.iter().any(|item| item.symbol == ticker),
+                "missing HK ticker {ticker}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_market_list_response_uses_builtin_universe() {
+        let response = built_in_market_list_response(&ListMarketQuery {
+            market: Some("US".to_string()),
+            exchange: None,
+            country: None,
+            instrument_type: None,
+        });
+
+        assert_eq!(response["success"], json!(true));
+        assert!(response["count"].as_u64().unwrap_or_default() >= 25);
+        assert!(response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["symbol"] == json!("AAPL")));
+        assert!(response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["symbol"] == json!("META")));
+        assert!(response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["symbol"].as_str().unwrap_or_default().ends_with(".HK") == false));
     }
 
     #[test]
