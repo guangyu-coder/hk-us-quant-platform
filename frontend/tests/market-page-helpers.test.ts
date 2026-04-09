@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   filterSearchResultsByMarket,
+  filterStocksByChangePercentRange,
   inferMarketFromSearchResult,
+  getChangePercentRangeError,
   sortStocksByBoardMode,
 } from '../src/app/market/market-page-helpers.ts';
 
@@ -53,4 +55,41 @@ test('market helpers sort gainers and losers by same day change percent', () => 
     ['A', 'C', 'B']
   );
   assert.deepEqual(sortStocksByBoardMode(stocks, 'all').map((item) => item.symbol), ['A', 'B', 'C', 'D']);
+});
+
+test('filters stocks by minimum and maximum daily change percent', () => {
+  const stocks = [
+    { symbol: 'AAPL', changePercent: 6.2 },
+    { symbol: 'TSLA', changePercent: -4.5 },
+    { symbol: 'MSFT', changePercent: 1.1 },
+  ];
+
+  const filtered = filterStocksByChangePercentRange(stocks, { min: -1, max: 5 });
+
+  assert.deepEqual(
+    filtered.map((item) => item.symbol),
+    ['MSFT']
+  );
+});
+
+test('accepts open-ended change percent ranges', () => {
+  const stocks = [
+    { symbol: 'AAPL', changePercent: 6.2 },
+    { symbol: 'TSLA', changePercent: -4.5 },
+    { symbol: 'MSFT', changePercent: 1.1 },
+  ];
+
+  assert.deepEqual(
+    filterStocksByChangePercentRange(stocks, { min: 5 }).map((item) => item.symbol),
+    ['AAPL']
+  );
+  assert.deepEqual(
+    filterStocksByChangePercentRange(stocks, { max: -3 }).map((item) => item.symbol),
+    ['TSLA']
+  );
+});
+
+test('detects invalid change percent ranges', () => {
+  assert.equal(getChangePercentRangeError({ min: 5, max: -1 }), '最小涨跌幅不能大于最大涨跌幅');
+  assert.equal(getChangePercentRangeError({ min: -3, max: 5 }), null);
 });

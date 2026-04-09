@@ -1,5 +1,9 @@
 export type MarketTab = 'US' | 'HK';
 export type BoardMode = 'all' | 'gainers' | 'losers';
+export type ChangePercentRange = {
+  min?: number | null;
+  max?: number | null;
+};
 
 type MarketLike = {
   symbol?: string | null;
@@ -30,6 +34,47 @@ export const inferMarketFromSearchResult = (item: MarketLike): MarketTab => {
 
 export const filterSearchResultsByMarket = <T extends MarketLike>(items: T[], market: MarketTab): T[] =>
   items.filter((item) => inferMarketFromSearchResult(item) === market);
+
+export const getChangePercentRangeError = (range: ChangePercentRange): string | null => {
+  if (
+    typeof range.min === 'number' &&
+    typeof range.max === 'number' &&
+    Number.isFinite(range.min) &&
+    Number.isFinite(range.max) &&
+    range.min > range.max
+  ) {
+    return '最小涨跌幅不能大于最大涨跌幅';
+  }
+
+  return null;
+};
+
+export const filterStocksByChangePercentRange = <T extends StockLike>(
+  items: T[],
+  range: ChangePercentRange
+): T[] => {
+  if (getChangePercentRangeError(range)) {
+    return items;
+  }
+
+  return items.filter((item) => {
+    if (!Number.isFinite(item.changePercent)) {
+      return false;
+    }
+
+    const value = item.changePercent ?? 0;
+
+    if (typeof range.min === 'number' && Number.isFinite(range.min) && value < range.min) {
+      return false;
+    }
+
+    if (typeof range.max === 'number' && Number.isFinite(range.max) && value > range.max) {
+      return false;
+    }
+
+    return true;
+  });
+};
 
 export const sortStocksByBoardMode = <T extends StockLike>(items: T[], mode: BoardMode): T[] => {
   if (mode === 'all') {
