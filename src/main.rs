@@ -42,12 +42,12 @@ use crate::execution::ExecutionService;
 use crate::portfolio::{PortfolioExecutionHandler, PortfolioService};
 use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
-use crate::strategy::StrategyService;
 use crate::strategy::build_latest_strategy_signal_snapshot;
+use crate::strategy::StrategyService;
 use crate::types::{
-    BacktestExperimentMetadata, BacktestResult, ExecutionTrade, OrderSide, OrderStatus, OrderType,
-    MarketData, RiskLimits, StrategyConfig, StrategyExecutionOverview, StrategyLatestBacktestSummary,
-    SignalReviewRecord, StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
+    BacktestExperimentMetadata, BacktestResult, ExecutionTrade, MarketData, OrderSide, OrderStatus,
+    OrderType, RiskLimits, SignalReviewRecord, StrategyConfig, StrategyExecutionOverview,
+    StrategyLatestBacktestSummary, StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
     StrategySignalSnapshot,
 };
 use crate::websocket::{
@@ -181,7 +181,12 @@ fn is_hk_symbol(symbol: &str) -> bool {
 }
 
 fn normalize_market_filter(market: Option<&str>) -> Option<&'static str> {
-    match market.unwrap_or_default().trim().to_ascii_uppercase().as_str() {
+    match market
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
         "HK" | "HONG KONG" | "HKEX" => Some("HK"),
         "US" | "USA" | "UNITED STATES" | "UNITED STATES OF AMERICA" => Some("US"),
         _ => None,
@@ -273,6 +278,420 @@ fn market_status_label(degraded: bool, has_error: bool) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn search_result(
+    symbol: &str,
+    instrument_name: &str,
+    exchange: &str,
+    country: &str,
+    instrument_type: &str,
+    aliases: &[&str],
+) -> SearchResult {
+    SearchResult {
+        symbol: symbol.to_string(),
+        instrument_name: instrument_name.to_string(),
+        exchange: exchange.to_string(),
+        country: country.to_string(),
+        instrument_type: instrument_type.to_string(),
+        aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn built_in_market_symbols(market: Option<&str>) -> Vec<SearchResult> {
+    let us_symbols = vec![
+        search_result(
+            "AAPL",
+            "Apple Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Apple"],
+        ),
+        search_result(
+            "AMZN",
+            "Amazon.com, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Amazon"],
+        ),
+        search_result(
+            "GOOGL",
+            "Alphabet Inc. Class A",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Alphabet", "Google"],
+        ),
+        search_result(
+            "MSFT",
+            "Microsoft Corporation",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Microsoft"],
+        ),
+        search_result(
+            "NVDA",
+            "NVIDIA Corporation",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["NVIDIA"],
+        ),
+        search_result(
+            "TSLA",
+            "Tesla, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Tesla"],
+        ),
+        search_result(
+            "META",
+            "Meta Platforms, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Meta", "Facebook"],
+        ),
+        search_result(
+            "NFLX",
+            "Netflix, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Netflix"],
+        ),
+        search_result(
+            "AMD",
+            "Advanced Micro Devices, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["AMD"],
+        ),
+        search_result(
+            "INTC",
+            "Intel Corporation",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Intel"],
+        ),
+        search_result(
+            "CRM",
+            "Salesforce, Inc.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Salesforce"],
+        ),
+        search_result(
+            "ORCL",
+            "Oracle Corporation",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Oracle"],
+        ),
+        search_result(
+            "ADBE",
+            "Adobe Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Adobe"],
+        ),
+        search_result(
+            "QCOM",
+            "QUALCOMM Incorporated",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Qualcomm"],
+        ),
+        search_result(
+            "AVGO",
+            "Broadcom Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Broadcom"],
+        ),
+        search_result(
+            "JPM",
+            "JPMorgan Chase & Co.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["JPMorgan Chase"],
+        ),
+        search_result(
+            "BAC",
+            "Bank of America Corporation",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Bank of America"],
+        ),
+        search_result(
+            "WFC",
+            "Wells Fargo & Company",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Wells Fargo"],
+        ),
+        search_result(
+            "GS",
+            "The Goldman Sachs Group, Inc.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Goldman Sachs"],
+        ),
+        search_result(
+            "V",
+            "Visa Inc.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Visa"],
+        ),
+        search_result(
+            "MA",
+            "Mastercard Incorporated",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Mastercard"],
+        ),
+        search_result(
+            "KO",
+            "The Coca-Cola Company",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Coca-Cola"],
+        ),
+        search_result(
+            "PEP",
+            "PepsiCo, Inc.",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["PepsiCo"],
+        ),
+        search_result(
+            "MCD",
+            "McDonald's Corporation",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["McDonald's"],
+        ),
+        search_result(
+            "DIS",
+            "The Walt Disney Company",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Disney"],
+        ),
+        search_result(
+            "NKE",
+            "NIKE, Inc.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Nike"],
+        ),
+        search_result(
+            "COST",
+            "Costco Wholesale Corporation",
+            "NASDAQ",
+            "United States",
+            "Common Stock",
+            &["Costco"],
+        ),
+        search_result(
+            "WMT",
+            "Walmart Inc.",
+            "NYSE",
+            "United States",
+            "Common Stock",
+            &["Walmart"],
+        ),
+        search_result(
+            "SPY",
+            "SPDR S&P 500 ETF Trust",
+            "NYSEARCA",
+            "United States",
+            "ETF",
+            &["S&P 500 ETF"],
+        ),
+        search_result(
+            "QQQ",
+            "Invesco QQQ Trust",
+            "NASDAQ",
+            "United States",
+            "ETF",
+            &["Nasdaq-100 ETF"],
+        ),
+        search_result(
+            "DIA",
+            "SPDR Dow Jones Industrial Average ETF Trust",
+            "NYSEARCA",
+            "United States",
+            "ETF",
+            &["Dow Jones ETF"],
+        ),
+        search_result(
+            "IWM",
+            "iShares Russell 2000 ETF",
+            "NYSEARCA",
+            "United States",
+            "ETF",
+            &["Russell 2000 ETF"],
+        ),
+    ];
+
+    let hk_symbols = vec![
+        search_result(
+            "0001.HK",
+            "CK Hutchison Holdings Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["CK Hutchison"],
+        ),
+        search_result(
+            "0005.HK",
+            "HSBC Holdings plc",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["HSBC"],
+        ),
+        search_result(
+            "0011.HK",
+            "Hang Seng Bank Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Hang Seng Bank"],
+        ),
+        search_result(
+            "0388.HK",
+            "Hong Kong Exchanges and Clearing Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["HKEX"],
+        ),
+        search_result(
+            "0700.HK",
+            "Tencent Holdings Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Tencent"],
+        ),
+        search_result(
+            "0939.HK",
+            "China Construction Bank Corporation",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["CCB"],
+        ),
+        search_result(
+            "0941.HK",
+            "China Mobile Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["China Mobile"],
+        ),
+        search_result(
+            "1299.HK",
+            "AIA Group Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["AIA"],
+        ),
+        search_result(
+            "1398.HK",
+            "Industrial and Commercial Bank of China Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["ICBC"],
+        ),
+        search_result(
+            "2318.HK",
+            "Ping An Insurance (Group) Company of China, Ltd.",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Ping An"],
+        ),
+        search_result(
+            "2388.HK",
+            "BOC Hong Kong (Holdings) Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["BOC Hong Kong"],
+        ),
+        search_result(
+            "2628.HK",
+            "China Life Insurance Company Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["China Life"],
+        ),
+        search_result(
+            "3690.HK",
+            "Meituan",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Meituan"],
+        ),
+        search_result(
+            "3988.HK",
+            "Bank of China Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Bank of China"],
+        ),
+        search_result(
+            "9988.HK",
+            "Alibaba Group Holding Limited",
+            "HKEX",
+            "Hong Kong",
+            "Common Stock",
+            &["Alibaba"],
+        ),
+    ];
+
+    match normalize_market_filter(market) {
+        Some("US") => us_symbols,
+        Some("HK") => hk_symbols,
+        _ => {
+            let mut combined = us_symbols;
+            combined.extend(hk_symbols);
+            combined
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchMarketDataRequest {
     pub symbols: Vec<String>,
@@ -281,6 +700,16 @@ pub struct BatchMarketDataRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolQuery {
     pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub symbol: String,
+    pub instrument_name: String,
+    pub exchange: String,
+    pub country: String,
+    pub instrument_type: String,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1139,7 +1568,11 @@ async fn get_strategy_state(
         .into_iter()
         .next();
 
-    let strategy_config = state.strategy_service.get_strategy_config(&strategy_id).await.ok();
+    let strategy_config = state
+        .strategy_service
+        .get_strategy_config(&strategy_id)
+        .await
+        .ok();
     let strategy_name = strategy_config
         .as_ref()
         .and_then(|config| config.display_name.clone().or(Some(config.name.clone())));
@@ -1918,7 +2351,10 @@ fn build_recent_signal_summary_from_snapshot(
 async fn load_latest_signal_snapshot_for_strategy(
     config: &StrategyConfig,
 ) -> StrategySignalSnapshot {
-    let strategy_name = config.display_name.clone().or_else(|| Some(config.name.clone()));
+    let strategy_name = config
+        .display_name
+        .clone()
+        .or_else(|| Some(config.name.clone()));
     let symbol = config
         .parameters
         .get("symbol")
@@ -2037,7 +2473,10 @@ async fn refresh_strategy_signal(
     State(state): State<AppState>,
     Path(strategy_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let config = state.strategy_service.get_strategy_config(&strategy_id).await?;
+    let config = state
+        .strategy_service
+        .get_strategy_config(&strategy_id)
+        .await?;
     let snapshot = load_latest_signal_snapshot_for_strategy(&config).await;
     state
         .strategy_service
@@ -2756,11 +3195,11 @@ mod http_e2e_tests {
         assert_eq!(response["strategy_id"], json!("strategy-1"));
         assert_eq!(response["signal_type"], json!("Buy"));
         assert_eq!(response["confirmation_state"], json!("manual_review_only"));
+        assert_eq!(response["note"], json!("信号已生成，需人工确认后才可下单"));
         assert_eq!(
-            response["note"],
-            json!("信号已生成，需人工确认后才可下单")
+            response["suggested_order"]["strategy_id"],
+            json!("strategy-1")
         );
-        assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
         assert_ne!(response["confirmation_state"], json!("auto_execute"));
     }
 
@@ -2819,6 +3258,27 @@ mod http_e2e_tests {
     }
 
     #[test]
+    fn market_symbol_list_expands_us_universe() {
+        let us_symbols = built_in_market_symbols(Some("US"));
+
+        assert!(us_symbols.len() >= 25, "expected a much larger US universe");
+        assert!(us_symbols.iter().any(|item| item.symbol == "AAPL"));
+        assert!(us_symbols.iter().any(|item| item.symbol == "NVDA"));
+        assert!(us_symbols.iter().any(|item| item.symbol == "META"));
+        assert!(us_symbols.iter().all(|item| !item.symbol.ends_with(".HK")));
+    }
+
+    #[test]
+    fn market_symbol_list_expands_hk_universe() {
+        let hk_symbols = built_in_market_symbols(Some("HK"));
+
+        assert!(hk_symbols.len() >= 15, "expected a much larger HK universe");
+        assert!(hk_symbols.iter().any(|item| item.symbol == "0700.HK"));
+        assert!(hk_symbols.iter().any(|item| item.symbol == "9988.HK"));
+        assert!(hk_symbols.iter().all(|item| item.symbol.ends_with(".HK")));
+    }
+
+    #[test]
     fn signal_review_record_json_keeps_manual_boundary_and_status() {
         let now = Utc::now();
         let review = crate::types::SignalReviewRecord {
@@ -2851,7 +3311,10 @@ mod http_e2e_tests {
         assert_eq!(response["signal_type"], json!("Buy"));
         assert_eq!(response["status"], json!("pending"));
         assert_eq!(response["confirmation_state"], json!("manual_review_only"));
-        assert_eq!(response["suggested_order"]["strategy_id"], json!("strategy-1"));
+        assert_eq!(
+            response["suggested_order"]["strategy_id"],
+            json!("strategy-1")
+        );
         assert_ne!(response["confirmation_state"], json!("auto_execute"));
     }
 
