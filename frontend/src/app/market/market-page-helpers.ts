@@ -57,6 +57,13 @@ export const filterStocksByChangePercentRange = <T extends StockLike>(
     return items;
   }
 
+  const hasMin = typeof range.min === 'number' && Number.isFinite(range.min);
+  const hasMax = typeof range.max === 'number' && Number.isFinite(range.max);
+
+  if (!hasMin && !hasMax) {
+    return items;
+  }
+
   return items.filter((item) => {
     if (!Number.isFinite(item.changePercent)) {
       return false;
@@ -64,11 +71,11 @@ export const filterStocksByChangePercentRange = <T extends StockLike>(
 
     const value = item.changePercent ?? 0;
 
-    if (typeof range.min === 'number' && Number.isFinite(range.min) && value < range.min) {
+    if (hasMin && value < range.min) {
       return false;
     }
 
-    if (typeof range.max === 'number' && Number.isFinite(range.max) && value > range.max) {
+    if (hasMax && value > range.max) {
       return false;
     }
 

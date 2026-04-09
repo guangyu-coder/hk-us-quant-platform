@@ -109,3 +109,23 @@ test('returns the original items unchanged when the change percent range is inva
     ['AAPL', 'TSLA', 'MSFT']
   );
 });
+
+test('returns the original items unchanged when the change percent range is empty', () => {
+  const stocks = [
+    { symbol: 'AAPL', changePercent: null },
+    { symbol: 'TSLA', changePercent: -4.5 },
+    { symbol: 'MSFT', changePercent: 1.1 },
+  ];
+
+  const filtered = filterStocksByChangePercentRange(stocks, {});
+
+  assert.strictEqual(filtered, stocks);
+  assert.deepEqual(
+    filtered.map((item) => item.symbol),
+    ['AAPL', 'TSLA', 'MSFT']
+  );
+  assert.deepEqual(
+    filtered.map((item) => item.changePercent),
+    [null, -4.5, 1.1]
+  );
+});
