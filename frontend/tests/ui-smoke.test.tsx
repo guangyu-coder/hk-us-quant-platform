@@ -793,5 +793,21 @@ describe('UI smoke', () => {
     await user.type(screen.getByLabelText('最小涨跌幅'), '5');
     await user.type(screen.getByLabelText('最大涨跌幅'), '1');
     expect(await screen.findByText('最小涨跌幅不能大于最大涨跌幅')).toBeTruthy();
+
+    await user.clear(screen.getByLabelText('最小涨跌幅'));
+    await user.clear(screen.getByLabelText('最大涨跌幅'));
+    await user.type(screen.getByLabelText('最小涨跌幅'), '10');
+    await waitFor(() => {
+      expect(screen.getByText('当前筛选下暂无股票')).toBeTruthy();
+    });
+
+    await user.click(screen.getByRole('button', { name: '重置筛选' }));
+    expect((screen.getByLabelText('最小涨跌幅') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('最大涨跌幅') as HTMLInputElement).value).toBe('');
+    await waitFor(() => {
+      const cards = screen.getAllByRole('button', { name: /选择股票/ });
+      expect(cards.length).toBeGreaterThan(0);
+      expect(cards[0]?.textContent ?? '').toContain('0941.HK');
+    });
   });
 });
