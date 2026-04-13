@@ -26,6 +26,25 @@ pub struct MarketData {
     pub exchange: Option<String>,
 }
 
+/// Snapshot row for market movers rankings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarketMoversSnapshot {
+    pub market: String,
+    pub instrument_type: String,
+    pub direction: String,
+    pub symbol: String,
+    pub instrument_name: String,
+    pub exchange: String,
+    pub country: String,
+    pub price: Option<f64>,
+    pub change: Option<f64>,
+    pub change_percent: Option<f64>,
+    pub currency: Option<String>,
+    pub rank: i32,
+    pub captured_at: DateTime<Utc>,
+    pub source: String,
+}
+
 impl MarketData {
     pub fn new(symbol: String, price: Decimal, volume: i64) -> Self {
         Self {

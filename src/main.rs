@@ -45,10 +45,10 @@ use crate::risk::RiskService;
 use crate::strategy::build_latest_strategy_signal_snapshot;
 use crate::strategy::StrategyService;
 use crate::types::{
-    BacktestExperimentMetadata, BacktestResult, ExecutionTrade, MarketData, OrderSide, OrderStatus,
-    OrderType, RiskLimits, SignalReviewRecord, StrategyConfig, StrategyExecutionOverview,
-    StrategyLatestBacktestSummary, StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
-    StrategySignalSnapshot,
+    BacktestExperimentMetadata, BacktestResult, ExecutionTrade, MarketData, MarketMoversSnapshot,
+    OrderSide, OrderStatus, OrderType, RiskLimits, SignalReviewRecord, StrategyConfig,
+    StrategyExecutionOverview, StrategyLatestBacktestSummary, StrategyLatestRealTradeSummary,
+    StrategyRecentSignalSummary, StrategySignalSnapshot,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -142,6 +142,13 @@ pub struct SignalReviewListQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSignalReviewNoteRequest {
     pub user_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketMoversQuery {
+    pub market: Option<String>,
+    pub instrument_type: Option<String>,
+    pub direction: Option<String>,
 }
 
 fn normalize_history_interval(interval: Option<&str>) -> &'static str {
@@ -833,6 +840,225 @@ fn built_in_market_list_response(query: &ListMarketQuery) -> Value {
     market_list_response_from_symbols(query, Vec::new())
 }
 
+fn normalize_market_movers_market(market: Option<&str>) -> Option<String> {
+    let trimmed = market.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    match trimmed.to_ascii_uppercase().as_str() {
+        "US" | "USA" | "UNITED STATES" | "UNITED STATES OF AMERICA" => Some("US".to_string()),
+        "HK" | "HONG KONG" | "HKEX" => Some("HK".to_string()),
+        _ => Some(trimmed.to_string()),
+    }
+}
+
+fn parse_market_movers_market(market: Option<&str>) -> Result<String, AppError> {
+    match normalize_market_movers_market(market) {
+        Some(value) if matches!(value.as_str(), "US" | "HK") => Ok(value),
+        Some(value) => Err(AppError::validation(format!(
+            "Invalid market movers market: {}",
+            value
+        ))),
+        None => Ok("US".to_string()),
+    }
+}
+
+fn normalize_market_movers_instrument_type(instrument_type: Option<&str>) -> Option<String> {
+    let trimmed = instrument_type.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    match trimmed.to_ascii_uppercase().as_str() {
+        "COMMON STOCK" | "STOCK" | "EQUITY" => Some("Common Stock".to_string()),
+        "ETF" | "EXCHANGE TRADED FUND" => Some("ETF".to_string()),
+        _ => Some(trimmed.to_string()),
+    }
+}
+
+fn parse_market_movers_instrument_type(instrument_type: Option<&str>) -> Result<String, AppError> {
+    match normalize_market_movers_instrument_type(instrument_type) {
+        Some(value) if matches!(value.as_str(), "Common Stock" | "ETF") => Ok(value),
+        Some(value) => Err(AppError::validation(format!(
+            "Invalid market movers instrument_type: {}",
+            value
+        ))),
+        None => Ok("Common Stock".to_string()),
+    }
+}
+
+fn normalize_market_movers_direction(direction: Option<&str>) -> String {
+    match direction
+        .unwrap_or("gainers")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gainer" | "gainers" | "top_gainer" | "top_gainers" | "up" => "gainers".to_string(),
+        "loser" | "losers" | "top_loser" | "top_losers" | "down" => "losers".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "gainers".to_string(),
+    }
+}
+
+fn parse_market_movers_direction(direction: Option<&str>) -> Result<String, AppError> {
+    let normalized = normalize_market_movers_direction(direction);
+    if matches!(normalized.as_str(), "gainers" | "losers") {
+        Ok(normalized)
+    } else {
+        Err(AppError::validation(format!(
+            "Invalid market movers direction: {}",
+            normalized
+        )))
+    }
+}
+
+fn market_movers_snapshot_to_value(snapshot: &MarketMoversSnapshot) -> Value {
+    json!({
+        "market": snapshot.market,
+        "instrument_type": snapshot.instrument_type,
+        "direction": snapshot.direction,
+        "symbol": snapshot.symbol,
+        "instrument_name": snapshot.instrument_name,
+        "exchange": snapshot.exchange,
+        "country": snapshot.country,
+        "price": snapshot.price,
+        "change": snapshot.change,
+        "change_percent": snapshot.change_percent,
+        "currency": snapshot.currency,
+        "rank": snapshot.rank,
+        "captured_at": snapshot.captured_at.to_rfc3339(),
+        "source": snapshot.source,
+    })
+}
+
+fn market_movers_snapshot_response_from_rows(
+    market: &str,
+    instrument_type: &str,
+    direction: &str,
+    rows: Vec<MarketMoversSnapshot>,
+) -> Value {
+    let normalized_market =
+        normalize_market_movers_market(Some(market)).unwrap_or_else(|| market.trim().to_string());
+    let normalized_instrument_type = normalize_market_movers_instrument_type(Some(instrument_type))
+        .unwrap_or_else(|| instrument_type.trim().to_string());
+    let normalized_direction = normalize_market_movers_direction(Some(direction));
+
+    let mut filtered_rows = rows
+        .into_iter()
+        .filter(|row| {
+            row.market == normalized_market
+                && row.instrument_type == normalized_instrument_type
+                && row.direction == normalized_direction
+        })
+        .collect::<Vec<_>>();
+
+    filtered_rows.sort_by(|left, right| {
+        left.rank
+            .cmp(&right.rank)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+
+    let latest_captured_at = filtered_rows.iter().map(|row| row.captured_at).max();
+
+    let latest_rows = latest_captured_at
+        .map(|captured_at| {
+            filtered_rows
+                .into_iter()
+                .filter(|row| row.captured_at == captured_at)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let captured_at_value = latest_rows
+        .first()
+        .map(|row| json!(row.captured_at.to_rfc3339()))
+        .unwrap_or(Value::Null);
+    let source_value = latest_rows
+        .first()
+        .map(|row| json!(row.source.clone()))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "success": true,
+        "market": normalized_market,
+        "instrument_type": normalized_instrument_type,
+        "direction": normalized_direction,
+        "captured_at": captured_at_value,
+        "source": source_value,
+        "count": latest_rows.len(),
+        "data": latest_rows.iter().map(market_movers_snapshot_to_value).collect::<Vec<_>>(),
+    })
+}
+
+async fn query_market_movers_snapshots_from_db(
+    db_pool: &PgPool,
+    market: &str,
+    instrument_type: &str,
+    direction: &str,
+) -> Result<Vec<MarketMoversSnapshot>, AppError> {
+    let latest_captured_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "
+        SELECT MAX(captured_at)
+        FROM market_movers_snapshots
+        WHERE market = $1
+          AND instrument_type = $2
+          AND direction = $3
+        ",
+    )
+    .bind(market)
+    .bind(instrument_type)
+    .bind(direction)
+    .fetch_one(db_pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let Some(latest_captured_at) = latest_captured_at else {
+        return Ok(Vec::new());
+    };
+
+    let rows = sqlx::query(
+        "
+        SELECT market, instrument_type, direction, symbol, instrument_name, exchange, country,
+               price, change, change_percent, currency, rank, captured_at, source
+        FROM market_movers_snapshots
+        WHERE market = $1
+          AND instrument_type = $2
+          AND direction = $3
+          AND captured_at = $4
+        ORDER BY rank ASC, symbol ASC
+        ",
+    )
+    .bind(market)
+    .bind(instrument_type)
+    .bind(direction)
+    .bind(latest_captured_at)
+    .fetch_all(db_pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| MarketMoversSnapshot {
+            market: row.get::<String, _>("market"),
+            instrument_type: row.get::<String, _>("instrument_type"),
+            direction: row.get::<String, _>("direction"),
+            symbol: row.get::<String, _>("symbol"),
+            instrument_name: row.get::<String, _>("instrument_name"),
+            exchange: row.get::<String, _>("exchange"),
+            country: row.get::<String, _>("country"),
+            price: row.get::<Option<f64>, _>("price"),
+            change: row.get::<Option<f64>, _>("change"),
+            change_percent: row.get::<Option<f64>, _>("change_percent"),
+            currency: row.get::<Option<String>, _>("currency"),
+            rank: row.get::<i32, _>("rank"),
+            captured_at: row.get::<DateTime<Utc>, _>("captured_at"),
+            source: row.get::<String, _>("source"),
+        })
+        .collect::<Vec<_>>())
+}
+
 async fn query_market_symbols_from_db(
     db_pool: &PgPool,
     query: &ListMarketQuery,
@@ -1398,6 +1624,7 @@ fn create_router(state: AppState) -> Router {
         .route("/api/v1/market-data/batch", post(get_market_data_batch))
         .route("/api/v1/market-data/search", get(search_symbols))
         .route("/api/v1/market-data/list", get(list_market_symbols))
+        .route("/api/v1/market-data/movers", get(list_market_movers))
         .route("/api/v1/lifecycle/cleanup", post(run_cleanup))
         .route("/api/v1/lifecycle/archival", post(run_archival))
         .route("/api/v1/lifecycle/settings", get(get_lifecycle_settings))
@@ -1783,6 +2010,30 @@ async fn list_market_symbols(
         &query,
         merged_symbols,
         source,
+    )))
+}
+
+async fn list_market_movers(
+    State(state): State<AppState>,
+    Query(query): Query<MarketMoversQuery>,
+) -> Result<Json<Value>, AppError> {
+    let market = parse_market_movers_market(query.market.as_deref())?;
+    let instrument_type = parse_market_movers_instrument_type(query.instrument_type.as_deref())?;
+    let direction = parse_market_movers_direction(query.direction.as_deref())?;
+
+    let db_rows = query_market_movers_snapshots_from_db(
+        &state.db_pool,
+        &market,
+        &instrument_type,
+        &direction,
+    )
+    .await?;
+
+    Ok(Json(market_movers_snapshot_response_from_rows(
+        &market,
+        &instrument_type,
+        &direction,
+        db_rows,
     )))
 }
 
@@ -3749,6 +4000,160 @@ mod http_e2e_tests {
                 "missing HK ticker {ticker}"
             );
         }
+    }
+
+    #[test]
+    fn market_movers_response_includes_captured_at_and_sorts_by_rank() {
+        let captured_at = Utc::now();
+        let earlier_captured_at = captured_at - chrono::Duration::minutes(10);
+        let rows = vec![
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "AAPL".to_string(),
+                instrument_name: "Apple Inc.".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(190.25),
+                change: Some(3.5),
+                change_percent: Some(1.87),
+                currency: Some("USD".to_string()),
+                rank: 2,
+                captured_at,
+                source: "script".to_string(),
+            },
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "MSFT".to_string(),
+                instrument_name: "Microsoft Corporation".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(420.0),
+                change: Some(9.0),
+                change_percent: Some(2.19),
+                currency: Some("USD".to_string()),
+                rank: 1,
+                captured_at,
+                source: "script".to_string(),
+            },
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "NVDA".to_string(),
+                instrument_name: "NVIDIA Corporation".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(860.0),
+                change: Some(11.0),
+                change_percent: Some(1.3),
+                currency: Some("USD".to_string()),
+                rank: 3,
+                captured_at,
+                source: "script".to_string(),
+            },
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "ORCL".to_string(),
+                instrument_name: "Oracle Corporation".to_string(),
+                exchange: "NYSE".to_string(),
+                country: "United States".to_string(),
+                price: Some(125.0),
+                change: Some(1.0),
+                change_percent: Some(0.81),
+                currency: Some("USD".to_string()),
+                rank: 1,
+                captured_at: earlier_captured_at,
+                source: "script".to_string(),
+            },
+        ];
+
+        let response =
+            market_movers_snapshot_response_from_rows("US", "Common Stock", "gainers", rows);
+
+        assert_eq!(response["market"], json!("US"));
+        assert_eq!(response["instrument_type"], json!("Common Stock"));
+        assert_eq!(response["direction"], json!("gainers"));
+        assert_eq!(response["captured_at"], json!(captured_at.to_rfc3339()));
+        assert_eq!(response["count"], json!(3));
+        assert_eq!(response["data"][0]["rank"], json!(1));
+        assert_eq!(response["data"][0]["symbol"], json!("MSFT"));
+        assert_eq!(response["data"][1]["rank"], json!(2));
+        assert_eq!(response["data"][2]["rank"], json!(3));
+    }
+
+    #[test]
+    fn market_movers_response_respects_filters_and_direction() {
+        let captured_at = Utc::now();
+        let rows = vec![
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "AAPL".to_string(),
+                instrument_name: "Apple Inc.".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(190.25),
+                change: Some(3.5),
+                change_percent: Some(1.87),
+                currency: Some("USD".to_string()),
+                rank: 1,
+                captured_at,
+                source: "script".to_string(),
+            },
+            crate::types::MarketMoversSnapshot {
+                market: "HK".to_string(),
+                instrument_type: "ETF".to_string(),
+                direction: "losers".to_string(),
+                symbol: "2800.HK".to_string(),
+                instrument_name: "Tracker Fund of Hong Kong".to_string(),
+                exchange: "HKEX".to_string(),
+                country: "Hong Kong".to_string(),
+                price: Some(17.3),
+                change: Some(-0.3),
+                change_percent: Some(-1.7),
+                currency: Some("HKD".to_string()),
+                rank: 1,
+                captured_at,
+                source: "script".to_string(),
+            },
+        ];
+
+        let response = market_movers_snapshot_response_from_rows("HK", "ETF", "losers", rows);
+
+        assert_eq!(response["market"], json!("HK"));
+        assert_eq!(response["instrument_type"], json!("ETF"));
+        assert_eq!(response["direction"], json!("losers"));
+        assert_eq!(response["captured_at"], json!(captured_at.to_rfc3339()));
+        assert_eq!(response["count"], json!(1));
+        assert_eq!(response["data"][0]["symbol"], json!("2800.HK"));
+    }
+
+    #[test]
+    fn market_movers_direction_normalizes_aliases() {
+        assert_eq!(normalize_market_movers_direction(None), "gainers");
+        assert_eq!(normalize_market_movers_direction(Some("losers")), "losers");
+        assert_eq!(
+            normalize_market_movers_direction(Some("top_gainers")),
+            "gainers"
+        );
+        assert_eq!(
+            normalize_market_movers_direction(Some("top_losers")),
+            "losers"
+        );
+    }
+
+    #[test]
+    fn market_movers_query_rejects_unknown_values() {
+        assert!(parse_market_movers_market(Some("CN")).is_err());
+        assert!(parse_market_movers_instrument_type(Some("REIT")).is_err());
+        assert!(parse_market_movers_direction(Some("sideways")).is_err());
     }
 
     #[test]
