@@ -54,6 +54,7 @@ use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
 };
 use chrono::{DateTime, NaiveDate, Utc};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 static APP_BOOT_AT: OnceLock<String> = OnceLock::new();
@@ -705,11 +706,8 @@ fn search_result_to_value(item: SearchResult) -> Value {
 
 fn market_symbol_matches_query(item: &SearchResult, query: &ListMarketQuery) -> bool {
     if let Some(target_market) = normalize_market_filter(query.market.as_deref()) {
-        if infer_market_from_symbol_record(
-            &item.symbol,
-            Some(&item.exchange),
-            Some(&item.country),
-        ) != target_market
+        if infer_market_from_symbol_record(&item.symbol, Some(&item.exchange), Some(&item.country))
+            != target_market
         {
             return false;
         }
@@ -717,14 +715,18 @@ fn market_symbol_matches_query(item: &SearchResult, query: &ListMarketQuery) -> 
 
     if let Some(exchange) = query.exchange.as_deref() {
         let normalized_exchange = exchange.trim().to_ascii_uppercase();
-        if !normalized_exchange.is_empty() && item.exchange.trim().to_ascii_uppercase() != normalized_exchange {
+        if !normalized_exchange.is_empty()
+            && item.exchange.trim().to_ascii_uppercase() != normalized_exchange
+        {
             return false;
         }
     }
 
     if let Some(country) = query.country.as_deref() {
         let normalized_country = country.trim().to_ascii_uppercase();
-        if !normalized_country.is_empty() && item.country.trim().to_ascii_uppercase() != normalized_country {
+        if !normalized_country.is_empty()
+            && item.country.trim().to_ascii_uppercase() != normalized_country
+        {
             return false;
         }
     }
@@ -735,6 +737,26 @@ fn market_symbol_matches_query(item: &SearchResult, query: &ListMarketQuery) -> 
             && item.instrument_type.trim().to_ascii_uppercase() != normalized_instrument_type
         {
             return false;
+        }
+    }
+
+    if let Some(search) = query.search.as_deref() {
+        let normalized_search = search.trim().to_ascii_lowercase();
+        if !normalized_search.is_empty() {
+            let haystack = format!(
+                "{} {} {} {} {} {}",
+                item.symbol,
+                item.instrument_name,
+                item.exchange,
+                item.country,
+                item.instrument_type,
+                item.aliases.join(" ")
+            )
+            .to_ascii_lowercase();
+
+            if !haystack.contains(&normalized_search) {
+                return false;
+            }
         }
     }
 
@@ -758,27 +780,337 @@ fn merge_market_symbol_lists(
     merged
 }
 
+fn paginate_market_symbols(
+    symbols: Vec<SearchResult>,
+    page: i64,
+    page_size: i64,
+) -> (Vec<SearchResult>, i64) {
+    let total = symbols.len() as i64;
+    let start = ((page - 1) * page_size).max(0) as usize;
+    let paged = symbols
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .collect::<Vec<_>>();
+
+    (paged, total)
+}
+
+fn market_list_response_from_universe(
+    query: &ListMarketQuery,
+    all_symbols: Vec<SearchResult>,
+    source: &str,
+) -> Value {
+    let filtered_symbols = all_symbols
+        .into_iter()
+        .filter(|item| market_symbol_matches_query(item, query))
+        .collect::<Vec<_>>();
+    let page = normalize_market_page(query.page);
+    let page_size = normalize_market_page_size(query.page_size);
+    let (paged_symbols, total) = paginate_market_symbols(filtered_symbols, page, page_size);
+
+    json!({
+        "success": true,
+        "count": paged_symbols.len(),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "data": paged_symbols.into_iter().map(search_result_to_value).collect::<Vec<_>>(),
+        "source": source,
+    })
+}
+
 fn market_list_response_from_symbols(
     query: &ListMarketQuery,
     provider_symbols: Vec<SearchResult>,
 ) -> Value {
     let builtin_symbols = built_in_market_symbols(None);
     let merged_symbols = merge_market_symbol_lists(provider_symbols, builtin_symbols);
-    let filtered_symbols = merged_symbols
-        .into_iter()
-        .filter(|item| market_symbol_matches_query(item, query))
-        .collect::<Vec<_>>();
-
-    json!({
-        "success": true,
-        "count": filtered_symbols.len(),
-        "data": filtered_symbols.into_iter().map(search_result_to_value).collect::<Vec<_>>(),
-        "source": "builtin+provider",
-    })
+    market_list_response_from_universe(query, merged_symbols, "builtin+provider")
 }
 
 fn built_in_market_list_response(query: &ListMarketQuery) -> Value {
     market_list_response_from_symbols(query, Vec::new())
+}
+
+async fn query_market_symbols_from_db(
+    db_pool: &PgPool,
+    query: &ListMarketQuery,
+) -> Result<(Vec<SearchResult>, i64), AppError> {
+    let market = normalize_market_filter(query.market.as_deref()).map(str::to_string);
+    let exchange = query
+        .exchange
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let country = query
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let instrument_type = query
+        .instrument_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", value));
+    let active_only = query.active_only.unwrap_or(true);
+    let page = normalize_market_page(query.page);
+    let page_size = normalize_market_page_size(query.page_size);
+    let offset = (page - 1) * page_size;
+
+    let mut count_builder =
+        QueryBuilder::<Postgres>::new("SELECT COUNT(*)::BIGINT FROM market_symbols WHERE 1=1");
+    if active_only {
+        count_builder.push(" AND is_active = TRUE");
+    }
+    if let Some(ref value) = market {
+        count_builder.push(" AND market = ").push_bind(value);
+    }
+    if let Some(ref value) = exchange {
+        count_builder.push(" AND exchange = ").push_bind(value);
+    }
+    if let Some(ref value) = country {
+        count_builder.push(" AND country = ").push_bind(value);
+    }
+    if let Some(ref value) = instrument_type {
+        count_builder
+            .push(" AND instrument_type = ")
+            .push_bind(value);
+    }
+    if let Some(ref value) = search {
+        count_builder
+            .push(" AND (symbol ILIKE ")
+            .push_bind(value)
+            .push(" OR instrument_name ILIKE ")
+            .push_bind(value)
+            .push(" OR aliases::text ILIKE ")
+            .push_bind(value)
+            .push(")");
+    }
+
+    let total = count_builder
+        .build_query_scalar::<i64>()
+        .fetch_one(db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
+        "SELECT symbol, instrument_name, exchange, country, instrument_type, aliases \
+         FROM market_symbols WHERE 1=1",
+    );
+    if active_only {
+        query_builder.push(" AND is_active = TRUE");
+    }
+    if let Some(ref value) = market {
+        query_builder.push(" AND market = ").push_bind(value);
+    }
+    if let Some(ref value) = exchange {
+        query_builder.push(" AND exchange = ").push_bind(value);
+    }
+    if let Some(ref value) = country {
+        query_builder.push(" AND country = ").push_bind(value);
+    }
+    if let Some(ref value) = instrument_type {
+        query_builder
+            .push(" AND instrument_type = ")
+            .push_bind(value);
+    }
+    if let Some(ref value) = search {
+        query_builder
+            .push(" AND (symbol ILIKE ")
+            .push_bind(value)
+            .push(" OR instrument_name ILIKE ")
+            .push_bind(value)
+            .push(" OR aliases::text ILIKE ")
+            .push_bind(value)
+            .push(")");
+    }
+    query_builder
+        .push(" ORDER BY instrument_name ASC, symbol ASC LIMIT ")
+        .push_bind(page_size)
+        .push(" OFFSET ")
+        .push_bind(offset);
+
+    let rows = query_builder
+        .build()
+        .fetch_all(db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    let symbols = rows
+        .into_iter()
+        .map(|row| {
+            let record = MarketSymbolRecord {
+                symbol: row.get::<String, _>("symbol"),
+                instrument_name: row.get::<String, _>("instrument_name"),
+                exchange: row.get::<String, _>("exchange"),
+                country: row.get::<String, _>("country"),
+                instrument_type: row.get::<String, _>("instrument_type"),
+                aliases: aliases_from_json_value(row.get::<serde_json::Value, _>("aliases")),
+            };
+            market_record_to_search_result(record)
+        })
+        .collect::<Vec<_>>();
+
+    Ok((symbols, total))
+}
+
+async fn query_all_market_symbols_from_db(
+    db_pool: &PgPool,
+    query: &ListMarketQuery,
+) -> Result<Vec<SearchResult>, AppError> {
+    let market = normalize_market_filter(query.market.as_deref()).map(str::to_string);
+    let exchange = query
+        .exchange
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let country = query
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let instrument_type = query
+        .instrument_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", value));
+    let active_only = query.active_only.unwrap_or(true);
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
+        "SELECT symbol, instrument_name, exchange, country, instrument_type, aliases \
+         FROM market_symbols WHERE 1=1",
+    );
+    if active_only {
+        query_builder.push(" AND is_active = TRUE");
+    }
+    if let Some(ref value) = market {
+        query_builder.push(" AND market = ").push_bind(value);
+    }
+    if let Some(ref value) = exchange {
+        query_builder.push(" AND exchange = ").push_bind(value);
+    }
+    if let Some(ref value) = country {
+        query_builder.push(" AND country = ").push_bind(value);
+    }
+    if let Some(ref value) = instrument_type {
+        query_builder
+            .push(" AND instrument_type = ")
+            .push_bind(value);
+    }
+    if let Some(ref value) = search {
+        query_builder
+            .push(" AND (symbol ILIKE ")
+            .push_bind(value)
+            .push(" OR instrument_name ILIKE ")
+            .push_bind(value)
+            .push(" OR aliases::text ILIKE ")
+            .push_bind(value)
+            .push(")");
+    }
+    query_builder.push(" ORDER BY instrument_name ASC, symbol ASC");
+
+    let rows = query_builder
+        .build()
+        .fetch_all(db_pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let record = MarketSymbolRecord {
+                symbol: row.get::<String, _>("symbol"),
+                instrument_name: row.get::<String, _>("instrument_name"),
+                exchange: row.get::<String, _>("exchange"),
+                country: row.get::<String, _>("country"),
+                instrument_type: row.get::<String, _>("instrument_type"),
+                aliases: aliases_from_json_value(row.get::<serde_json::Value, _>("aliases")),
+            };
+            market_record_to_search_result(record)
+        })
+        .collect::<Vec<_>>())
+}
+
+async fn search_market_symbols_from_db(
+    db_pool: &PgPool,
+    query: &SearchSymbolQuery,
+) -> Result<Vec<SearchResult>, AppError> {
+    let list_query = ListMarketQuery {
+        market: query.market.clone(),
+        exchange: None,
+        country: None,
+        instrument_type: query.instrument_type.clone(),
+        search: Some(query.query.clone()),
+        page: Some(1),
+        page_size: Some(normalize_search_limit(query.limit)),
+        active_only: Some(true),
+    };
+
+    let (symbols, _) = query_market_symbols_from_db(db_pool, &list_query).await?;
+    Ok(symbols)
+}
+
+async fn fetch_search_symbols_from_script(query: &SearchSymbolQuery) -> Option<Vec<SearchResult>> {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("market_data.py");
+
+    let output = Command::new("python3")
+        .arg(script_path)
+        .arg("--search")
+        .arg(&query.query)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let response: MarketListScriptResponse = serde_json::from_slice(&output.stdout).ok()?;
+    if response.success.unwrap_or(false) {
+        response.data
+    } else {
+        None
+    }
+}
+
+fn fallback_search_symbols(query: &SearchSymbolQuery) -> Vec<SearchResult> {
+    let fallback_query = ListMarketQuery {
+        market: query.market.clone(),
+        exchange: None,
+        country: None,
+        instrument_type: query.instrument_type.clone(),
+        search: Some(query.query.clone()),
+        page: Some(1),
+        page_size: Some(normalize_search_limit(query.limit)),
+        active_only: Some(true),
+    };
+
+    built_in_market_symbols(query.market.as_deref())
+        .into_iter()
+        .filter(|item| market_symbol_matches_query(item, &fallback_query))
+        .take(normalize_search_limit(query.limit) as usize)
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -819,6 +1151,9 @@ pub struct BatchMarketDataRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolQuery {
     pub query: String,
+    pub market: Option<String>,
+    pub instrument_type: Option<String>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -837,6 +1172,53 @@ pub struct ListMarketQuery {
     pub exchange: Option<String>,
     pub country: Option<String>,
     pub instrument_type: Option<String>,
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    pub active_only: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct MarketSymbolRecord {
+    symbol: String,
+    instrument_name: String,
+    exchange: String,
+    country: String,
+    instrument_type: String,
+    aliases: Vec<String>,
+}
+
+fn normalize_market_page(page: Option<i64>) -> i64 {
+    page.unwrap_or(1).max(1)
+}
+
+fn normalize_market_page_size(page_size: Option<i64>) -> i64 {
+    page_size.unwrap_or(50).clamp(1, 200)
+}
+
+fn normalize_search_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(20).clamp(1, 100)
+}
+
+fn aliases_from_json_value(value: serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn market_record_to_search_result(record: MarketSymbolRecord) -> SearchResult {
+    SearchResult {
+        symbol: record.symbol,
+        instrument_name: record.instrument_name,
+        exchange: record.exchange,
+        country: record.country,
+        instrument_type: record.instrument_type,
+        aliases: record.aliases,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -871,6 +1253,7 @@ pub struct TradeListQuery {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
+    pub db_pool: PgPool,
     pub data_service: Arc<DataService>,
     pub strategy_service: Arc<StrategyService>,
     pub execution_service: Arc<ExecutionService>,
@@ -991,6 +1374,7 @@ async fn initialize_services(config: Arc<AppConfig>) -> Result<AppState> {
 
     Ok(AppState {
         config,
+        db_pool,
         data_service,
         strategy_service,
         execution_service,
@@ -1316,78 +1700,90 @@ async fn get_market_data_batch(
 }
 
 async fn search_symbols(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(query): Query<SearchSymbolQuery>,
 ) -> Result<Json<Value>, AppError> {
     info!("Searching for symbols: {}", query.query);
 
-    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("market_data.py");
-
-    let output = Command::new("python3")
-        .arg(script_path)
-        .arg("--search")
-        .arg(&query.query)
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(output) => output,
-        Err(e) => {
-            info!(
-                "Search script execution failed for query '{}': {}. Returning fallback response.",
-                query.query, e
+    let db_results = match search_market_symbols_from_db(&state.db_pool, &query).await {
+        Ok(results) => results,
+        Err(error) => {
+            warn!(
+                "Database-backed symbol search failed for query '{}': {}. Falling back.",
+                query.query, error
             );
-            return Ok(Json(json!({
-                "success": false,
-                "data": [],
-                "error": format!("search unavailable: {}", e),
-                "source": "fallback"
-            })));
+            Vec::new()
         }
     };
+    let script_results = fetch_search_symbols_from_script(&query)
+        .await
+        .unwrap_or_default();
+    let builtin_results = fallback_search_symbols(&query);
+    let merged_results = merge_market_symbol_lists(
+        db_results,
+        merge_market_symbol_lists(script_results, builtin_results),
+    )
+    .into_iter()
+    .take(normalize_search_limit(query.limit) as usize)
+    .collect::<Vec<_>>();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        info!(
-            "Search script failed for query '{}': {}. Returning fallback response.",
-            query.query, stderr
-        );
-        return Ok(Json(json!({
-            "success": false,
-            "data": [],
-            "error": format!("search unavailable: {}", stderr),
-            "source": "fallback"
-        })));
-    }
+    let source = if !merged_results.is_empty() {
+        "database+provider+builtin"
+    } else {
+        "fallback"
+    };
 
-    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        info!(
-            "Search response parse failed for query '{}': {}. Returning fallback response.",
-            query.query, e
-        );
-        json!({
-            "success": false,
-            "data": [],
-            "error": format!("invalid search response: {}", e),
-            "source": "fallback"
-        })
-    });
-
-    Ok(Json(data))
+    Ok(Json(json!({
+        "success": true,
+        "count": merged_results.len(),
+        "data": merged_results.into_iter().map(search_result_to_value).collect::<Vec<_>>(),
+        "source": source,
+    })))
 }
 
 async fn list_market_symbols(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(query): Query<ListMarketQuery>,
 ) -> Result<Json<Value>, AppError> {
     info!("Listing market symbols");
+    let (db_symbols, has_db_results) =
+        match query_all_market_symbols_from_db(&state.db_pool, &query).await {
+            Ok(symbols) => {
+                let has_results = !symbols.is_empty();
+                (symbols, has_results)
+            }
+            Err(error) => {
+                warn!(
+                "Database-backed market list failed: {}. Falling back to provider+builtin symbols.",
+                error
+            );
+                (Vec::new(), false)
+            }
+        };
+
     let provider_symbols = fetch_market_list_symbols_from_script()
         .await
         .unwrap_or_default();
+    let builtin_and_provider =
+        merge_market_symbol_lists(provider_symbols, built_in_market_symbols(None));
+    let merged_symbols = if db_symbols.is_empty() {
+        builtin_and_provider
+    } else {
+        merge_market_symbol_lists(db_symbols, builtin_and_provider)
+    };
+    let source = if merged_symbols.is_empty() {
+        "fallback"
+    } else if has_db_results {
+        "database+provider+builtin"
+    } else {
+        "builtin+provider"
+    };
 
-    Ok(Json(market_list_response_from_symbols(&query, provider_symbols)))
+    Ok(Json(market_list_response_from_universe(
+        &query,
+        merged_symbols,
+        source,
+    )))
 }
 
 async fn get_order(
@@ -3363,6 +3759,10 @@ mod http_e2e_tests {
                 exchange: None,
                 country: None,
                 instrument_type: None,
+                search: None,
+                page: None,
+                page_size: None,
+                active_only: None,
             },
             Vec::new(),
         );
@@ -3370,7 +3770,9 @@ mod http_e2e_tests {
         let symbols = response["data"].as_array().unwrap();
         assert!(response["count"].as_u64().unwrap_or_default() >= 45);
         assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
-        assert!(symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+        assert!(symbols
+            .iter()
+            .any(|item| item["symbol"] == json!("0700.HK")));
     }
 
     #[test]
@@ -3381,13 +3783,19 @@ mod http_e2e_tests {
                 exchange: Some("HKEX".to_string()),
                 country: None,
                 instrument_type: None,
+                search: None,
+                page: None,
+                page_size: None,
+                active_only: None,
             },
             Vec::new(),
         );
 
         let symbols = response["data"].as_array().unwrap();
         assert!(symbols.iter().all(|item| item["exchange"] == json!("HKEX")));
-        assert!(symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+        assert!(symbols
+            .iter()
+            .any(|item| item["symbol"] == json!("0700.HK")));
         assert!(!symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
     }
 
@@ -3399,14 +3807,22 @@ mod http_e2e_tests {
                 exchange: None,
                 country: Some("United States".to_string()),
                 instrument_type: None,
+                search: None,
+                page: None,
+                page_size: None,
+                active_only: None,
             },
             Vec::new(),
         );
 
         let symbols = response["data"].as_array().unwrap();
-        assert!(symbols.iter().all(|item| item["country"] == json!("United States")));
+        assert!(symbols
+            .iter()
+            .all(|item| item["country"] == json!("United States")));
         assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
-        assert!(!symbols.iter().any(|item| item["symbol"] == json!("0700.HK")));
+        assert!(!symbols
+            .iter()
+            .any(|item| item["symbol"] == json!("0700.HK")));
     }
 
     #[test]
@@ -3417,14 +3833,41 @@ mod http_e2e_tests {
                 exchange: None,
                 country: None,
                 instrument_type: Some("ETF".to_string()),
+                search: None,
+                page: None,
+                page_size: None,
+                active_only: None,
             },
             Vec::new(),
         );
 
         let symbols = response["data"].as_array().unwrap();
-        assert!(symbols.iter().all(|item| item["instrument_type"] == json!("ETF")));
+        assert!(symbols
+            .iter()
+            .all(|item| item["instrument_type"] == json!("ETF")));
         assert!(symbols.iter().any(|item| item["symbol"] == json!("SPY")));
         assert!(!symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
+    }
+
+    #[test]
+    fn market_list_response_filters_by_search_term() {
+        let response = market_list_response_from_symbols(
+            &ListMarketQuery {
+                market: Some("HK".to_string()),
+                exchange: None,
+                country: None,
+                instrument_type: None,
+                search: Some("tencent".to_string()),
+                page: None,
+                page_size: None,
+                active_only: None,
+            },
+            Vec::new(),
+        );
+
+        let symbols = response["data"].as_array().unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0]["symbol"], json!("0700.HK"));
     }
 
     #[test]
@@ -3435,6 +3878,10 @@ mod http_e2e_tests {
                 exchange: Some("NASDAQ".to_string()),
                 country: None,
                 instrument_type: None,
+                search: None,
+                page: None,
+                page_size: None,
+                active_only: None,
             },
             vec![SearchResult {
                 symbol: "ZZTOP".to_string(),
@@ -3449,7 +3896,9 @@ mod http_e2e_tests {
         let symbols = response["data"].as_array().unwrap();
         assert!(symbols.iter().any(|item| item["symbol"] == json!("AAPL")));
         assert!(symbols.iter().any(|item| item["symbol"] == json!("ZZTOP")));
-        assert!(symbols.iter().all(|item| item["exchange"] == json!("NASDAQ")));
+        assert!(symbols
+            .iter()
+            .all(|item| item["exchange"] == json!("NASDAQ")));
     }
 
     #[test]
@@ -3459,11 +3908,18 @@ mod http_e2e_tests {
             exchange: None,
             country: None,
             instrument_type: None,
+            search: None,
+            page: Some(2),
+            page_size: Some(25),
+            active_only: None,
         });
 
         assert_eq!(response["success"], json!(true));
-        assert!(response["count"].as_u64().unwrap_or_default() >= 25);
-        assert!(response["data"]
+        assert!(response["count"].as_u64().unwrap_or_default() <= 25);
+        assert!(response["total"].as_u64().unwrap_or_default() >= 25);
+        assert_eq!(response["page"], json!(2));
+        assert_eq!(response["page_size"], json!(25));
+        assert!(!response["data"]
             .as_array()
             .unwrap()
             .iter()
@@ -3473,6 +3929,38 @@ mod http_e2e_tests {
             .unwrap()
             .iter()
             .all(|item| item["symbol"].as_str().unwrap_or_default().ends_with(".HK") == false));
+    }
+
+    #[test]
+    fn market_list_response_applies_pagination_to_fallback_results() {
+        let page_one = built_in_market_list_response(&ListMarketQuery {
+            market: Some("US".to_string()),
+            exchange: None,
+            country: None,
+            instrument_type: None,
+            search: None,
+            page: Some(1),
+            page_size: Some(5),
+            active_only: None,
+        });
+        let page_two = built_in_market_list_response(&ListMarketQuery {
+            market: Some("US".to_string()),
+            exchange: None,
+            country: None,
+            instrument_type: None,
+            search: None,
+            page: Some(2),
+            page_size: Some(5),
+            active_only: None,
+        });
+
+        let page_one_symbols = page_one["data"].as_array().unwrap();
+        let page_two_symbols = page_two["data"].as_array().unwrap();
+
+        assert_eq!(page_one_symbols.len(), 5);
+        assert_eq!(page_two_symbols.len(), 5);
+        assert_ne!(page_one_symbols[0]["symbol"], page_two_symbols[0]["symbol"]);
+        assert_eq!(page_one["total"], page_two["total"]);
     }
 
     #[test]
@@ -3734,6 +4222,7 @@ mod http_e2e_tests {
 
         let state = AppState {
             config,
+            db_pool: db_pool.clone(),
             data_service,
             strategy_service,
             execution_service,
