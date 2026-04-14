@@ -2,10 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  buildMarketModuleHref,
   filterSearchResultsByMarket,
+  filterSearchResultsByScope,
   filterStocksByChangePercentRange,
+  getMarketInstrumentTypeLabel,
   inferMarketFromSearchResult,
+  hasNextMarketPage,
   getChangePercentRangeError,
+  normalizeMarketSymbol,
+  normalizeSearchSymbol,
   sortStocksByBoardMode,
 } from '../src/app/market/market-page-helpers.ts';
 
@@ -24,6 +30,29 @@ test('market helpers classify hk and us search results', () => {
   );
 });
 
+test('normalizes search result symbols for hong kong stocks', () => {
+  assert.equal(
+    normalizeSearchSymbol({ symbol: '700', exchange: 'HKEX', country: 'Hong Kong' }),
+    '0700.HK'
+  );
+  assert.equal(
+    normalizeSearchSymbol({ symbol: 'AAPL', exchange: 'NASDAQ', country: 'United States' }),
+    'AAPL'
+  );
+});
+
+test('builds market-module hrefs with optional symbol preservation', () => {
+  assert.equal(buildMarketModuleHref('/market/chart', 'AAPL'), '/market/chart?symbol=AAPL');
+  assert.equal(buildMarketModuleHref('/market/orderbook', '700'), '/market/orderbook?symbol=0700.HK');
+  assert.equal(buildMarketModuleHref('/market', ''), '/market');
+});
+
+test('normalizes standalone market symbols', () => {
+  assert.equal(normalizeMarketSymbol('700'), '0700.HK');
+  assert.equal(normalizeMarketSymbol('0700.HK'), '0700.HK');
+  assert.equal(normalizeMarketSymbol('msft'), 'MSFT');
+});
+
 test('market helpers filter search results by selected market', () => {
   const items = [
     { symbol: 'AAPL', exchange: 'NASDAQ', country: 'United States' },
@@ -36,6 +65,23 @@ test('market helpers filter search results by selected market', () => {
     ['AAPL', 'MSFT']
   );
   assert.deepEqual(filterSearchResultsByMarket(items, 'HK').map((item) => item.symbol), ['0700.HK']);
+});
+
+test('market helpers filter search results by market and instrument type scope', () => {
+  const items = [
+    { symbol: 'AAPL', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
+    { symbol: 'SPY', exchange: 'NYSE Arca', country: 'United States', instrument_type: 'ETF' },
+    { symbol: '2800.HK', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'ETF' },
+  ];
+
+  assert.deepEqual(
+    filterSearchResultsByScope(items, 'US', 'Common Stock').map((item) => item.symbol),
+    ['AAPL']
+  );
+  assert.deepEqual(
+    filterSearchResultsByScope(items, 'US', 'ETF').map((item) => item.symbol),
+    ['SPY']
+  );
 });
 
 test('market helpers sort gainers and losers by same day change percent', () => {
@@ -128,4 +174,15 @@ test('returns the original items unchanged when the change percent range is empt
     filtered.map((item) => item.changePercent),
     [null, -4.5, 1.1]
   );
+});
+
+test('formats instrument type labels for market page controls', () => {
+  assert.equal(getMarketInstrumentTypeLabel('Common Stock'), '普通股票');
+  assert.equal(getMarketInstrumentTypeLabel('ETF'), 'ETF');
+});
+
+test('detects whether paginated market list has a next page', () => {
+  assert.equal(hasNextMarketPage(1, 25, 100), true);
+  assert.equal(hasNextMarketPage(4, 25, 100), false);
+  assert.equal(hasNextMarketPage(2, 50, 75), false);
 });

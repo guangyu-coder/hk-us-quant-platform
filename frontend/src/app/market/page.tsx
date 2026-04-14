@@ -1,945 +1,671 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { MarketDataWidget } from '@/components/market/MarketDataWidget';
-import { marketDataApi, WebSocketManager } from '@/lib/api';
-import { formatMarketNumber, formatMarketPrice, getMarketStatusLabel, inferCurrency } from '@/lib/market';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { Search, Loader2, TrendingUp, TrendingDown, RefreshCw } from 'lucide-react';
-import type { MarketData, MarketDataMeta, MarketQuoteResult } from '@/types';
+import Link from 'next/link';
+import { useEffect, useRef, useState } from 'react';
+import { clsx } from 'clsx';
+import { ChevronLeft, ChevronRight, Loader2, RefreshCw, Search, TrendingDown, TrendingUp } from 'lucide-react';
+import { marketDataApi } from '@/lib/api';
+import { formatMarketNumber, formatMarketPrice, inferCurrency } from '@/lib/market';
+import type { MarketData, MarketInstrumentType, MarketMoverRecord, MarketQuoteResult, MarketSymbolRecord, MarketTab } from '@/types';
+import { MarketModuleNav } from './_components/MarketModuleNav';
 import {
+  buildMarketModuleHref,
+  filterSearchResultsByScope,
   filterStocksByChangePercentRange,
-  filterSearchResultsByMarket,
   getChangePercentRangeError,
-  sortStocksByBoardMode,
+  getMarketInstrumentTypeLabel,
+  hasNextMarketPage,
+  normalizeMarketSymbol,
   type BoardMode,
   type ChangePercentRange,
-  type MarketTab,
 } from './market-page-helpers';
 
-interface StockData {
+type DisplayStock = {
   symbol: string;
-  name: string;
-  price: number;
-  change: number;
-  changePercent: number;
-  currency?: string;
-  exchange?: string;
-}
-
-interface SearchResult {
-  symbol: string;
-  instrument_name: string;
+  instrumentName: string;
   exchange: string;
   country: string;
-  instrument_type: string;
-}
-
-interface ChartPoint {
-  timestamp: string;
-  time: string;
-  price: number;
-  volume: number;
-}
-
-interface MarketListResponse {
-  count?: number;
-  data?: SearchResult[];
-}
-
-const toFiniteNumber = (value: unknown, fallback = 0): number => {
-  const num = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(num) ? num : fallback;
+  instrumentType: MarketInstrumentType;
+  market: MarketTab;
+  currency: string;
+  price?: number;
+  change?: number;
+  changePercent?: number;
+  source: 'quotes' | 'snapshot';
 };
 
-const normalizeSearchSymbol = (result: SearchResult): string => {
-  const rawSymbol = result.symbol.trim().toUpperCase();
-  const exchange = result.exchange.trim().toUpperCase();
-  const country = result.country.trim().toUpperCase();
+const MARKET_TABS: Array<{ key: MarketTab; label: string }> = [
+  { key: 'US', label: '美股' },
+  { key: 'HK', label: '港股' },
+];
 
-  if (rawSymbol.endsWith('.HK')) {
-    return rawSymbol;
-  }
+const BOARD_OPTIONS: Array<{ key: BoardMode; label: string; description: string }> = [
+  { key: 'all', label: '全部', description: '分页浏览当前市场股票池' },
+  { key: 'gainers', label: '涨幅榜', description: '读取当日涨幅快照，优先看强势股' },
+  { key: 'losers', label: '跌幅榜', description: '读取当日跌幅快照，快速找弱势股' },
+];
 
-  const isHongKong =
-    country.includes('HONG KONG') ||
-    exchange.includes('HK') ||
-    exchange.includes('HONG KONG');
+const INSTRUMENT_TYPES: MarketInstrumentType[] = ['Common Stock', 'ETF'];
+const PAGE_SIZE = 25;
 
-  if (isHongKong && /^\d+$/.test(rawSymbol)) {
-    const normalizedCode = rawSymbol.length >= 4 ? rawSymbol : rawSymbol.padStart(4, '0');
-    return `${normalizedCode}.HK`;
-  }
-
-  return rawSymbol;
-};
-
-const formatChartLabel = (timestamp: string): string => {
-  if (!timestamp) {
-    return '';
-  }
-
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-};
-
-const parseOptionalNumber = (value: string): number | null => {
-  if (!value.trim()) {
+const parseRangeInput = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
     return null;
   }
 
-  const parsed = Number(value);
+  const parsed = Number(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const getHistoryParams = (selectedTimeframe: string) => {
-  let interval = '1d';
-  let startDate = '';
-  const endDate = '';
+const mapListRecordToDisplay = (
+  record: MarketSymbolRecord,
+  quote: Partial<MarketData> | null | undefined,
+  market: MarketTab
+): DisplayStock => ({
+  symbol: normalizeMarketSymbol(record.symbol),
+  instrumentName: record.instrument_name,
+  exchange: record.exchange,
+  country: record.country,
+  instrumentType: record.instrument_type,
+  market,
+  currency: inferCurrency(record.symbol, record.exchange, quote?.currency),
+  price: quote?.price,
+  change: quote?.change,
+  changePercent: quote?.change_percent,
+  source: 'quotes',
+});
 
-  const now = new Date();
-  const start = new Date();
-
-  switch (selectedTimeframe) {
-    case '1D':
-      interval = '15m';
-      start.setDate(now.getDate() - 1);
-      startDate = start.toISOString().split('T')[0];
-      break;
-    case '1W':
-      interval = '1h';
-      start.setDate(now.getDate() - 7);
-      startDate = start.toISOString().split('T')[0];
-      break;
-    case '1M':
-      interval = '1d';
-      start.setMonth(now.getMonth() - 1);
-      startDate = start.toISOString().split('T')[0];
-      break;
-    case '3M':
-      interval = '1d';
-      start.setMonth(now.getMonth() - 3);
-      startDate = start.toISOString().split('T')[0];
-      break;
-    case '1Y':
-      interval = '1wk';
-      start.setFullYear(now.getFullYear() - 1);
-      startDate = start.toISOString().split('T')[0];
-      break;
-    default:
-      interval = '1d';
-  }
-
-  return { interval, startDate, endDate };
-};
-
-const getChartRefreshInterval = (selectedTimeframe: string): number => {
-  switch (selectedTimeframe) {
-    case '1D':
-      return 15000;
-    case '1W':
-      return 30000;
-    default:
-      return 60000;
-  }
-};
-
-const applyQuoteToChartData = (
-  existingData: ChartPoint[],
-  quote: Partial<MarketData> | null
-): ChartPoint[] => {
-  if (!quote || existingData.length === 0 || !Number.isFinite(quote.price)) {
-    return existingData;
-  }
-
-  const timestamp = quote.timestamp || new Date().toISOString();
-  const nextPoint: ChartPoint = {
-    timestamp,
-    time: formatChartLabel(timestamp),
-    price: quote.price ?? NaN,
-    volume: toFiniteNumber(quote.volume),
-  };
-
-  const updatedData = [...existingData];
-  const lastIndex = updatedData.length - 1;
-  const lastPoint = updatedData[lastIndex];
-
-  if (!lastPoint) {
-    return [nextPoint];
-  }
-
-  const nextTime = new Date(timestamp).getTime();
-  const lastTime = new Date(lastPoint.timestamp).getTime();
-
-  if (Number.isFinite(nextTime) && Number.isFinite(lastTime) && nextTime > lastTime) {
-    updatedData[lastIndex] = {
-      ...lastPoint,
-      price: nextPoint.price,
-      volume: nextPoint.volume,
-    };
-    return updatedData;
-  }
-
-  updatedData[lastIndex] = {
-    ...lastPoint,
-    price: nextPoint.price,
-    volume: nextPoint.volume,
-  };
-
-  return updatedData;
-};
+const mapMoverRecordToDisplay = (record: MarketMoverRecord): DisplayStock => ({
+  symbol: normalizeMarketSymbol(record.symbol),
+  instrumentName: record.instrument_name,
+  exchange: record.exchange,
+  country: record.country,
+  instrumentType: record.instrument_type,
+  market: record.market,
+  currency: inferCurrency(record.symbol, record.exchange, record.currency ?? undefined),
+  price: record.price ?? undefined,
+  change: record.change ?? undefined,
+  changePercent: record.change_percent ?? undefined,
+  source: 'snapshot',
+});
 
 export default function MarketPage() {
-  const wsManagerRef = useRef<WebSocketManager | null>(null);
-  const selectedSymbolRef = useRef('AAPL');
-  const [selectedTimeframe, setSelectedTimeframe] = useState('1D');
-  const [selectedSymbol, setSelectedSymbol] = useState('AAPL');
+  const hasLoadedStocksRef = useRef(false);
   const [selectedMarket, setSelectedMarket] = useState<MarketTab>('US');
   const [selectedBoardMode, setSelectedBoardMode] = useState<BoardMode>('all');
-  const [marketStocks, setMarketStocks] = useState<StockData[]>([]);
-  const [chartData, setChartData] = useState<ChartPoint[]>([]);
-  const [selectedQuote, setSelectedQuote] = useState<MarketQuoteResult | null>(null);
+  const [selectedInstrumentType, setSelectedInstrumentType] = useState<MarketInstrumentType>('Common Stock');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [marketStocks, setMarketStocks] = useState<DisplayStock[]>([]);
   const [loading, setLoading] = useState(true);
-  const [chartLoading, setChartLoading] = useState(false);
-  const [chartRefreshing, setChartRefreshing] = useState(false);
-  const [lastChartUpdatedAt, setLastChartUpdatedAt] = useState<string | null>(null);
-  const [chartMeta, setChartMeta] = useState<MarketDataMeta | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
-  const [refreshNonce, setRefreshNonce] = useState(0);
-  const [minChangePercentInput, setMinChangePercentInput] = useState('');
-  const [maxChangePercentInput, setMaxChangePercentInput] = useState('');
-  
-  // 搜索相关状态
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [range, setRange] = useState<ChangePercentRange>({ min: null, max: null });
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
-  const [showSearchResults, setShowSearchResults] = useState(false);
+  const [searchResults, setSearchResults] = useState<MarketSymbolRecord[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [snapshotCapturedAt, setSnapshotCapturedAt] = useState<string | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  const rangeError = getChangePercentRangeError(range);
+  const filteredStocks = filterStocksByChangePercentRange(marketStocks, range);
+  const visibleStocks = rangeError ? marketStocks : filteredStocks;
+  const isAllMode = selectedBoardMode === 'all';
+  const isSearching = searchQuery.trim().length > 0;
+  const canGoNext = isAllMode && hasNextMarketPage(currentPage, pageSize, total);
+  const canGoPrevious = isAllMode && currentPage > 1;
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedMarket, selectedInstrumentType]);
 
   useEffect(() => {
     let cancelled = false;
 
-    const fetchMarketStocks = async () => {
-      setLoading(true);
+    const loadStocks = async () => {
+      setError(null);
+      if (hasLoadedStocksRef.current) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
 
       try {
-        const payload = (await marketDataApi.getMarketList(selectedMarket)) as MarketListResponse;
-        const symbols = Array.isArray(payload.data)
-          ? payload.data
-              .map((item) => normalizeSearchSymbol(item))
-              .filter((value, index, all) => value && all.indexOf(value) === index)
-          : [];
-
-        if (symbols.length === 0) {
-          if (!cancelled) {
-            setMarketStocks([]);
-          }
-          return;
-        }
-
-        const quotes = await marketDataApi.getMultipleSymbols(symbols);
-        const detailsBySymbol = new Map(
-          (payload.data ?? []).map((item) => [normalizeSearchSymbol(item), item] as const)
-        );
-
-        const stocks = quotes
-          .filter((item) => item.success)
-          .map((item) => {
-            const normalizedSymbol = item.data?.symbol ?? item.meta.normalized_symbol;
-            const detail = detailsBySymbol.get(normalizedSymbol);
-
-            return {
-              symbol: normalizedSymbol,
-              name: detail?.instrument_name || normalizedSymbol,
-              price: toFiniteNumber(item.data?.price),
-              change: toFiniteNumber(item.data?.change),
-              changePercent: toFiniteNumber(item.data?.change_percent),
-              currency: typeof item.data?.currency === 'string' ? item.data.currency : undefined,
-              exchange:
-                typeof item.data?.exchange === 'string'
-                  ? item.data.exchange
-                  : detail?.exchange,
-            };
+        if (selectedBoardMode === 'all') {
+          const listResponse = await marketDataApi.getMarketList({
+            market: selectedMarket,
+            instrumentType: selectedInstrumentType,
+            page: currentPage,
+            pageSize: PAGE_SIZE,
+            activeOnly: true,
           });
 
-        if (!cancelled) {
-          setMarketStocks(stocks);
+          const symbols = listResponse.data
+            .map((item) => normalizeMarketSymbol(item.symbol))
+            .filter(Boolean);
+          const quoteResults = symbols.length > 0
+            ? await marketDataApi.getMultipleSymbols(symbols)
+            : [];
+          const quoteMap = new Map<string, MarketQuoteResult>();
+
+          quoteResults.forEach((result) => {
+            const key = normalizeMarketSymbol(
+              result.meta?.normalized_symbol ?? result.data?.symbol ?? result.meta?.requested_symbol
+            );
+            if (key) {
+              quoteMap.set(key, result);
+            }
+          });
+
+          const nextStocks = listResponse.data.map((record) =>
+            mapListRecordToDisplay(
+              record,
+              quoteMap.get(normalizeMarketSymbol(record.symbol))?.data,
+              selectedMarket
+            )
+          );
+
+          if (!cancelled) {
+            setMarketStocks(nextStocks);
+            setTotal(listResponse.total || listResponse.count || nextStocks.length);
+            setPageSize(listResponse.page_size || PAGE_SIZE);
+            setSnapshotCapturedAt(null);
+            setLastUpdatedAt(new Date().toISOString());
+            hasLoadedStocksRef.current = true;
+          }
+        } else {
+          const movers = await marketDataApi.getMarketMovers(
+            selectedMarket,
+            selectedInstrumentType,
+            selectedBoardMode
+          );
+
+          if (!cancelled) {
+            setMarketStocks(movers.data.map(mapMoverRecordToDisplay));
+            setTotal(movers.count);
+            setPageSize(PAGE_SIZE);
+            setSnapshotCapturedAt(movers.captured_at);
+            setLastUpdatedAt(new Date().toISOString());
+            hasLoadedStocksRef.current = true;
+          }
         }
-      } catch (error) {
-        console.error("Failed to fetch market data", error);
+      } catch (loadError) {
+        console.error('Failed to load market stocks', loadError);
         if (!cancelled) {
+          setError('加载市场榜单失败，请稍后重试。');
           setMarketStocks([]);
+          setTotal(0);
+          setSnapshotCapturedAt(null);
         }
       } finally {
         if (!cancelled) {
           setLoading(false);
+          setRefreshing(false);
         }
       }
     };
 
-    fetchMarketStocks();
-    // 每30秒刷新一次数据
-    const interval = setInterval(fetchMarketStocks, 30000);
+    loadStocks();
+
     return () => {
       cancelled = true;
-      clearInterval(interval);
     };
-  }, [refreshNonce, selectedMarket]);
+  }, [selectedMarket, selectedBoardMode, selectedInstrumentType, currentPage, refreshNonce]);
 
   useEffect(() => {
-    if (marketStocks.length === 0) {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      setSearchLoading(false);
       return;
     }
 
-    const currentSymbolExists = marketStocks.some((stock) => stock.symbol === selectedSymbol);
-    if (!currentSymbolExists) {
-      setSelectedSymbol(marketStocks[0]?.symbol ?? 'AAPL');
-    }
-  }, [marketStocks, selectedSymbol]);
+    let cancelled = false;
+    setSearchLoading(true);
 
-  // 处理搜索
-  useEffect(() => {
-    const delayDebounceFn = setTimeout(async () => {
-      if (searchQuery.trim().length > 1) {
-        setIsSearching(true);
-        setShowSearchResults(true);
-        try {
-          const response = await marketDataApi.searchSymbols(searchQuery);
-          const rawResults = Array.isArray(response?.data)
-            ? response.data
-            : Array.isArray(response)
-              ? response
-              : [];
-
-          if (rawResults.length > 0) {
-             setSearchResults(filterSearchResultsByMarket(rawResults, selectedMarket));
-          } else {
-             setSearchResults([]);
-          }
-        } catch (error) {
-          console.error("Search failed", error);
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await marketDataApi.searchSymbols(searchQuery.trim());
+        if (!cancelled) {
+          setSearchResults(
+            filterSearchResultsByScope(response.data ?? [], selectedMarket, selectedInstrumentType)
+          );
+        }
+      } catch (searchError) {
+        console.error('Failed to search symbols', searchError);
+        if (!cancelled) {
           setSearchResults([]);
-        } finally {
-          setIsSearching(false);
-        }
-      } else {
-        setSearchResults([]);
-        setShowSearchResults(false);
-      }
-    }, 500);
-
-    return () => clearTimeout(delayDebounceFn);
-  }, [searchQuery, selectedMarket]);
-
-  // 选择搜索结果
-  const handleSelectSymbol = (result: SearchResult) => {
-    const normalizedSymbol = normalizeSearchSymbol(result);
-    setSelectedSymbol(normalizedSymbol);
-    setSearchQuery('');
-    setShowSearchResults(false);
-  };
-
-  useEffect(() => {
-    selectedSymbolRef.current = selectedSymbol;
-  }, [selectedSymbol]);
-
-  useEffect(() => {
-    const wsManager = new WebSocketManager();
-    wsManagerRef.current = wsManager;
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-
-    wsManager.connect(
-      wsUrl,
-      (message) => {
-        if (message?.type !== 'MarketData' || !message.data) {
-          return;
-        }
-
-        const payload = message.data;
-        if (
-          typeof payload.symbol !== 'string' ||
-          payload.symbol.toUpperCase() !== selectedSymbolRef.current.toUpperCase()
-        ) {
-          return;
-        }
-
-        setSelectedQuote({
-          success: true,
-          data: {
-            symbol: payload.symbol,
-            timestamp: payload.timestamp ?? new Date().toISOString(),
-            price: toFiniteNumber(payload.price),
-            volume: toFiniteNumber(payload.volume),
-            exchange: typeof payload.exchange === 'string' ? payload.exchange : undefined,
-            currency: typeof payload.currency === 'string' ? payload.currency : undefined,
-          },
-          meta: {
-            status: 'live',
-            source: 'websocket',
-            fallback_used: false,
-            is_stale: false,
-            degraded: false,
-            requested_symbol: payload.symbol,
-            normalized_symbol: payload.symbol,
-          },
-          error: null,
-        });
-      },
-      () => {
-        setWsConnected(false);
-      },
-      (connected) => setWsConnected(connected)
-    );
-
-    return () => {
-      setWsConnected(false);
-      wsManager.disconnect();
-      wsManagerRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!wsManagerRef.current) {
-      return;
-    }
-
-    wsManagerRef.current.send({
-      type: 'Subscribe',
-      data: {
-        channels: [`market_data:${selectedSymbol}`],
-      },
-    });
-  }, [selectedSymbol]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const fetchSelectedQuote = async () => {
-      try {
-        const quote = await marketDataApi.getRealTimeData(selectedSymbol);
-        if (!cancelled) {
-          setSelectedQuote(quote);
-        }
-      } catch (error) {
-        console.error('Failed to fetch selected symbol quote', error);
-      }
-    };
-
-    fetchSelectedQuote();
-    const interval = setInterval(fetchSelectedQuote, 10000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [selectedSymbol]);
-
-  // 获取图表数据
-  useEffect(() => {
-    let cancelled = false;
-
-    const generateChartData = async (backgroundRefresh = false) => {
-      if (backgroundRefresh) {
-        setChartRefreshing(true);
-      } else {
-        setChartLoading(true);
-      }
-
-      try {
-        const { interval, startDate, endDate } = getHistoryParams(selectedTimeframe);
-        const history = await marketDataApi.getHistoricalData(selectedSymbol, startDate, endDate, interval);
-        if (!cancelled) {
-          setChartMeta(history.meta);
-        }
-
-        if (!history.success || !Array.isArray(history.data) || history.data.length === 0) {
-          if (!cancelled) {
-            setChartData([]);
-          }
-          return;
-        }
-
-        const formattedData = history.data
-          .map((item) => ({
-            timestamp: typeof item.timestamp === 'string' ? item.timestamp : '',
-            time: typeof item.timestamp === 'string' ? formatChartLabel(item.timestamp) : '',
-            price: toFiniteNumber(item.price ?? item.close, NaN),
-            volume: toFiniteNumber(item.volume),
-          }))
-          .filter((item) => item.timestamp && Number.isFinite(item.price));
-
-        formattedData.sort(
-          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-        );
-
-        const mergedData = applyQuoteToChartData(formattedData, selectedQuote?.data ?? null);
-
-        if (!cancelled) {
-          setChartData(mergedData);
-          setLastChartUpdatedAt(new Date().toISOString());
-        }
-      } catch (error) {
-        console.error('Failed to fetch historical data', error);
-        if (!cancelled) {
-          setChartData([]);
         }
       } finally {
         if (!cancelled) {
-          if (backgroundRefresh) {
-            setChartRefreshing(false);
-          } else {
-            setChartLoading(false);
-          }
+          setSearchLoading(false);
         }
       }
-    };
-
-    generateChartData();
-    const interval = setInterval(
-      () => generateChartData(true),
-      getChartRefreshInterval(selectedTimeframe)
-    );
+    }, 250);
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      window.clearTimeout(timer);
     };
-  }, [selectedSymbol, selectedTimeframe, selectedQuote]);
+  }, [searchQuery, selectedMarket, selectedInstrumentType]);
 
-  useEffect(() => {
-    setChartData((currentData) => applyQuoteToChartData(currentData, selectedQuote?.data ?? null));
-  }, [selectedQuote]);
-
-  const selectedStock = marketStocks.find(s => s.symbol === selectedSymbol);
-  const selectedMarketData = selectedQuote?.data
-    ? {
-        symbol: selectedQuote.data.symbol,
-        price: toFiniteNumber(selectedQuote.data.price),
-        change: toFiniteNumber(selectedQuote.data.change),
-        changePercent: toFiniteNumber(selectedQuote.data.change_percent),
-        exchange: selectedQuote.data.exchange,
-        currency: selectedQuote.data.currency,
-      }
-    : selectedStock
-      ? {
-          symbol: selectedStock.symbol,
-          price: selectedStock.price,
-          change: selectedStock.change,
-          changePercent: selectedStock.changePercent,
-          exchange: selectedStock.exchange,
-          currency: selectedStock.currency,
-        }
-      : null;
-  const selectedCurrency = inferCurrency(
-    selectedMarketData?.symbol ?? selectedSymbol,
-    selectedMarketData?.exchange,
-    selectedMarketData?.currency
-  );
-  const isPositive = selectedMarketData ? selectedMarketData.change >= 0 : true;
-  const quoteMeta = selectedQuote?.meta;
-  const changePercentRange: ChangePercentRange = {
-    min: parseOptionalNumber(minChangePercentInput),
-    max: parseOptionalNumber(maxChangePercentInput),
+  const handleRangeChange = (key: 'min' | 'max', value: string) => {
+    setRange((current) => ({
+      ...current,
+      [key]: parseRangeInput(value),
+    }));
   };
-  const changePercentRangeError = getChangePercentRangeError(changePercentRange);
-  const displayedStocks = filterStocksByChangePercentRange(
-    sortStocksByBoardMode(marketStocks, selectedBoardMode),
-    changePercentRange
-  );
-  const marketLabel = selectedMarket === 'US' ? '美股市场' : '港股市场';
-  const boardOptions: Array<{ value: BoardMode; label: string }> = [
-    { value: 'all', label: '全部' },
-    { value: 'gainers', label: '涨幅榜' },
-    { value: 'losers', label: '跌幅榜' },
-  ];
-  const marketTabs: Array<{ value: MarketTab; label: string }> = [
-    { value: 'US', label: '美股' },
-    { value: 'HK', label: '港股' },
-  ];
+
+  const handleResetFilters = () => {
+    setSearchQuery('');
+    setSearchResults([]);
+    setRange({ min: null, max: null });
+    setCurrentPage(1);
+  };
+
+  const marketTitle = selectedMarket === 'US' ? '美股榜单' : '港股榜单';
+  const showingEmptyByFilter = !loading && !error && marketStocks.length > 0 && visibleStocks.length === 0;
+  const showingEmptyByUniverse = !loading && !error && marketStocks.length === 0;
 
   return (
-    <div className="p-6 space-y-6 max-w-[1600px] mx-auto">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight text-foreground">市场概览</h1>
-          <p className="text-muted-foreground mt-1">按市场切换查看实时行情、涨幅榜和跌幅榜</p>
-        </div>
-        
-        {/* 搜索框 */}
-        <div className="relative w-full md:w-80">
-          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-            <Search className="h-4 w-4 text-muted-foreground" />
-          </div>
-          <input
-            type="text"
-            className="block w-full pl-10 pr-3 py-2.5 border border-input rounded-lg leading-5 bg-background/50 backdrop-blur-sm text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent sm:text-sm shadow-sm transition-all"
-            placeholder="搜索代码 (例如: AAPL)"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-          {isSearching && (
-            <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none">
-              <Loader2 className="h-4 w-4 text-muted-foreground animate-spin" />
-            </div>
-          )}
-          
-          {/* 搜索结果下拉框 */}
-          {showSearchResults && searchResults.length > 0 && (
-            <div className="absolute z-50 mt-2 w-full bg-popover text-popover-foreground shadow-xl rounded-lg py-1 ring-1 ring-black ring-opacity-5 overflow-hidden max-h-80 overflow-y-auto">
-              {searchResults.map((result, index) => (
-                <div
-                  key={`${result.symbol}-${index}`}
-                  className="cursor-pointer select-none relative py-3 pl-4 pr-4 hover:bg-accent hover:text-accent-foreground transition-colors border-b border-border/50 last:border-0"
-                  onMouseDown={() => handleSelectSymbol(result)}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="font-bold text-sm">{result.symbol}</span>
-                    <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{result.instrument_type}</span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span className="truncate max-w-[180px]">{result.instrument_name}</span>
-                    <span>{result.exchange}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          {showSearchResults && !isSearching && searchResults.length === 0 && searchQuery.trim().length > 1 && (
-            <div className="absolute z-50 mt-2 w-full bg-popover text-popover-foreground shadow-xl rounded-lg px-4 py-3 ring-1 ring-black ring-opacity-5 text-sm text-muted-foreground">
-              当前市场没有匹配标的
-            </div>
-          )}
-        </div>
-      </div>
+    <div className="mx-auto max-w-[1400px] space-y-6 p-6">
+      <MarketModuleNav current="leaderboard" />
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* 左侧图表区域 */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="bg-card text-card-foreground p-6 rounded-xl shadow-sm border border-border">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
-              <div className="flex items-center gap-4">
-                <div>
-                  <h3 className="text-2xl font-bold">{selectedSymbol}</h3>
-                  <div className="flex items-center gap-2 mt-1">
-                    {selectedMarketData && (
-                      <>
-                        <span className="text-xl font-mono">
-                          {formatMarketPrice(selectedMarketData.price, {
-                            symbol: selectedMarketData.symbol,
-                            exchange: selectedMarketData.exchange,
-                            currency: selectedMarketData.currency,
-                          })}
-                        </span>
-                        <span className={`flex items-center text-sm font-medium px-2 py-0.5 rounded ${isPositive ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'}`}>
-                          {isPositive ? <TrendingUp className="w-3 h-3 mr-1" /> : <TrendingDown className="w-3 h-3 mr-1" />}
-                          {selectedMarketData.change >= 0 ? '+' : ''}{formatMarketNumber(selectedMarketData.change)} ({formatMarketNumber(selectedMarketData.changePercent)}%)
-                        </span>
-                      </>
-                    )}
-                    {quoteMeta && (
-                      <span className={`text-xs px-2 py-0.5 rounded-full ${
-                        quoteMeta.status === 'degraded'
-                          ? 'bg-yellow-100 text-yellow-700'
-                          : quoteMeta.status === 'error'
-                            ? 'bg-red-100 text-red-700'
-                            : 'bg-secondary text-secondary-foreground'
-                      }`}>
-                        {getMarketStatusLabel(quoteMeta)} / {quoteMeta.source}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-              
-              <div className="flex items-center gap-3">
-                <div className="text-right">
-                  <div className="text-xs text-muted-foreground">图表刷新</div>
-                  <div className="text-xs font-medium flex items-center justify-end gap-1">
-                    <RefreshCw className={`h-3 w-3 ${chartRefreshing ? 'animate-spin' : ''}`} />
-                    {lastChartUpdatedAt
-                      ? new Date(lastChartUpdatedAt).toLocaleTimeString('zh-CN', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                          hour12: false,
-                        })
-                      : '--:--:--'}
-                  </div>
-                  <div className={`text-[11px] ${wsConnected ? 'text-success' : 'text-muted-foreground'}`}>
-                    {wsConnected ? 'WebSocket 已连接' : 'WebSocket 断开，使用轮询'}
-                  </div>
-                </div>
-
-                <div className="flex bg-secondary/50 p-1 rounded-lg">
-                  {['1D', '1W', '1M', '3M', '1Y'].map((timeframe) => (
-                    <button
-                      key={timeframe}
-                      onClick={() => setSelectedTimeframe(timeframe)}
-                      className={`px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
-                        selectedTimeframe === timeframe
-                          ? 'bg-background text-foreground shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-                      }`}
-                    >
-                      {timeframe}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            
-            <div className="h-[400px] w-full">
-              {chartLoading ? (
-                <div className="h-full w-full flex items-center justify-center">
-                  <Loader2 className="h-8 w-8 text-primary animate-spin" />
-                </div>
-              ) : chartData.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={chartData}>
-                    <defs>
-                      <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={isPositive ? "hsl(var(--success))" : "hsl(var(--destructive))"} stopOpacity={0.2}/>
-                        <stop offset="95%" stopColor={isPositive ? "hsl(var(--success))" : "hsl(var(--destructive))"} stopOpacity={0}/>
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" opacity={0.4} />
-                    <XAxis 
-                      dataKey="time" 
-                      stroke="hsl(var(--muted-foreground))" 
-                      fontSize={12} 
-                      tickLine={false}
-                      axisLine={false}
-                      minTickGap={30}
-                    />
-                    <YAxis 
-                      domain={['auto', 'auto']} 
-                      stroke="hsl(var(--muted-foreground))" 
-                      fontSize={12} 
-                      tickLine={false}
-                      axisLine={false}
-                      tickFormatter={(value) => `$${toFiniteNumber(value).toFixed(0)}`}
-                    />
-                    <Tooltip 
-                      contentStyle={{ 
-                        backgroundColor: "hsl(var(--popover))", 
-                        borderColor: "hsl(var(--border))",
-                        borderRadius: "var(--radius)",
-                        color: "hsl(var(--popover-foreground))"
-                      }}
-                      formatter={(value: number | string) => [
-                        formatMarketPrice(toFiniteNumber(value), {
-                          symbol: selectedSymbol,
-                          currency: selectedCurrency,
-                        }),
-                        'Price',
-                      ]}
-                      labelStyle={{ color: "hsl(var(--muted-foreground))" }}
-                    />
-                    <Area 
-                      type="monotone" 
-                      dataKey="price" 
-                      stroke={isPositive ? "hsl(var(--success))" : "hsl(var(--destructive))"} 
-                      strokeWidth={2}
-                      fillOpacity={1} 
-                      fill="url(#colorPrice)" 
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              ) : (
-                <div className="h-full w-full flex flex-col items-center justify-center text-muted-foreground bg-secondary/20 rounded-lg">
-                  <TrendingUp className="h-12 w-12 mb-2 opacity-20" />
-                  <p>暂无此时间段的图表数据</p>
-                  {chartMeta?.message && (
-                    <p className="mt-2 text-xs">{chartMeta.message}</p>
-                  )}
-                </div>
-              )}
-            </div>
-            {chartMeta?.status === 'degraded' && (
-              <div className="mt-4 text-xs text-yellow-700 bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-2">
-                图表数据使用降级源 `{chartMeta.source}`。{chartMeta.message ?? '上游返回不完整，已回退到备用来源。'}
-              </div>
-            )}
-          </div>
-          
-          <MarketDataWidget symbol={selectedSymbol} />
-        </div>
-
-        {/* 右侧列表区域 */}
-        <div className="space-y-6">
-          <div className="bg-card text-card-foreground p-6 rounded-xl shadow-sm border border-border">
-            <div className="flex items-center justify-between gap-3 mb-6">
+      <section className="overflow-hidden rounded-[28px] border border-border bg-card shadow-sm">
+        <div className="border-b border-border bg-gradient-to-r from-slate-950 via-slate-900 to-slate-800 px-6 py-6 text-slate-50">
+          <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
+            <div className="space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-300">
+                Market Movers
+              </p>
               <div>
-                <h3 className="text-lg font-bold">{marketLabel}</h3>
-                <p className="text-xs text-muted-foreground mt-1">按当前市场查看全部股票、涨幅榜和跌幅榜</p>
+                <h1 className="text-3xl font-semibold tracking-tight">{marketTitle}</h1>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+                  市场模块现在把榜单单独拉出来，专门用于浏览全市场股票、涨跌榜和区间筛选。
+                </p>
               </div>
-              <button 
-                onClick={() => setRefreshNonce((value) => value + 1)}
-                disabled={loading}
-                className="p-2 hover:bg-secondary rounded-full transition-colors text-muted-foreground hover:text-foreground"
-                aria-label="刷新市场列表"
-              >
-                <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-              </button>
             </div>
 
-            <div
-              role="tablist"
-              aria-label="市场切换"
-              className="flex items-center gap-2 rounded-lg bg-secondary/40 p-1 mb-4"
-            >
-              {marketTabs.map((tab) => (
-                <button
-                  key={tab.value}
-                  role="tab"
-                  type="button"
-                  aria-selected={selectedMarket === tab.value}
-                  onClick={() => setSelectedMarket(tab.value)}
-                  className={`flex-1 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-                    selectedMarket === tab.value
-                      ? 'bg-background text-foreground shadow-sm'
-                      : 'text-muted-foreground hover:bg-background/60 hover:text-foreground'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-center gap-2 mb-6">
-              {boardOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => setSelectedBoardMode(option.value)}
-                  className={`rounded-full px-3 py-1.5 text-sm font-medium transition-colors ${
-                    selectedBoardMode === option.value
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-secondary/70 text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
-              <label className="text-xs text-muted-foreground">
-                最小涨跌幅
-                <input
-                  aria-label="最小涨跌幅"
-                  type="number"
-                  value={minChangePercentInput}
-                  onChange={(e) => setMinChangePercentInput(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="例如 5"
-                />
-              </label>
-              <label className="text-xs text-muted-foreground">
-                最大涨跌幅
-                <input
-                  aria-label="最大涨跌幅"
-                  type="number"
-                  value={maxChangePercentInput}
-                  onChange={(e) => setMaxChangePercentInput(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="例如 -5"
-                />
-              </label>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setMinChangePercentInput('');
-                setMaxChangePercentInput('');
-              }}
-              className="mb-4 text-xs text-muted-foreground hover:text-foreground"
-            >
-              重置筛选
-            </button>
-
-            {changePercentRangeError && (
-              <div className="mb-4 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                {changePercentRangeError}
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">当前模式</div>
+                <div className="mt-2 text-lg font-semibold text-white">
+                  {selectedBoardMode === 'all'
+                    ? '分页全市场'
+                    : selectedBoardMode === 'gainers'
+                      ? '涨幅快照'
+                      : '跌幅快照'}
+                </div>
               </div>
-            )}
-            
-            {loading ? (
-              <div className="space-y-4">
-                {[...Array(6)].map((_, i) => (
-                  <div key={i} className="animate-pulse flex items-center justify-between p-3">
-                    <div className="space-y-2">
-                      <div className="h-4 w-12 bg-secondary rounded"></div>
-                      <div className="h-3 w-24 bg-secondary rounded"></div>
-                    </div>
-                    <div className="space-y-2 flex flex-col items-end">
-                      <div className="h-4 w-16 bg-secondary rounded"></div>
-                      <div className="h-3 w-12 bg-secondary rounded"></div>
-                    </div>
-                  </div>
-                ))}
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">品类</div>
+                <div className="mt-2 text-lg font-semibold text-white">
+                  {getMarketInstrumentTypeLabel(selectedInstrumentType)}
+                </div>
               </div>
-            ) : displayedStocks.length > 0 ? (
-              <div className="space-y-2">
-                {displayedStocks.map((stock) => (
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">最近刷新</div>
+                <div className="mt-2 text-sm font-medium text-white">
+                  {snapshotCapturedAt ?? lastUpdatedAt ?? '等待加载'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-6 px-6 py-6 xl:grid-cols-[300px_minmax(0,1fr)]">
+          <aside className="space-y-5">
+            <div className="rounded-2xl border border-border bg-secondary/20 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                市场
+              </p>
+              <div className="mt-3 flex gap-2">
+                {MARKET_TABS.map((tab) => (
                   <button
+                    key={tab.key}
                     type="button"
-                    key={stock.symbol} 
-                    className={`flex items-center justify-between p-3 rounded-lg cursor-pointer transition-all border border-transparent ${
-                      selectedSymbol === stock.symbol 
-                        ? 'bg-secondary border-border shadow-sm' 
-                        : 'hover:bg-secondary/50'
-                    }`}
-                    onClick={() => setSelectedSymbol(stock.symbol)}
-                    aria-label={`选择股票 ${stock.symbol}`}
+                    role="tab"
+                    aria-selected={selectedMarket === tab.key}
+                    className={clsx(
+                      'flex-1 rounded-xl px-4 py-2.5 text-sm font-medium transition-colors',
+                      selectedMarket === tab.key
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'bg-background text-muted-foreground hover:bg-secondary hover:text-foreground'
+                    )}
+                    onClick={() => setSelectedMarket(tab.key)}
                   >
-                    <div>
-                      <div className="font-bold">{stock.symbol}</div>
-                      <div className="text-xs text-muted-foreground">{stock.name}</div>
-                    </div>
-                    <div className="text-right">
-                      <div className="font-mono font-medium">
-                        {formatMarketPrice(stock.price, {
-                          symbol: stock.symbol,
-                          exchange: stock.exchange,
-                          currency: stock.currency,
-                        })}
-                      </div>
-                      <div className={`text-xs font-medium flex items-center justify-end ${stock.change >= 0 ? 'text-success' : 'text-destructive'}`}>
-                        {stock.change >= 0 ? '+' : ''}{stock.changePercent.toFixed(2)}%
-                      </div>
-                    </div>
+                    {tab.label}
                   </button>
                 ))}
               </div>
-            ) : (
-              <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
-                {marketStocks.length === 0 ? '当前市场暂无可展示股票' : '当前筛选下暂无股票'}
+            </div>
+
+            <div className="rounded-2xl border border-border bg-secondary/20 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                榜单模式
+              </p>
+              <div className="mt-3 space-y-2">
+                {BOARD_OPTIONS.map((option) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    aria-label={option.label}
+                    className={clsx(
+                      'flex w-full items-start justify-between rounded-xl border px-3 py-3 text-left transition-colors',
+                      selectedBoardMode === option.key
+                        ? 'border-primary bg-primary/10 text-foreground'
+                        : 'border-border bg-background hover:border-primary/40 hover:bg-secondary/40'
+                    )}
+                    onClick={() => {
+                      setSelectedBoardMode(option.key);
+                      setCurrentPage(1);
+                    }}
+                  >
+                      <span>
+                        <span className="block text-sm font-semibold">{option.label}</span>
+                        <span
+                          aria-hidden="true"
+                          className="mt-1 block text-xs leading-5 text-muted-foreground"
+                        >
+                          {option.description}
+                        </span>
+                      </span>
+                    {option.key === 'gainers' ? (
+                      <TrendingUp className="mt-0.5 h-4 w-4 text-success" />
+                    ) : option.key === 'losers' ? (
+                      <TrendingDown className="mt-0.5 h-4 w-4 text-destructive" />
+                    ) : (
+                      <div className="mt-1 h-4 w-4 rounded-full border border-border" />
+                    )}
+                  </button>
+                ))}
               </div>
-            )}
-          </div>
-          
-          {/* 这里可以放其他小组件，如市场情绪、新闻等 */}
-          <div className="bg-gradient-to-br from-primary/10 to-transparent p-6 rounded-xl border border-primary/20">
-            <h3 className="text-lg font-bold mb-2 text-primary">小贴士</h3>
-            <p className="text-sm text-muted-foreground">
-              使用搜索栏查找 Twelve Data 支持的任何股票、ETF 或加密货币对。
-              尝试搜索 &quot;BTC/USD&quot; 或 &quot;EUR/USD&quot;。
-            </p>
-          </div>
+            </div>
+
+            <div className="rounded-2xl border border-border bg-secondary/20 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                品类
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {INSTRUMENT_TYPES.map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    className={clsx(
+                      'rounded-xl px-4 py-2 text-sm font-medium transition-colors',
+                      selectedInstrumentType === type
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'bg-background text-muted-foreground hover:bg-secondary hover:text-foreground'
+                    )}
+                    onClick={() => setSelectedInstrumentType(type)}
+                  >
+                    {getMarketInstrumentTypeLabel(type)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-border bg-secondary/20 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                  涨跌幅区间
+                </p>
+                <button
+                  type="button"
+                  className="text-xs font-medium text-primary hover:opacity-80"
+                  onClick={handleResetFilters}
+                >
+                  重置筛选
+                </button>
+              </div>
+
+              <div className="mt-3 space-y-3">
+                <label className="block text-sm">
+                  <span className="mb-1 block text-muted-foreground">最小涨跌幅</span>
+                  <input
+                    aria-label="最小涨跌幅"
+                    type="number"
+                    inputMode="decimal"
+                    className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={range.min ?? ''}
+                    onChange={(event) => handleRangeChange('min', event.target.value)}
+                    placeholder="例如 5"
+                  />
+                </label>
+
+                <label className="block text-sm">
+                  <span className="mb-1 block text-muted-foreground">最大涨跌幅</span>
+                  <input
+                    aria-label="最大涨跌幅"
+                    type="number"
+                    inputMode="decimal"
+                    className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={range.max ?? ''}
+                    onChange={(event) => handleRangeChange('max', event.target.value)}
+                    placeholder="例如 -5"
+                  />
+                </label>
+
+                {rangeError ? (
+                  <p className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                    {rangeError}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-border bg-secondary/20 p-4">
+              <label className="block text-sm">
+                <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                  搜索标的
+                </span>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="text"
+                    className="w-full rounded-xl border border-border bg-background pl-9 pr-3 py-2.5 text-sm outline-none transition focus:border-primary"
+                    placeholder="搜索代码 (例如: AAPL)"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                  />
+                </div>
+              </label>
+
+              {searchQuery.trim() ? (
+                <div className="mt-3 rounded-xl border border-border bg-background">
+                  <div className="flex items-center justify-between border-b border-border px-3 py-2 text-xs text-muted-foreground">
+                    <span>当前范围搜索结果</span>
+                    {searchLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <span>{searchResults.length} 条</span>}
+                  </div>
+                  <div className="max-h-72 overflow-y-auto">
+                    {searchResults.length > 0 ? (
+                      searchResults.map((item) => {
+                        const symbol = normalizeMarketSymbol(item.symbol);
+                        return (
+                          <Link
+                            key={`${item.symbol}-${item.instrument_type}`}
+                            href={buildMarketModuleHref('/market/chart', symbol)}
+                            aria-label={`打开 ${item.instrument_name} (${symbol}) 曲线页`}
+                            className="flex items-center justify-between gap-3 border-b border-border px-3 py-3 text-sm last:border-b-0 hover:bg-secondary/40"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-medium text-foreground">{item.instrument_name}</div>
+                              <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                                {symbol} · {item.exchange}
+                              </div>
+                            </div>
+                            <span className="rounded-full bg-secondary px-2 py-1 text-[11px] text-muted-foreground">
+                              {getMarketInstrumentTypeLabel(item.instrument_type)}
+                            </span>
+                          </Link>
+                        );
+                      })
+                    ) : (
+                      <p className="px-3 py-4 text-sm text-muted-foreground">
+                        当前市场和品类范围内没有匹配结果。
+                      </p>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </aside>
+
+          <section className="space-y-4">
+            <div className="flex flex-col gap-4 rounded-2xl border border-border bg-background p-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-foreground">当前结果</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {selectedBoardMode === 'all'
+                    ? `当前展示 ${getMarketInstrumentTypeLabel(selectedInstrumentType)}，第 ${currentPage} 页，共 ${total} 只。`
+                    : `当前展示 ${getMarketInstrumentTypeLabel(selectedInstrumentType)} 的${selectedBoardMode === 'gainers' ? '涨幅榜' : '跌幅榜'}快照。`}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {isAllMode ? (
+                  <>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-xl border border-border px-3 py-2 text-sm text-muted-foreground transition hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"
+                      onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+                      disabled={!canGoPrevious}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-xl border border-border px-3 py-2 text-sm text-muted-foreground transition hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"
+                      onClick={() => setCurrentPage((page) => page + 1)}
+                      disabled={!canGoNext}
+                    >
+                      下一页
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
+                  onClick={() => setRefreshNonce((current) => current + 1)}
+                >
+                  {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  刷新榜单
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="grid grid-cols-[1.8fr_1.05fr_0.95fr_0.95fr_0.7fr] gap-3 border-b border-border bg-secondary/40 px-5 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                <span>标的</span>
+                <span className="text-right">最新价</span>
+                <span className="text-right">涨跌额</span>
+                <span className="text-right">涨跌幅</span>
+                <span className="text-right">操作</span>
+              </div>
+
+              {loading ? (
+                <div className="flex items-center justify-center gap-3 px-6 py-16 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  正在加载市场股票池...
+                </div>
+              ) : error ? (
+                <div className="px-6 py-12">
+                  <div className="rounded-2xl border border-destructive/30 bg-destructive/5 px-4 py-4 text-sm text-destructive">
+                    {error}
+                  </div>
+                </div>
+              ) : showingEmptyByUniverse ? (
+                <div className="px-6 py-12">
+                  <div className="rounded-2xl border border-dashed border-border bg-secondary/20 px-4 py-10 text-center">
+                    <p className="text-lg font-medium text-foreground">当前市场暂无可展示股票</p>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      可以先切换市场或品类，也可以手动刷新一次榜单。
+                    </p>
+                  </div>
+                </div>
+              ) : showingEmptyByFilter ? (
+                <div className="px-6 py-12">
+                  <div className="rounded-2xl border border-dashed border-border bg-secondary/20 px-4 py-10 text-center">
+                    <p className="text-lg font-medium text-foreground">当前筛选下暂无股票</p>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      放宽涨跌幅区间，或者点击“重置筛选”快速恢复。
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  {visibleStocks.map((stock) => {
+                    const positive = (stock.change ?? 0) >= 0;
+                    const changeClass = positive ? 'text-success' : 'text-destructive';
+                    return (
+                      <div
+                        key={`${stock.symbol}-${stock.instrumentType}-${selectedBoardMode}`}
+                        className="grid grid-cols-[1.8fr_1.05fr_0.95fr_0.95fr_0.7fr] gap-3 border-b border-border px-5 py-4 text-sm last:border-b-0"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate font-semibold text-foreground">{stock.instrumentName}</div>
+                          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                            <span className="font-mono">{stock.symbol}</span>
+                            <span>{stock.exchange}</span>
+                            <span>{getMarketInstrumentTypeLabel(stock.instrumentType)}</span>
+                            {stock.source === 'snapshot' ? (
+                              <span className="rounded-full bg-secondary px-2 py-0.5">快照</span>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        <div className="text-right font-mono font-semibold text-foreground">
+                          {formatMarketPrice(stock.price, {
+                            symbol: stock.symbol,
+                            exchange: stock.exchange,
+                            currency: stock.currency,
+                          })}
+                        </div>
+                        <div className={clsx('text-right font-mono font-semibold', changeClass)}>
+                          {stock.change !== undefined
+                            ? `${positive ? '+' : ''}${formatMarketNumber(stock.change)}`
+                            : 'N/A'}
+                        </div>
+                        <div className={clsx('text-right font-mono font-semibold', changeClass)}>
+                          {stock.changePercent !== undefined
+                            ? `${positive ? '+' : ''}${formatMarketNumber(stock.changePercent)}%`
+                            : 'N/A'}
+                        </div>
+                        <div className="flex justify-end gap-2">
+                          <Link
+                            href={buildMarketModuleHref('/market/chart', stock.symbol)}
+                            className="inline-flex items-center rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground transition hover:bg-secondary"
+                          >
+                            看曲线
+                          </Link>
+                          <Link
+                            href={buildMarketModuleHref('/market/orderbook', stock.symbol)}
+                            className="inline-flex items-center rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground transition hover:bg-secondary"
+                          >
+                            看订单簿
+                          </Link>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-border bg-secondary/20 px-4 py-4 text-sm text-muted-foreground">
+              <p className="font-medium text-foreground">使用说明</p>
+              <p className="mt-2 leading-6">
+                “全部”模式走分页浏览，适合看完整股票池；“涨幅榜 / 跌幅榜”走后端 snapshot，更适合快速扫当日强弱股。
+                区间筛选会在当前结果集上继续过滤，便于直接找出指定涨跌幅区间的股票。
+              </p>
+            </div>
+          </section>
         </div>
-      </div>
+      </section>
     </div>
   );
 }

@@ -9,6 +9,7 @@ const apiMocks = vi.hoisted(() => ({
   getHistoricalData: vi.fn(),
   getMultipleSymbols: vi.fn(),
   getMarketList: vi.fn(),
+  getMarketMovers: vi.fn(),
   getStrategies: vi.fn(),
   createStrategy: vi.fn(),
   updateStrategy: vi.fn(),
@@ -70,6 +71,7 @@ vi.mock('@/lib/api', () => ({
     getHistoricalData: apiMocks.getHistoricalData,
     getMultipleSymbols: apiMocks.getMultipleSymbols,
     getMarketList: apiMocks.getMarketList,
+    getMarketMovers: apiMocks.getMarketMovers,
     searchSymbols: apiMocks.searchSymbols,
   },
   WebSocketManager: class {
@@ -91,6 +93,11 @@ vi.mock('@/lib/api', () => ({
 vi.mock('@/components/market/MarketDataWidget', () => ({
   MarketDataWidget: ({ symbol = 'AAPL' }: { symbol?: string }) =>
     React.createElement('div', { 'data-testid': 'market-data-widget' }, `订单簿详情:${symbol}`),
+}));
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => window.location.pathname,
+  useSearchParams: () => new URLSearchParams(window.location.search),
 }));
 
 vi.mock('recharts', () => {
@@ -119,6 +126,8 @@ import StrategiesPage from '../src/app/strategies/page';
 import BacktestPage from '../src/app/backtest/page';
 import TradingPage from '../src/app/trading/page';
 import MarketPage from '../src/app/market/page';
+import MarketChartPage from '../src/app/market/chart/page';
+import MarketOrderbookPage from '../src/app/market/orderbook/page';
 
 const strategy = {
   id: 'strategy-001',
@@ -415,20 +424,26 @@ const ignoredReview = {
 };
 
 const usMarketList = {
+  total: 4,
+  page: 1,
+  page_size: 2,
   count: 3,
   data: [
     { symbol: 'AAPL', instrument_name: 'Apple Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
     { symbol: 'TSLA', instrument_name: 'Tesla Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
-    { symbol: 'MSFT', instrument_name: 'Microsoft Corp.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock' },
+    { symbol: 'SPY', instrument_name: 'SPDR S&P 500 ETF Trust', exchange: 'NYSE Arca', country: 'United States', instrument_type: 'ETF' },
   ],
 };
 
 const hkMarketList = {
+  total: 4,
+  page: 1,
+  page_size: 2,
   count: 3,
   data: [
     { symbol: '0700.HK', instrument_name: 'Tencent Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
     { symbol: '0941.HK', instrument_name: 'China Mobile', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
-    { symbol: '0005.HK', instrument_name: 'HSBC Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock' },
+    { symbol: '2800.HK', instrument_name: 'Tracker Fund of Hong Kong', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'ETF' },
   ],
 };
 
@@ -436,12 +451,42 @@ const batchQuotes = {
   AAPL: { symbol: 'AAPL', price: 185, change: 4.1, change_percent: 2.27, exchange: 'NASDAQ', currency: 'USD' },
   TSLA: { symbol: 'TSLA', price: 170, change: -6.8, change_percent: -3.85, exchange: 'NASDAQ', currency: 'USD' },
   MSFT: { symbol: 'MSFT', price: 415, change: 1.9, change_percent: 0.46, exchange: 'NASDAQ', currency: 'USD' },
+  SPY: { symbol: 'SPY', price: 521, change: 2.4, change_percent: 0.46, exchange: 'NYSE Arca', currency: 'USD' },
   '0700.HK': { symbol: '0700.HK', price: 320, change: 18, change_percent: 5.96, exchange: 'HKEX', currency: 'HKD' },
   '0941.HK': { symbol: '0941.HK', price: 72, change: -3.5, change_percent: -4.64, exchange: 'HKEX', currency: 'HKD' },
   '0005.HK': { symbol: '0005.HK', price: 64, change: 1.2, change_percent: 1.91, exchange: 'HKEX', currency: 'HKD' },
+  '2800.HK': { symbol: '2800.HK', price: 17.3, change: -0.3, change_percent: -1.7, exchange: 'HKEX', currency: 'HKD' },
 };
 
-function renderWithQueryClient(ui: React.ReactNode) {
+const usMovers = {
+  market: 'US',
+  instrument_type: 'Common Stock',
+  direction: 'gainers',
+  captured_at: '2026-04-03T00:00:00Z',
+  source: 'snapshot',
+  count: 2,
+  data: [
+    { symbol: 'AAPL', instrument_name: 'Apple Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock', market: 'US', price: 185, change: 4.1, change_percent: 2.27, currency: 'USD', rank: 1, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
+    { symbol: 'TSLA', instrument_name: 'Tesla Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock', market: 'US', price: 170, change: -6.8, change_percent: -3.85, currency: 'USD', rank: 2, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
+  ],
+};
+
+const hkMovers = {
+  market: 'HK',
+  instrument_type: 'Common Stock',
+  direction: 'losers',
+  captured_at: '2026-04-03T00:00:00Z',
+  source: 'snapshot',
+  count: 2,
+  data: [
+    { symbol: '0941.HK', instrument_name: 'China Mobile', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock', market: 'HK', price: 72, change: -3.5, change_percent: -4.64, currency: 'HKD', rank: 1, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
+    { symbol: '0700.HK', instrument_name: 'Tencent Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock', market: 'HK', price: 320, change: 18, change_percent: 5.96, currency: 'HKD', rank: 2, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
+  ],
+};
+
+function renderWithQueryClient(ui: React.ReactNode, options?: { url?: string }) {
+  window.history.pushState({}, '', options?.url ?? '/');
+
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -509,9 +554,43 @@ describe('UI smoke', () => {
         error: null,
       }))
     );
-    apiMocks.getMarketList.mockImplementation(async (market?: string) =>
-      market === 'HK' ? hkMarketList : usMarketList
+    apiMocks.getMarketList.mockImplementation(
+      async (
+        options?:
+          | string
+          | {
+              market?: string;
+              instrumentType?: string;
+              page?: number;
+              pageSize?: number;
+            }
+      ) => {
+        const resolvedMarket = typeof options === 'string' ? options : options?.market;
+        const resolvedInstrumentType =
+          typeof options === 'string' ? 'Common Stock' : options?.instrumentType ?? 'Common Stock';
+        const resolvedPage = typeof options === 'string' ? 1 : options?.page ?? 1;
+        const resolvedPageSize = typeof options === 'string' ? 2 : options?.pageSize ?? 2;
+        const baseList = resolvedMarket === 'HK' ? hkMarketList : usMarketList;
+        const filteredData = baseList.data.filter((item) => item.instrument_type === resolvedInstrumentType);
+        const start = (resolvedPage - 1) * resolvedPageSize;
+        const pageData = filteredData.slice(start, start + resolvedPageSize);
+
+        return {
+          ...baseList,
+          total: filteredData.length,
+          count: pageData.length,
+          page: resolvedPage,
+          page_size: resolvedPageSize,
+          data: pageData,
+        };
+      }
     );
+    apiMocks.getMarketMovers.mockImplementation(async (market?: string, instrumentType?: string, direction?: string) => {
+      if (market === 'HK' && direction === 'losers') {
+        return { ...hkMovers, instrument_type: instrumentType ?? 'Common Stock' };
+      }
+      return { ...usMovers, instrument_type: instrumentType ?? 'Common Stock', direction: direction ?? 'gainers' };
+    });
     apiMocks.getStrategies.mockResolvedValue([strategy, secondStrategy]);
     apiMocks.createStrategy.mockResolvedValue({ id: 'created-strategy' });
     apiMocks.updateStrategy.mockResolvedValue({ id: strategy.id });
@@ -732,29 +811,46 @@ describe('UI smoke', () => {
     await screen.findByText(/财报窗口内先忽略/);
   });
 
-  it('switches market tabs, board modes, and current-market search on the market page', async () => {
+  it('renders market module navigation and a leaderboard-first market page', async () => {
     const user = userEvent.setup();
-    renderWithQueryClient(React.createElement(MarketPage));
+    renderWithQueryClient(React.createElement(MarketPage), { url: '/market' });
+
+    expect(screen.getByRole('link', { name: '榜单' }).getAttribute('href')).toBe('/market');
+    expect(screen.getByRole('link', { name: '股票曲线' }).getAttribute('href')).toBe('/market/chart');
+    expect(screen.getByRole('link', { name: '订单簿' }).getAttribute('href')).toBe('/market/orderbook');
 
     await screen.findByRole('tab', { name: '美股' });
     await screen.findByRole('tab', { name: '港股' });
-    await screen.findByRole('button', { name: '全部' });
-    await screen.findByRole('button', { name: '涨幅榜' });
-    await screen.findByRole('button', { name: '跌幅榜' });
+    await screen.findByText('全部');
+    await screen.findByText('涨幅榜');
+    await screen.findByText('跌幅榜');
+    await screen.findByRole('button', { name: '普通股票' });
+    await screen.findByRole('button', { name: 'ETF' });
+    await screen.findByRole('button', { name: '下一页' });
 
-    expect(await screen.findByText('美股市场')).toBeTruthy();
-    expect(screen.getAllByRole('button', { name: /选择股票/ })[0]?.textContent ?? '').toContain('AAPL');
+    expect(await screen.findByText('美股榜单')).toBeTruthy();
+    expect(screen.queryByTestId('market-data-widget')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'AAPL' })).toBeNull();
+    expect(screen.getAllByRole('link', { name: '看曲线' })[0]?.getAttribute('href')).toBe(
+      '/market/chart?symbol=AAPL'
+    );
+    expect(screen.getAllByRole('link', { name: '看订单簿' })[0]?.getAttribute('href')).toBe(
+      '/market/orderbook?symbol=AAPL'
+    );
 
     await user.click(screen.getByRole('button', { name: '涨幅榜' }));
-    const usCards = screen.getAllByRole('button', { name: /选择股票/ });
-    expect(usCards[0]?.textContent ?? '').toContain('AAPL');
+    await waitFor(() => {
+      expect(apiMocks.getMarketMovers).toHaveBeenCalledWith('US', 'Common Stock', 'gainers');
+    });
+    const usCards = screen.getAllByRole('link', { name: '看曲线' });
+    expect(usCards[0]?.getAttribute('href')).toBe('/market/chart?symbol=AAPL');
 
     await user.click(screen.getByRole('tab', { name: '港股' }));
-    expect(await screen.findByText('港股市场')).toBeTruthy();
+    expect(await screen.findByText('港股榜单')).toBeTruthy();
 
     await user.click(screen.getByRole('button', { name: '跌幅榜' }));
-    const hkCards = screen.getAllByRole('button', { name: /选择股票/ });
-    expect(hkCards[0]?.textContent ?? '').toContain('0941.HK');
+    const hkCards = screen.getAllByRole('link', { name: '看曲线' });
+    expect(hkCards[0]?.getAttribute('href')).toBe('/market/chart?symbol=0941.HK');
 
     const searchInput = screen.getByPlaceholderText('搜索代码 (例如: AAPL)');
     await user.clear(searchInput);
@@ -766,27 +862,24 @@ describe('UI smoke', () => {
     const tencentMatches = await screen.findAllByText('Tencent Holdings');
     expect(tencentMatches.length).toBeGreaterThan(0);
     expect(screen.queryByText('Apple Inc.')).toBeNull();
-
-    const searchResultRow = tencentMatches[0]?.closest('div[class*="cursor-pointer"]');
-    expect(searchResultRow).not.toBeNull();
-    fireEvent.mouseDown(searchResultRow as HTMLDivElement);
-    await waitFor(() => {
-      expect(screen.getByRole('heading', { name: '0700.HK' })).toBeTruthy();
-    });
-    expect(screen.getByTestId('market-data-widget').textContent ?? '').toContain('0700.HK');
+    expect(
+      screen
+        .getByRole('link', { name: '打开 Tencent Holdings (0700.HK) 曲线页' })
+        .getAttribute('href')
+    ).toBe('/market/chart?symbol=0700.HK');
 
     await user.type(screen.getByLabelText('最小涨跌幅'), '5');
     await waitFor(() => {
-      const cards = screen.getAllByRole('button', { name: /选择股票/ });
-      expect(cards[0]?.textContent ?? '').toContain('0700.HK');
+      const cards = screen.getAllByRole('link', { name: '看曲线' });
+      expect(cards[0]?.getAttribute('href')).toBe('/market/chart?symbol=0700.HK');
       expect(screen.queryByText('China Mobile')).toBeNull();
     });
 
     await user.clear(screen.getByLabelText('最小涨跌幅'));
     await user.type(screen.getByLabelText('最大涨跌幅'), '-3');
     await waitFor(() => {
-      const cards = screen.getAllByRole('button', { name: /选择股票/ });
-      expect(cards[0]?.textContent ?? '').toContain('0941.HK');
+      const cards = screen.getAllByRole('link', { name: '看曲线' });
+      expect(cards[0]?.getAttribute('href')).toBe('/market/chart?symbol=0941.HK');
     });
 
     await user.clear(screen.getByLabelText('最大涨跌幅'));
@@ -805,9 +898,41 @@ describe('UI smoke', () => {
     expect((screen.getByLabelText('最小涨跌幅') as HTMLInputElement).value).toBe('');
     expect((screen.getByLabelText('最大涨跌幅') as HTMLInputElement).value).toBe('');
     await waitFor(() => {
-      const cards = screen.getAllByRole('button', { name: /选择股票/ });
+      const cards = screen.getAllByRole('link', { name: '看曲线' });
       expect(cards.length).toBeGreaterThan(0);
-      expect(cards[0]?.textContent ?? '').toContain('0941.HK');
+      expect(cards[0]?.getAttribute('href')).toBe('/market/chart?symbol=0941.HK');
     });
+  });
+
+  it('renders a dedicated chart page that preserves the selected symbol across market routes', async () => {
+    renderWithQueryClient(React.createElement(MarketChartPage), {
+      url: '/market/chart?symbol=AAPL',
+    });
+
+    expect(screen.getByRole('link', { name: '榜单' }).getAttribute('href')).toBe('/market?symbol=AAPL');
+    expect(screen.getByRole('link', { name: '订单簿' }).getAttribute('href')).toBe(
+      '/market/orderbook?symbol=AAPL'
+    );
+    expect(await screen.findByRole('heading', { name: 'AAPL' })).toBeTruthy();
+    expect(screen.getByText('图表刷新')).toBeTruthy();
+  });
+
+  it('shows an empty state when chart or orderbook routes are opened without symbol', async () => {
+    const chartView = renderWithQueryClient(React.createElement(MarketChartPage), { url: '/market/chart' });
+
+    expect(await screen.findByText('还没有选择股票')).toBeTruthy();
+    expect(screen.getByRole('link', { name: '返回榜单挑选股票' }).getAttribute('href')).toBe('/market');
+
+    chartView.unmount();
+
+    renderWithQueryClient(React.createElement(MarketOrderbookPage), {
+      url: '/market/orderbook?symbol=0700.HK',
+    });
+
+    expect(await screen.findByRole('heading', { name: '0700.HK' })).toBeTruthy();
+    expect(screen.getByTestId('market-data-widget').textContent ?? '').toContain('0700.HK');
+    expect(screen.getAllByRole('link', { name: '股票曲线' })[0]?.getAttribute('href')).toBe(
+      '/market/chart?symbol=0700.HK'
+    );
   });
 });

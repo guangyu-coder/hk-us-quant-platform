@@ -3,6 +3,11 @@ import type {
   MarketData, 
   MarketQuoteResult,
   MarketHistoryResult,
+  MarketInstrumentType,
+  MarketMoversDirection,
+  MarketMoversResponse,
+  MarketSymbolSearchResponse,
+  MarketSymbolsResponse,
   Order, 
   CreateOrderResult,
   ExecutionTrade,
@@ -185,22 +190,80 @@ export const marketDataApi = {
   },
 
   // 搜索标的
-  searchSymbols: async (query: string): Promise<any> => {
-    return api.get('/v1/market-data/search', {
-      params: { query }
+  searchSymbols: async (
+    query: string,
+    market?: 'US' | 'HK',
+    instrumentType?: MarketInstrumentType,
+    limit?: number
+  ): Promise<MarketSymbolSearchResponse> => {
+    const payload: any = await api.get('/v1/market-data/search', {
+      params: { query, market, instrument_type: instrumentType, limit }
     });
+
+    return {
+      success: payload?.success,
+      count: payload?.count,
+      data: Array.isArray(payload?.data) ? payload.data : [],
+      source: payload?.source,
+    };
   },
 
   // 获取市场标的列表
   getMarketList: async (
-    market?: 'US' | 'HK',
-    exchange?: string,
-    country?: string,
-    type?: string
-  ): Promise<any> => {
-    return api.get('/v1/market-data/list', {
-      params: { market, exchange, country, instrument_type: type }
+    options: {
+      market?: 'US' | 'HK';
+      exchange?: string;
+      country?: string;
+      instrumentType?: MarketInstrumentType;
+      search?: string;
+      page?: number;
+      pageSize?: number;
+      activeOnly?: boolean;
+    } = {}
+  ): Promise<MarketSymbolsResponse> => {
+    const payload: any = await api.get('/v1/market-data/list', {
+      params: {
+        market: options.market,
+        exchange: options.exchange,
+        country: options.country,
+        instrument_type: options.instrumentType,
+        search: options.search,
+        page: options.page,
+        page_size: options.pageSize,
+        active_only: options.activeOnly,
+      }
     });
+
+    return {
+      success: payload?.success,
+      count: typeof payload?.count === 'number' ? payload.count : 0,
+      total: typeof payload?.total === 'number' ? payload.total : 0,
+      page: typeof payload?.page === 'number' ? payload.page : 1,
+      page_size: typeof payload?.page_size === 'number' ? payload.page_size : 50,
+      data: Array.isArray(payload?.data) ? payload.data : [],
+      source: payload?.source,
+    };
+  },
+
+  getMarketMovers: async (
+    market: 'US' | 'HK',
+    instrumentType: MarketInstrumentType,
+    direction: MarketMoversDirection
+  ): Promise<MarketMoversResponse> => {
+    const payload: any = await api.get('/v1/market-data/movers', {
+      params: { market, instrument_type: instrumentType, direction }
+    });
+
+    return {
+      success: payload?.success,
+      market: payload?.market ?? market,
+      instrument_type: payload?.instrument_type ?? instrumentType,
+      direction: payload?.direction ?? direction,
+      captured_at: payload?.captured_at ?? null,
+      source: payload?.source ?? null,
+      count: typeof payload?.count === 'number' ? payload.count : 0,
+      data: Array.isArray(payload?.data) ? payload.data : [],
+    };
   },
 };
 

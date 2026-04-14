@@ -57,6 +57,65 @@ export interface MarketHistoryResult {
   error?: string | null;
 }
 
+export type MarketTab = 'US' | 'HK';
+export type MarketInstrumentType = 'Common Stock' | 'ETF';
+export type MarketMoversDirection = 'gainers' | 'losers';
+
+export interface MarketSymbolRecord {
+  symbol: string;
+  instrument_name: string;
+  market?: MarketTab;
+  exchange: string;
+  country: string;
+  instrument_type: MarketInstrumentType;
+  aliases?: string[];
+  is_active?: boolean;
+}
+
+export interface MarketSymbolSearchResponse {
+  success?: boolean;
+  count?: number;
+  data: MarketSymbolRecord[];
+  source?: string;
+}
+
+export interface MarketSymbolsResponse {
+  success?: boolean;
+  count: number;
+  total: number;
+  page: number;
+  page_size: number;
+  data: MarketSymbolRecord[];
+  source?: string;
+}
+
+export interface MarketMoverRecord {
+  symbol: string;
+  instrument_name: string;
+  market: MarketTab;
+  exchange: string;
+  country: string;
+  instrument_type: MarketInstrumentType;
+  price?: number | null;
+  change?: number | null;
+  change_percent?: number | null;
+  currency?: string | null;
+  rank: number;
+  captured_at: string;
+  source: string;
+}
+
+export interface MarketMoversResponse {
+  success?: boolean;
+  market: MarketTab;
+  instrument_type: MarketInstrumentType;
+  direction: MarketMoversDirection;
+  captured_at: string | null;
+  source?: string | null;
+  count: number;
+  data: MarketMoverRecord[];
+}
+
 // 交易信号类型
 export type SignalType = 'Buy' | 'Sell' | 'Hold';
 
