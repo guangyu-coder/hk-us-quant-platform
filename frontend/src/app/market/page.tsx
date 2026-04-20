@@ -11,6 +11,7 @@ import type {
   MarketInstrumentType,
   MarketMoverRecord,
   MarketMoversCoverage,
+  MarketMoversResponse,
   MarketQuoteResult,
   MarketSymbolRecord,
   MarketTab,
@@ -60,6 +61,8 @@ const BOARD_OPTIONS: Array<{ key: BoardMode; label: string; description: string 
 
 const INSTRUMENT_TYPES: MarketInstrumentType[] = ['Common Stock', 'ETF'];
 const PAGE_SIZE = 25;
+const ALL_MODE_POLL_MS = 30_000;
+const MOVERS_MODE_POLL_MS = 15_000;
 
 const parseRangeInput = (value: string): number | null => {
   const trimmed = value.trim();
@@ -132,9 +135,30 @@ export default function MarketPage() {
   const canGoNext = isAllMode && hasNextMarketPage(currentPage, pageSize, total);
   const canGoPrevious = isAllMode && currentPage > 1;
 
+  const applyMoversResponse = (movers: MarketMoversResponse) => {
+    setMarketStocks(movers.data.map(mapMoverRecordToDisplay));
+    setTotal(movers.count);
+    setPageSize(PAGE_SIZE);
+    setSnapshotCapturedAt(movers.captured_at);
+    setSnapshotCoverage(movers.coverage);
+    setLastUpdatedAt(new Date().toISOString());
+    hasLoadedStocksRef.current = true;
+  };
+
   useEffect(() => {
     setCurrentPage(1);
   }, [selectedMarket, selectedInstrumentType]);
+
+  useEffect(() => {
+    const intervalMs = isAllMode ? ALL_MODE_POLL_MS : MOVERS_MODE_POLL_MS;
+    const timer = window.setInterval(() => {
+      setRefreshNonce((current) => current + 1);
+    }, intervalMs);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isAllMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -199,13 +223,7 @@ export default function MarketPage() {
           );
 
           if (!cancelled) {
-            setMarketStocks(movers.data.map(mapMoverRecordToDisplay));
-            setTotal(movers.count);
-            setPageSize(PAGE_SIZE);
-            setSnapshotCapturedAt(movers.captured_at);
-            setSnapshotCoverage(movers.coverage);
-            setLastUpdatedAt(new Date().toISOString());
-            hasLoadedStocksRef.current = true;
+            applyMoversResponse(movers);
           }
         }
       } catch (loadError) {
@@ -282,6 +300,30 @@ export default function MarketPage() {
     setCurrentPage(1);
   };
 
+  const handleRefresh = async () => {
+    if (isAllMode) {
+      setRefreshNonce((current) => current + 1);
+      return;
+    }
+
+    setRefreshing(true);
+    setError(null);
+
+    try {
+      const movers = await marketDataApi.refreshMarketMovers(
+        selectedMarket,
+        selectedInstrumentType,
+        selectedBoardMode
+      );
+      applyMoversResponse(movers);
+    } catch (refreshError) {
+      console.error('Failed to refresh market movers', refreshError);
+      setError('刷新实时榜单失败，请稍后重试。');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const marketTitle = selectedMarket === 'US' ? '美股榜单' : '港股榜单';
   const showingEmptyByFilter = !loading && !error && marketStocks.length > 0 && visibleStocks.length === 0;
   const showingEmptyByUniverse = !loading && !error && marketStocks.length === 0;
@@ -296,10 +338,10 @@ export default function MarketPage() {
   const boardTone = getMarketBoardTone(selectedBoardMode);
   const refreshButtonLabel = isAllMode
     ? `刷新${selectedMarket === 'US' ? '美股' : '港股'}列表`
-    : `刷新${selectedMarket === 'US' ? '美股' : '港股'}${getMarketBoardModeLabel(selectedBoardMode)}`;
+    : `立即刷新${selectedMarket === 'US' ? '美股' : '港股'}${getMarketBoardModeLabel(selectedBoardMode)}`;
   const boardDescription = isAllMode
-    ? `当前展示 ${getMarketInstrumentTypeLabel(selectedInstrumentType)}，第 ${currentPage} 页，共 ${total} 只。`
-    : `当前展示 ${selectedMarket === 'US' ? '美股' : '港股'}${getMarketInstrumentTypeLabel(selectedInstrumentType)}${getMarketBoardModeLabel(selectedBoardMode)}，${coverageSummary}。`;
+    ? `当前展示 ${getMarketInstrumentTypeLabel(selectedInstrumentType)}，第 ${currentPage} 页，共 ${total} 只，页面每 30 秒自动刷新一次。`
+    : `当前展示 ${selectedMarket === 'US' ? '美股' : '港股'}${getMarketInstrumentTypeLabel(selectedInstrumentType)}${getMarketBoardModeLabel(selectedBoardMode)}，${coverageSummary}，页面每 15 秒自动同步一次最新快照。`;
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6 p-6">
@@ -645,7 +687,7 @@ export default function MarketPage() {
                 <button
                   type="button"
                   className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-                  onClick={() => setRefreshNonce((current) => current + 1)}
+                  onClick={() => void handleRefresh()}
                 >
                   {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                   {refreshButtonLabel}

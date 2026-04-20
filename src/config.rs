@@ -118,7 +118,7 @@ impl AppConfig {
                     .parse()
                     .context("Invalid PAPER_TRADING")?,
                 movers_refresh_interval_secs: env::var("MOVERS_REFRESH_INTERVAL_SECS")
-                    .unwrap_or_else(|_| "300".to_string())
+                    .unwrap_or_else(|_| "60".to_string())
                     .parse()
                     .context("Invalid MOVERS_REFRESH_INTERVAL_SECS")?,
             },
@@ -192,14 +192,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trading_config_defaults_movers_refresh_interval_to_five_minutes() {
+    fn trading_config_defaults_movers_refresh_interval_to_one_minute() {
         let previous = env::var("MOVERS_REFRESH_INTERVAL_SECS").ok();
         unsafe {
             env::remove_var("MOVERS_REFRESH_INTERVAL_SECS");
         }
 
         let interval = env::var("MOVERS_REFRESH_INTERVAL_SECS")
-            .unwrap_or_else(|_| "300".to_string())
+            .unwrap_or_else(|_| "60".to_string())
             .parse::<u64>()
             .expect("default interval should parse");
 
@@ -212,7 +212,7 @@ mod tests {
             },
         }
 
-        assert_eq!(interval, 300);
+        assert_eq!(interval, 60);
     }
 }
 

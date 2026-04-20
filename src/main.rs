@@ -1402,6 +1402,10 @@ fn create_router(state: AppState) -> Router {
         .route("/api/v1/market-data/search", get(search_symbols))
         .route("/api/v1/market-data/list", get(list_market_symbols))
         .route("/api/v1/market-data/movers", get(list_market_movers))
+        .route(
+            "/api/v1/market-data/movers/refresh",
+            post(refresh_market_movers),
+        )
         .route("/api/v1/lifecycle/cleanup", post(run_cleanup))
         .route("/api/v1/lifecycle/archival", post(run_archival))
         .route("/api/v1/lifecycle/settings", get(get_lifecycle_settings))
@@ -1839,6 +1843,48 @@ async fn list_market_movers(
     .await?;
     let total_symbols = count_active_market_symbols_from_db(&state.db_pool, &market, &instrument_type)
         .await?;
+
+    Ok(Json(market_movers_snapshot_response_from_rows(
+        &market,
+        &instrument_type,
+        &direction,
+        total_symbols,
+        db_rows,
+    )))
+}
+
+async fn refresh_market_movers(
+    State(state): State<AppState>,
+    Query(query): Query<MarketMoversQuery>,
+) -> Result<Json<Value>, AppError> {
+    let market = parse_market_movers_market(query.market.as_deref())?;
+    let instrument_type = parse_market_movers_instrument_type(query.instrument_type.as_deref())?;
+    let direction = parse_market_movers_direction(query.direction.as_deref())?;
+
+    let summary =
+        run_market_movers_refresh_script(&state.config.database.url, &market, &instrument_type)
+            .await
+            .map_err(|error| AppError::market_data(format!(
+                "Failed to refresh movers snapshot for {market} {instrument_type}: {error}"
+            )))?;
+
+    info!(
+        market = market,
+        instrument_type = instrument_type,
+        direction = direction,
+        refresh_summary = %summary,
+        "Market movers snapshot refreshed on demand"
+    );
+
+    let db_rows = query_market_movers_snapshots_from_db(
+        &state.db_pool,
+        &market,
+        &instrument_type,
+        &direction,
+    )
+    .await?;
+    let total_symbols =
+        count_active_market_symbols_from_db(&state.db_pool, &market, &instrument_type).await?;
 
     Ok(Json(market_movers_snapshot_response_from_rows(
         &market,

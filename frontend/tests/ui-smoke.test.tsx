@@ -11,6 +11,7 @@ const apiMocks = vi.hoisted(() => ({
   getMultipleSymbols: vi.fn(),
   getMarketList: vi.fn(),
   getMarketMovers: vi.fn(),
+  refreshMarketMovers: vi.fn(),
   getStrategies: vi.fn(),
   createStrategy: vi.fn(),
   updateStrategy: vi.fn(),
@@ -85,6 +86,7 @@ vi.mock('@/lib/api', () => ({
     getMultipleSymbols: apiMocks.getMultipleSymbols,
     getMarketList: apiMocks.getMarketList,
     getMarketMovers: apiMocks.getMarketMovers,
+    refreshMarketMovers: apiMocks.refreshMarketMovers,
     searchSymbols: apiMocks.searchSymbols,
   },
   WebSocketManager: class {
@@ -741,6 +743,12 @@ describe('UI smoke', () => {
       }
       return { ...usMovers, instrument_type: instrumentType ?? 'Common Stock', direction: direction ?? 'gainers' };
     });
+    apiMocks.refreshMarketMovers.mockImplementation(async (market?: string, instrumentType?: string, direction?: string) => {
+      if (market === 'HK' && direction === 'losers') {
+        return { ...hkMovers, instrument_type: instrumentType ?? 'Common Stock' };
+      }
+      return { ...usMovers, instrument_type: instrumentType ?? 'Common Stock', direction: direction ?? 'gainers' };
+    });
     apiMocks.getStrategies.mockResolvedValue([strategy, secondStrategy]);
     apiMocks.createStrategy.mockResolvedValue({ id: 'created-strategy' });
     apiMocks.updateStrategy.mockResolvedValue({ id: strategy.id });
@@ -996,6 +1004,10 @@ describe('UI smoke', () => {
     await user.click(screen.getByRole('button', { name: '涨幅榜' }));
     await waitFor(() => {
       expect(apiMocks.getMarketMovers).toHaveBeenCalledWith('US', 'Common Stock', 'gainers');
+    });
+    await user.click(screen.getByRole('button', { name: '立即刷新美股涨幅榜' }));
+    await waitFor(() => {
+      expect(apiMocks.refreshMarketMovers).toHaveBeenCalledWith('US', 'Common Stock', 'gainers');
     });
     const usCards = screen.getAllByRole('link', { name: '看曲线' });
     expect(usCards[0]?.getAttribute('href')).toBe('/market/chart?symbol=AAPL');

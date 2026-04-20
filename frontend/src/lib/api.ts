@@ -276,6 +276,34 @@ export const marketDataApi = {
       data: Array.isArray(payload?.data) ? payload.data : [],
     };
   },
+
+  refreshMarketMovers: async (
+    market: 'US' | 'HK',
+    instrumentType: MarketInstrumentType,
+    direction: MarketMoversDirection
+  ): Promise<MarketMoversResponse> => {
+    const payload: any = await api.post('/v1/market-data/movers/refresh', null, {
+      params: { market, instrument_type: instrumentType, direction }
+    });
+
+    return {
+      success: payload?.success,
+      market: payload?.market ?? market,
+      instrument_type: payload?.instrument_type ?? instrumentType,
+      direction: payload?.direction ?? direction,
+      captured_at: payload?.captured_at ?? null,
+      source: payload?.source ?? null,
+      count: typeof payload?.count === 'number' ? payload.count : 0,
+      coverage: {
+        covered: typeof payload?.coverage?.covered === 'number' ? payload.coverage.covered : 0,
+        total: typeof payload?.coverage?.total === 'number' ? payload.coverage.total : 0,
+        missing: typeof payload?.coverage?.missing === 'number' ? payload.coverage.missing : 0,
+        success_rate:
+          typeof payload?.coverage?.success_rate === 'number' ? payload.coverage.success_rate : 0,
+      },
+      data: Array.isArray(payload?.data) ? payload.data : [],
+    };
+  },
 };
 
 // 策略API
