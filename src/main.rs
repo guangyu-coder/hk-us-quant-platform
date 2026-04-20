@@ -679,12 +679,20 @@ fn market_movers_coverage_value(covered: usize, total: usize) -> Value {
     })
 }
 
+fn market_missing_symbol_to_value(symbol: &str, instrument_name: &str) -> Value {
+    json!({
+        "symbol": symbol,
+        "instrument_name": instrument_name,
+    })
+}
+
 fn market_movers_snapshot_response_from_rows(
     market: &str,
     instrument_type: &str,
     direction: &str,
     total_symbols: usize,
     rows: Vec<MarketMoversSnapshot>,
+    missing_symbols: Vec<(String, String)>,
 ) -> Value {
     let normalized_market =
         normalize_market_movers_market(Some(market)).unwrap_or_else(|| market.trim().to_string());
@@ -741,6 +749,10 @@ fn market_movers_snapshot_response_from_rows(
         "source": source_value,
         "count": latest_rows.len(),
         "coverage": market_movers_coverage_value(covered_symbols, total_symbols),
+        "missing_symbols": missing_symbols
+            .iter()
+            .map(|(symbol, instrument_name)| market_missing_symbol_to_value(symbol, instrument_name))
+            .collect::<Vec<_>>(),
         "data": latest_rows.iter().map(market_movers_snapshot_to_value).collect::<Vec<_>>(),
     })
 }
@@ -833,6 +845,71 @@ async fn count_active_market_symbols_from_db(
     .map_err(AppError::Database)?;
 
     Ok(total.max(0) as usize)
+}
+
+async fn query_missing_market_symbols_from_db(
+    db_pool: &PgPool,
+    market: &str,
+    instrument_type: &str,
+    direction: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    let latest_captured_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "
+        SELECT MAX(captured_at)
+        FROM market_movers_snapshots
+        WHERE market = $1
+          AND instrument_type = $2
+          AND direction = $3
+        ",
+    )
+    .bind(market)
+    .bind(instrument_type)
+    .bind(direction)
+    .fetch_one(db_pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let Some(latest_captured_at) = latest_captured_at else {
+        return Ok(Vec::new());
+    };
+
+    let rows = sqlx::query(
+        "
+        SELECT ms.symbol, ms.instrument_name
+        FROM market_symbols ms
+        WHERE ms.is_active = TRUE
+          AND ms.market = $1
+          AND ms.instrument_type = $2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM market_movers_snapshots mms
+              WHERE mms.market = $1
+                AND mms.instrument_type = $2
+                AND mms.direction = $3
+                AND mms.captured_at = $4
+                AND mms.symbol = ms.symbol
+          )
+        ORDER BY ms.symbol ASC
+        LIMIT 8
+        ",
+    )
+    .bind(market)
+    .bind(instrument_type)
+    .bind(direction)
+    .bind(latest_captured_at)
+    .fetch_all(db_pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("symbol"),
+                row.get::<String, _>("instrument_name"),
+            )
+        })
+        .collect::<Vec<_>>())
 }
 
 async fn query_market_symbols_from_db(
@@ -1843,6 +1920,9 @@ async fn list_market_movers(
     .await?;
     let total_symbols = count_active_market_symbols_from_db(&state.db_pool, &market, &instrument_type)
         .await?;
+    let missing_symbols =
+        query_missing_market_symbols_from_db(&state.db_pool, &market, &instrument_type, &direction)
+            .await?;
 
     Ok(Json(market_movers_snapshot_response_from_rows(
         &market,
@@ -1850,6 +1930,7 @@ async fn list_market_movers(
         &direction,
         total_symbols,
         db_rows,
+        missing_symbols,
     )))
 }
 
@@ -1885,6 +1966,9 @@ async fn refresh_market_movers(
     .await?;
     let total_symbols =
         count_active_market_symbols_from_db(&state.db_pool, &market, &instrument_type).await?;
+    let missing_symbols =
+        query_missing_market_symbols_from_db(&state.db_pool, &market, &instrument_type, &direction)
+            .await?;
 
     Ok(Json(market_movers_snapshot_response_from_rows(
         &market,
@@ -1892,6 +1976,7 @@ async fn refresh_market_movers(
         &direction,
         total_symbols,
         db_rows,
+        missing_symbols,
     )))
 }
 
@@ -4569,6 +4654,7 @@ mod http_e2e_tests {
             "gainers",
             3,
             rows,
+            Vec::new(),
         );
 
         assert_eq!(response["market"], json!("US"));
@@ -4621,7 +4707,7 @@ mod http_e2e_tests {
         ];
 
         let response =
-            market_movers_snapshot_response_from_rows("HK", "ETF", "losers", 1, rows);
+            market_movers_snapshot_response_from_rows("HK", "ETF", "losers", 1, rows, Vec::new());
 
         assert_eq!(response["market"], json!("HK"));
         assert_eq!(response["instrument_type"], json!("ETF"));
@@ -4675,12 +4761,54 @@ mod http_e2e_tests {
             "gainers",
             2,
             rows,
+            Vec::new(),
         );
 
         assert_eq!(response["coverage"]["covered"], json!(2));
         assert_eq!(response["coverage"]["total"], json!(2));
         assert_eq!(response["coverage"]["missing"], json!(0));
         assert_eq!(response["coverage"]["success_rate"], json!(100.0));
+        assert_eq!(response["missing_symbols"], json!([]));
+    }
+
+    #[test]
+    fn market_movers_response_includes_missing_symbol_preview() {
+        let captured_at = Utc::now();
+        let rows = vec![crate::types::MarketMoversSnapshot {
+            market: "HK".to_string(),
+            instrument_type: "ETF".to_string(),
+            direction: "gainers".to_string(),
+            symbol: "2800.HK".to_string(),
+            instrument_name: "Tracker Fund of Hong Kong".to_string(),
+            exchange: "HKEX".to_string(),
+            country: "Hong Kong".to_string(),
+            price: Some(17.3),
+            change: Some(0.3),
+            change_percent: Some(1.7),
+            currency: Some("HKD".to_string()),
+            rank: 1,
+            captured_at,
+            source: "script".to_string(),
+        }];
+
+        let response = market_movers_snapshot_response_from_rows(
+            "HK",
+            "ETF",
+            "gainers",
+            2,
+            rows,
+            vec![(
+                "2833.HK".to_string(),
+                "Hang Seng Index ETF".to_string(),
+            )],
+        );
+
+        assert_eq!(response["coverage"]["missing"], json!(1));
+        assert_eq!(response["missing_symbols"][0]["symbol"], json!("2833.HK"));
+        assert_eq!(
+            response["missing_symbols"][0]["instrument_name"],
+            json!("Hang Seng Index ETF")
+        );
     }
 
     #[test]

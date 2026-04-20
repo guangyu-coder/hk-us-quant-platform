@@ -112,6 +112,11 @@ export interface MarketMoversCoverage {
   success_rate: number;
 }
 
+export interface MarketMissingSymbol {
+  symbol: string;
+  instrument_name: string;
+}
+
 export interface MarketMoversResponse {
   success?: boolean;
   market: MarketTab;
@@ -121,6 +126,7 @@ export interface MarketMoversResponse {
   source?: string | null;
   count: number;
   coverage: MarketMoversCoverage;
+  missing_symbols: MarketMissingSymbol[];
   data: MarketMoverRecord[];
 }
 

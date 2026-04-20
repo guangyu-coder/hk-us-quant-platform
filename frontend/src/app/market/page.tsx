@@ -9,6 +9,7 @@ import { formatMarketNumber, formatMarketPrice, inferCurrency } from '@/lib/mark
 import type {
   MarketData,
   MarketInstrumentType,
+  MarketMissingSymbol,
   MarketMoverRecord,
   MarketMoversCoverage,
   MarketMoversResponse,
@@ -24,6 +25,7 @@ import {
   formatMarketCoverageHint,
   formatMarketCoverageSummary,
   formatMarketTimestamp,
+  formatMissingSymbolsPreview,
   getMarketBoardTone,
   getChangePercentRangeError,
   getMarketBoardModeLabel,
@@ -125,6 +127,7 @@ export default function MarketPage() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [snapshotCapturedAt, setSnapshotCapturedAt] = useState<string | null>(null);
   const [snapshotCoverage, setSnapshotCoverage] = useState<MarketMoversCoverage | null>(null);
+  const [missingSymbols, setMissingSymbols] = useState<MarketMissingSymbol[]>([]);
   const [refreshNonce, setRefreshNonce] = useState(0);
 
   const rangeError = getChangePercentRangeError(range);
@@ -141,6 +144,7 @@ export default function MarketPage() {
     setPageSize(PAGE_SIZE);
     setSnapshotCapturedAt(movers.captured_at);
     setSnapshotCoverage(movers.coverage);
+    setMissingSymbols(movers.missing_symbols ?? []);
     setLastUpdatedAt(new Date().toISOString());
     hasLoadedStocksRef.current = true;
   };
@@ -212,6 +216,7 @@ export default function MarketPage() {
             setPageSize(listResponse.page_size || PAGE_SIZE);
             setSnapshotCapturedAt(null);
             setSnapshotCoverage(null);
+            setMissingSymbols([]);
             setLastUpdatedAt(new Date().toISOString());
             hasLoadedStocksRef.current = true;
           }
@@ -234,6 +239,7 @@ export default function MarketPage() {
           setTotal(0);
           setSnapshotCapturedAt(null);
           setSnapshotCoverage(null);
+          setMissingSymbols([]);
         }
       } finally {
         if (!cancelled) {
@@ -335,6 +341,7 @@ export default function MarketPage() {
   const coverageHint = snapshotCoverage
     ? formatMarketCoverageHint(snapshotCoverage)
     : '当前模式未返回覆盖率';
+  const missingSymbolsPreview = formatMissingSymbolsPreview(missingSymbols);
   const boardTone = getMarketBoardTone(selectedBoardMode);
   const refreshButtonLabel = isAllMode
     ? `刷新${selectedMarket === 'US' ? '美股' : '港股'}列表`
@@ -362,7 +369,7 @@ export default function MarketPage() {
               </div>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
                 <div className="text-xs uppercase tracking-[0.18em] text-slate-400">当前模式</div>
                 <div className={clsx(
@@ -406,6 +413,36 @@ export default function MarketPage() {
                   {isAllMode ? '分页列表按当前页实时拉取行情' : coverageHint}
                 </div>
               </div>
+              {!isAllMode && selectedMarket === 'HK' ? (
+                <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-4 py-4 text-sm">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                      <div className="text-xs uppercase tracking-[0.18em] text-slate-400">
+                        港股快照状态
+                      </div>
+                      <div className="mt-2 text-base font-semibold text-white">
+                        {snapshotCoverage?.missing
+                          ? `当前仍有 ${snapshotCoverage.missing} 只港股${getMarketInstrumentTypeLabel(selectedInstrumentType)}未进入快照`
+                          : '当前港股快照已完整覆盖本品类股票池'}
+                      </div>
+                      <div className="mt-1 text-sm text-slate-300">
+                        {snapshotCoverage?.missing ? missingSymbolsPreview : '榜单已覆盖当前股票池，可直接按强弱排序查看。'}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {missingSymbols.map((item) => (
+                        <span
+                          key={item.symbol}
+                          className="rounded-full border border-amber-300/20 bg-amber-400/10 px-3 py-1 text-xs font-medium text-amber-100"
+                          title={item.instrument_name}
+                        >
+                          {item.symbol}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

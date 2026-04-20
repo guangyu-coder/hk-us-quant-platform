@@ -493,6 +493,8 @@ const usMovers = {
   captured_at: '2026-04-03T00:00:00Z',
   source: 'snapshot',
   count: 2,
+  coverage: { covered: 2, total: 2, missing: 0, success_rate: 100 },
+  missing_symbols: [],
   data: [
     { symbol: 'AAPL', instrument_name: 'Apple Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock', market: 'US', price: 185, change: 4.1, change_percent: 2.27, currency: 'USD', rank: 1, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
     { symbol: 'TSLA', instrument_name: 'Tesla Inc.', exchange: 'NASDAQ', country: 'United States', instrument_type: 'Common Stock', market: 'US', price: 170, change: -6.8, change_percent: -3.85, currency: 'USD', rank: 2, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
@@ -506,6 +508,10 @@ const hkMovers = {
   captured_at: '2026-04-03T00:00:00Z',
   source: 'snapshot',
   count: 2,
+  coverage: { covered: 2, total: 3, missing: 1, success_rate: 66.7 },
+  missing_symbols: [
+    { symbol: '2833.HK', instrument_name: 'Hang Seng Index ETF' },
+  ],
   data: [
     { symbol: '0941.HK', instrument_name: 'China Mobile', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock', market: 'HK', price: 72, change: -3.5, change_percent: -4.64, currency: 'HKD', rank: 1, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },
     { symbol: '0700.HK', instrument_name: 'Tencent Holdings', exchange: 'HKEX', country: 'Hong Kong', instrument_type: 'Common Stock', market: 'HK', price: 320, change: 18, change_percent: 5.96, currency: 'HKD', rank: 2, captured_at: '2026-04-03T00:00:00Z', source: 'snapshot' },

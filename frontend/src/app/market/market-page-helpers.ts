@@ -12,6 +12,11 @@ export type MarketMoversCoverage = {
   success_rate: number;
 };
 
+export type MarketMissingSymbol = {
+  symbol: string;
+  instrument_name: string;
+};
+
 export type MarketModulePath = '/market' | '/market/chart' | '/market/orderbook';
 
 type MarketLike = {
@@ -253,4 +258,24 @@ export const formatMarketCoverageHint = (coverage: MarketMoversCoverage): string
   }
 
   return `成功率 ${coverage.success_rate.toFixed(1)}%，未覆盖 ${missing} 只`;
+};
+
+export const formatMissingSymbolsPreview = (
+  items: MarketMissingSymbol[],
+  maxItems = 3
+): string => {
+  if (items.length === 0) {
+    return '当前没有缺失标的';
+  }
+
+  const preview = items
+    .slice(0, maxItems)
+    .map((item) => item.symbol)
+    .join('、');
+
+  if (items.length <= maxItems) {
+    return `缺失标的：${preview}`;
+  }
+
+  return `缺失标的：${preview} 等 ${items.length} 只`;
 };

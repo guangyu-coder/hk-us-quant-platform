@@ -273,6 +273,7 @@ export const marketDataApi = {
         success_rate:
           typeof payload?.coverage?.success_rate === 'number' ? payload.coverage.success_rate : 0,
       },
+      missing_symbols: Array.isArray(payload?.missing_symbols) ? payload.missing_symbols : [],
       data: Array.isArray(payload?.data) ? payload.data : [],
     };
   },
@@ -301,6 +302,7 @@ export const marketDataApi = {
         success_rate:
           typeof payload?.coverage?.success_rate === 'number' ? payload.coverage.success_rate : 0,
       },
+      missing_symbols: Array.isArray(payload?.missing_symbols) ? payload.missing_symbols : [],
       data: Array.isArray(payload?.data) ? payload.data : [],
     };
   },
