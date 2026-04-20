@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 const apiMocks = vi.hoisted(() => ({
+  routerPush: vi.fn(),
   getRealTimeData: vi.fn(),
   getHistoricalData: vi.fn(),
   getMultipleSymbols: vi.fn(),
@@ -32,6 +33,11 @@ const apiMocks = vi.hoisted(() => ({
   simulateOrders: vi.fn(),
   listTrades: vi.fn(),
   searchSymbols: vi.fn(),
+  listPortfolioBacktestConfigs: vi.fn(),
+  createPortfolioBacktestConfig: vi.fn(),
+  getPortfolioBacktestConfig: vi.fn(),
+  runPortfolioBacktestConfig: vi.fn(),
+  getPortfolioBacktestRun: vi.fn(),
 }));
 
 vi.mock('@/lib/api', () => ({
@@ -66,6 +72,13 @@ vi.mock('@/lib/api', () => ({
   tradeApi: {
     listTrades: apiMocks.listTrades,
   },
+  portfolioBacktestApi: {
+    listConfigs: apiMocks.listPortfolioBacktestConfigs,
+    createConfig: apiMocks.createPortfolioBacktestConfig,
+    getConfig: apiMocks.getPortfolioBacktestConfig,
+    runConfig: apiMocks.runPortfolioBacktestConfig,
+    getRun: apiMocks.getPortfolioBacktestRun,
+  },
   marketDataApi: {
     getRealTimeData: apiMocks.getRealTimeData,
     getHistoricalData: apiMocks.getHistoricalData,
@@ -98,6 +111,16 @@ vi.mock('@/components/market/MarketDataWidget', () => ({
 vi.mock('next/navigation', () => ({
   usePathname: () => window.location.pathname,
   useSearchParams: () => new URLSearchParams(window.location.search),
+  useParams: () => {
+    const segments = window.location.pathname.split('/').filter(Boolean);
+    const runIdIndex = segments.indexOf('runs');
+    return runIdIndex >= 0 ? { runId: segments[runIdIndex + 1] } : {};
+  },
+  useRouter: () => ({
+    push: apiMocks.routerPush,
+    replace: vi.fn(),
+    prefetch: vi.fn(),
+  }),
 }));
 
 vi.mock('recharts', () => {
@@ -128,6 +151,9 @@ import TradingPage from '../src/app/trading/page';
 import MarketPage from '../src/app/market/page';
 import MarketChartPage from '../src/app/market/chart/page';
 import MarketOrderbookPage from '../src/app/market/orderbook/page';
+import PortfolioBacktestPage from '../src/app/portfolio-backtest/page';
+import NewPortfolioBacktestPage from '../src/app/portfolio-backtest/new/page';
+import PortfolioBacktestRunPage from '../src/app/portfolio-backtest/runs/[runId]/page';
 
 const strategy = {
   id: 'strategy-001',
@@ -484,6 +510,129 @@ const hkMovers = {
   ],
 };
 
+const portfolioBacktestConfig = {
+  id: 'portfolio-config-001',
+  name: '美股双龙头组合',
+  description: 'Apple 与 Microsoft 的月度再平衡组合',
+  initial_capital: 100000,
+  fee_bps: 5,
+  slippage_bps: 2,
+  rebalancing_frequency: 'monthly',
+  start_date: '2025-01-01',
+  end_date: '2025-12-31',
+  is_active: true,
+  asset_count: 2,
+  created_at: '2026-04-10T00:00:00Z',
+  updated_at: '2026-04-10T01:00:00Z',
+};
+
+const portfolioBacktestDetail = {
+  ...portfolioBacktestConfig,
+  assets: [
+    {
+      symbol: 'AAPL',
+      display_name: 'Apple',
+      market: 'US',
+      instrument_type: 'Common Stock',
+      target_weight: 0.5,
+    },
+    {
+      symbol: 'MSFT',
+      display_name: 'Microsoft',
+      market: 'US',
+      instrument_type: 'Common Stock',
+      target_weight: 0.5,
+    },
+  ],
+};
+
+const portfolioBacktestReport = {
+  config: portfolioBacktestDetail,
+  run: {
+    id: 'portfolio-run-001',
+    config_id: portfolioBacktestConfig.id,
+    status: 'completed',
+    started_at: '2026-04-10T02:00:00Z',
+    completed_at: '2026-04-10T02:05:00Z',
+    initial_capital: 100000,
+    final_capital: 108500,
+    total_return: 0.085,
+    annualized_return: 0.112,
+    max_drawdown: 0.041,
+    sharpe_ratio: 1.48,
+    volatility: 0.17,
+    summary: { rebalance_count: 3 },
+    error_message: null,
+  },
+  equity_curve: [
+    {
+      trading_date: '2025-01-02',
+      total_value: 100000,
+      cash_balance: 0,
+      invested_value: 100000,
+      daily_return: 0,
+      drawdown: 0,
+    },
+    {
+      trading_date: '2025-06-30',
+      total_value: 104500,
+      cash_balance: 300,
+      invested_value: 104200,
+      daily_return: 0.004,
+      drawdown: 0.01,
+    },
+    {
+      trading_date: '2025-12-31',
+      total_value: 108500,
+      cash_balance: 500,
+      invested_value: 108000,
+      daily_return: 0.003,
+      drawdown: 0.005,
+    },
+  ],
+  holdings: [
+    {
+      id: 'holding-001',
+      run_id: 'portfolio-run-001',
+      symbol: 'AAPL',
+      holding_date: '2025-12-31',
+      quantity: 120,
+      price: 190,
+      market_value: 22800,
+      weight: 0.5,
+      created_at: '2026-04-10T02:05:00Z',
+    },
+    {
+      id: 'holding-002',
+      run_id: 'portfolio-run-001',
+      symbol: 'MSFT',
+      holding_date: '2025-12-31',
+      quantity: 110,
+      price: 220,
+      market_value: 24200,
+      weight: 0.5,
+      created_at: '2026-04-10T02:05:00Z',
+    },
+  ],
+  rebalances: [
+    {
+      id: 'rebalance-001',
+      run_id: 'portfolio-run-001',
+      symbol: 'AAPL',
+      rebalance_date: '2025-02-03',
+      action: 'buy',
+      pre_weight: 0.47,
+      target_weight: 0.5,
+      post_weight: 0.5,
+      trade_value: 3500,
+      quantity_delta: 18,
+      fee_cost: 3.5,
+      slippage_cost: 1.2,
+      created_at: '2026-04-10T02:05:00Z',
+    },
+  ],
+};
+
 function renderWithQueryClient(ui: React.ReactNode, options?: { url?: string }) {
   window.history.pushState({}, '', options?.url ?? '/');
 
@@ -506,6 +655,7 @@ function renderWithQueryClient(ui: React.ReactNode, options?: { url?: string }) 
 describe('UI smoke', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    apiMocks.routerPush.mockReset();
 
     apiMocks.getRealTimeData.mockImplementation(async (symbol: string) => ({
       success: true,
@@ -640,6 +790,11 @@ describe('UI smoke', () => {
         hkMarketList.data[0],
       ],
     });
+    apiMocks.listPortfolioBacktestConfigs.mockResolvedValue([portfolioBacktestConfig]);
+    apiMocks.createPortfolioBacktestConfig.mockResolvedValue(portfolioBacktestDetail);
+    apiMocks.getPortfolioBacktestConfig.mockResolvedValue(portfolioBacktestDetail);
+    apiMocks.runPortfolioBacktestConfig.mockResolvedValue(portfolioBacktestReport);
+    apiMocks.getPortfolioBacktestRun.mockResolvedValue(portfolioBacktestReport);
 
     vi.stubGlobal('alert', vi.fn());
     vi.stubGlobal('confirm', vi.fn(() => true));
@@ -934,5 +1089,55 @@ describe('UI smoke', () => {
     expect(screen.getAllByRole('link', { name: '股票曲线' })[0]?.getAttribute('href')).toBe(
       '/market/chart?symbol=0700.HK'
     );
+  });
+
+  it('covers the portfolio backtest create, run, and report flow', async () => {
+    const user = userEvent.setup();
+
+    renderWithQueryClient(React.createElement(NewPortfolioBacktestPage), {
+      url: '/portfolio-backtest/new',
+    });
+
+    const nameInput = screen.getByPlaceholderText('例如：美股科技五巨头');
+    await user.clear(nameInput);
+    await user.type(nameInput, '美股双龙头组合');
+    await user.click(screen.getByRole('button', { name: '保存组合回测配置' }));
+
+    await waitFor(() => {
+      expect(apiMocks.createPortfolioBacktestConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: '美股双龙头组合',
+          rebalancing_frequency: 'monthly',
+          assets: expect.arrayContaining([
+            expect.objectContaining({ symbol: 'AAPL', target_weight: 0.5 }),
+            expect.objectContaining({ symbol: 'MSFT', target_weight: 0.5 }),
+          ]),
+        })
+      );
+      expect(apiMocks.routerPush).toHaveBeenCalledWith('/portfolio-backtest');
+    });
+
+    const listView = renderWithQueryClient(React.createElement(PortfolioBacktestPage), {
+      url: '/portfolio-backtest',
+    });
+
+    await screen.findByText('美股双龙头组合');
+    await user.click(screen.getByRole('button', { name: '运行组合回测' }));
+
+    await waitFor(() => {
+      expect(apiMocks.runPortfolioBacktestConfig).toHaveBeenCalledWith(portfolioBacktestConfig.id);
+      expect(apiMocks.routerPush).toHaveBeenCalledWith('/portfolio-backtest/runs/portfolio-run-001');
+    });
+
+    listView.unmount();
+
+    renderWithQueryClient(React.createElement(PortfolioBacktestRunPage), {
+      url: '/portfolio-backtest/runs/portfolio-run-001',
+    });
+
+    await screen.findByRole('heading', { name: '美股双龙头组合' });
+    await screen.findByText('权益曲线');
+    await screen.findByText('持仓快照');
+    await screen.findByText('调仓记录');
   });
 });

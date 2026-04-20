@@ -179,7 +179,7 @@ def quote_to_mover_row(
 def build_snapshot_rows(
     symbols: list[MarketSymbolRow],
     quotes: dict[str, dict[str, Any]],
-    limit: int,
+    limit: int | None,
     captured_at: datetime,
 ) -> list[MoversRow]:
     scored: list[tuple[MarketSymbolRow, float, dict[str, Any]]] = []
@@ -208,11 +208,15 @@ def build_snapshot_rows(
     gainers = sorted(
         scored,
         key=lambda item: (-item[1], item[0].symbol),
-    )[:limit]
+    )
     losers = sorted(
         scored,
         key=lambda item: (item[1], item[0].symbol),
-    )[:limit]
+    )
+
+    if limit is not None and limit > 0:
+        gainers = gainers[:limit]
+        losers = losers[:limit]
 
     rows: list[MoversRow] = []
     for rank, (symbol_row, _, quote) in enumerate(gainers, start=1):
@@ -275,18 +279,24 @@ def insert_snapshot_rows(db_url: str, rows: list[MoversRow]) -> int:
 def print_dry_run_summary(
     market: str,
     instrument_type: str,
-    limit: int,
+    limit: int | None,
     symbols: list[MarketSymbolRow],
     rows: list[MoversRow],
     captured_at: datetime,
 ) -> None:
+    covered = len({row.symbol for row in rows if row.direction == "gainers"})
+    total = len(symbols)
+    success_rate = round((covered / total) * 100.0, 2) if total > 0 else 0.0
     summary = {
         "dry_run": True,
         "market": market,
         "instrument_type": instrument_type,
         "limit": limit,
         "captured_at": captured_at.isoformat(),
-        "symbols": len(symbols),
+        "symbols": total,
+        "covered": covered,
+        "missing": max(total - covered, 0),
+        "success_rate": success_rate,
         "rows": len(rows),
         "gainers": [row.symbol for row in rows if row.direction == "gainers"],
         "losers": [row.symbol for row in rows if row.direction == "losers"],
@@ -298,7 +308,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build market movers snapshots")
     parser.add_argument("--market", required=True, choices=sorted(ALLOWED_MARKETS))
     parser.add_argument("--instrument-type", required=True, choices=sorted(ALLOWED_INSTRUMENT_TYPES))
-    parser.add_argument("--limit", type=int, default=20, help="Maximum gainers/losers per snapshot")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum gainers/losers per snapshot. Use 0 to keep every successfully quoted symbol.",
+    )
     parser.add_argument("--db-url", default=os.environ.get("DATABASE_URL", ""), help="Database URL")
     parser.add_argument("--dry-run", action="store_true", help="Compute movers without writing to the database")
     parser.add_argument("--apikey", default=os.environ.get("TWELVE_DATA_API_KEY", ""), help="Optional quote API key")
@@ -310,7 +325,7 @@ def main() -> int:
 
     market = normalize_market(args.market)
     instrument_type = normalize_instrument_type(args.instrument_type)
-    limit = max(1, args.limit)
+    limit = args.limit if args.limit > 0 else None
     captured_at = datetime.now(timezone.utc)
 
     if not args.db_url.strip():
@@ -347,6 +362,13 @@ def main() -> int:
                 "instrument_type": instrument_type,
                 "captured_at": captured_at.isoformat(),
                 "rows": inserted,
+                "covered": len({row.symbol for row in rows if row.direction == "gainers"}),
+                "total_symbols": len(symbols),
+                "missing": max(len(symbols) - len({row.symbol for row in rows if row.direction == "gainers"}), 0),
+                "success_rate": round(
+                    (len({row.symbol for row in rows if row.direction == "gainers"}) / len(symbols)) * 100.0,
+                    2,
+                ) if symbols else 0.0,
                 "gainers": len([row for row in rows if row.direction == "gainers"]),
                 "losers": len([row for row in rows if row.direction == "losers"]),
             },

@@ -47,6 +47,7 @@ pub struct TradingConfig {
     pub max_order_size: i64,
     pub risk_check_enabled: bool,
     pub paper_trading: bool,
+    pub movers_refresh_interval_secs: u64,
 }
 
 impl AppConfig {
@@ -116,6 +117,10 @@ impl AppConfig {
                     .unwrap_or_else(|_| "true".to_string())
                     .parse()
                     .context("Invalid PAPER_TRADING")?,
+                movers_refresh_interval_secs: env::var("MOVERS_REFRESH_INTERVAL_SECS")
+                    .unwrap_or_else(|_| "300".to_string())
+                    .parse()
+                    .context("Invalid MOVERS_REFRESH_INTERVAL_SECS")?,
             },
         };
 
@@ -153,6 +158,10 @@ impl AppConfig {
             anyhow::bail!("Max order size must be greater than 0");
         }
 
+        if config.trading.movers_refresh_interval_secs > 86_400 {
+            anyhow::bail!("MOVERS_REFRESH_INTERVAL_SECS cannot exceed 86400");
+        }
+
         // Validate log level
         match config.logging.level.to_lowercase().as_str() {
             "trace" | "debug" | "info" | "warn" | "error" => {}
@@ -175,6 +184,35 @@ impl AppConfig {
     /// Check if running in development environment
     pub fn is_development(&self) -> bool {
         self.get_environment().to_lowercase() == "development"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trading_config_defaults_movers_refresh_interval_to_five_minutes() {
+        let previous = env::var("MOVERS_REFRESH_INTERVAL_SECS").ok();
+        unsafe {
+            env::remove_var("MOVERS_REFRESH_INTERVAL_SECS");
+        }
+
+        let interval = env::var("MOVERS_REFRESH_INTERVAL_SECS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse::<u64>()
+            .expect("default interval should parse");
+
+        match previous {
+            Some(value) => unsafe {
+                env::set_var("MOVERS_REFRESH_INTERVAL_SECS", value);
+            },
+            None => unsafe {
+                env::remove_var("MOVERS_REFRESH_INTERVAL_SECS");
+            },
+        }
+
+        assert_eq!(interval, 300);
     }
 }
 

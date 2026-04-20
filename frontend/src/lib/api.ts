@@ -15,6 +15,10 @@ import type {
   OrderAuditTrail,
   CreateOrderPayload,
   Portfolio, 
+  PortfolioBacktestConfigDetail,
+  PortfolioBacktestConfigInput,
+  PortfolioBacktestConfigListItem,
+  PortfolioBacktestReport,
   PortfolioPnLPoint,
   PortfolioPnLReport,
   StrategyConfig, 
@@ -262,6 +266,13 @@ export const marketDataApi = {
       captured_at: payload?.captured_at ?? null,
       source: payload?.source ?? null,
       count: typeof payload?.count === 'number' ? payload.count : 0,
+      coverage: {
+        covered: typeof payload?.coverage?.covered === 'number' ? payload.coverage.covered : 0,
+        total: typeof payload?.coverage?.total === 'number' ? payload.coverage.total : 0,
+        missing: typeof payload?.coverage?.missing === 'number' ? payload.coverage.missing : 0,
+        success_rate:
+          typeof payload?.coverage?.success_rate === 'number' ? payload.coverage.success_rate : 0,
+      },
       data: Array.isArray(payload?.data) ? payload.data : [],
     };
   },
@@ -428,6 +439,30 @@ export const portfolioApi = {
     return api.get('/v1/portfolio/pnl/history', {
       params: { days }
     });
+  },
+};
+
+export const portfolioBacktestApi = {
+  listConfigs: async (): Promise<PortfolioBacktestConfigListItem[]> => {
+    return api.get('/v1/portfolio-backtests/configs');
+  },
+
+  getConfig: async (configId: string): Promise<PortfolioBacktestConfigDetail> => {
+    return api.get(`/v1/portfolio-backtests/configs/${configId}`);
+  },
+
+  createConfig: async (
+    payload: PortfolioBacktestConfigInput
+  ): Promise<PortfolioBacktestConfigDetail> => {
+    return api.post('/v1/portfolio-backtests/configs', payload);
+  },
+
+  runConfig: async (configId: string): Promise<PortfolioBacktestReport> => {
+    return api.post(`/v1/portfolio-backtests/${configId}/run`);
+  },
+
+  getRun: async (runId: string): Promise<PortfolioBacktestReport> => {
+    return api.get(`/v1/portfolio-backtests/runs/${runId}`);
   },
 };
 

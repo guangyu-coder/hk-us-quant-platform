@@ -105,6 +105,13 @@ export interface MarketMoverRecord {
   source: string;
 }
 
+export interface MarketMoversCoverage {
+  covered: number;
+  total: number;
+  missing: number;
+  success_rate: number;
+}
+
 export interface MarketMoversResponse {
   success?: boolean;
   market: MarketTab;
@@ -113,6 +120,7 @@ export interface MarketMoversResponse {
   captured_at: string | null;
   source?: string | null;
   count: number;
+  coverage: MarketMoversCoverage;
   data: MarketMoverRecord[];
 }
 
@@ -276,6 +284,113 @@ export interface PortfolioPnLReport {
   unrealized_pnl: number;
   realized_pnl: number;
   generated_at: string;
+}
+
+export type PortfolioBacktestMarket = 'US' | 'HK';
+export type PortfolioBacktestInstrumentType = 'Common Stock' | 'ETF';
+export type PortfolioBacktestRebalancingFrequency = 'daily' | 'weekly' | 'monthly';
+
+export interface PortfolioBacktestAssetInput {
+  symbol: string;
+  display_name: string;
+  market: PortfolioBacktestMarket;
+  instrument_type: PortfolioBacktestInstrumentType;
+  target_weight: number;
+}
+
+export interface PortfolioBacktestConfigInput {
+  name: string;
+  description?: string | null;
+  initial_capital: number;
+  fee_bps: number;
+  slippage_bps: number;
+  rebalancing_frequency: PortfolioBacktestRebalancingFrequency;
+  start_date: string;
+  end_date: string;
+  is_active: boolean;
+  assets: PortfolioBacktestAssetInput[];
+}
+
+export interface PortfolioBacktestConfigListItem {
+  id: string;
+  name: string;
+  description?: string | null;
+  initial_capital: number;
+  fee_bps: number;
+  slippage_bps: number;
+  rebalancing_frequency: PortfolioBacktestRebalancingFrequency;
+  start_date: string;
+  end_date: string;
+  is_active: boolean;
+  asset_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioBacktestConfigDetail extends PortfolioBacktestConfigListItem {
+  assets: PortfolioBacktestAssetInput[];
+}
+
+export interface PortfolioBacktestRunSummary {
+  id: string;
+  config_id: string;
+  status: string;
+  started_at: string;
+  completed_at?: string | null;
+  initial_capital: number;
+  final_capital?: number | null;
+  total_return?: number | null;
+  annualized_return?: number | null;
+  max_drawdown?: number | null;
+  sharpe_ratio?: number | null;
+  volatility?: number | null;
+  summary?: Record<string, any> | null;
+  error_message?: string | null;
+}
+
+export interface PortfolioBacktestHoldingRow {
+  id: string;
+  run_id: string;
+  symbol: string;
+  holding_date: string;
+  quantity: number;
+  price: number;
+  market_value: number;
+  weight: number;
+  created_at: string;
+}
+
+export interface PortfolioBacktestRebalanceRow {
+  id: string;
+  run_id: string;
+  symbol: string;
+  rebalance_date: string;
+  action: string;
+  pre_weight: number;
+  target_weight: number;
+  post_weight: number;
+  trade_value: number;
+  quantity_delta: number;
+  fee_cost: number;
+  slippage_cost: number;
+  created_at: string;
+}
+
+export interface PortfolioBacktestEquityPoint {
+  trading_date: string;
+  total_value: number;
+  cash_balance: number;
+  invested_value: number;
+  daily_return?: number | null;
+  drawdown?: number | null;
+}
+
+export interface PortfolioBacktestReport {
+  config: PortfolioBacktestConfigDetail;
+  run: PortfolioBacktestRunSummary;
+  equity_curve: PortfolioBacktestEquityPoint[];
+  holdings: PortfolioBacktestHoldingRow[];
+  rebalances: PortfolioBacktestRebalanceRow[];
 }
 
 // 策略配置类型

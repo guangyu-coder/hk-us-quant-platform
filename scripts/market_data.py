@@ -26,6 +26,7 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 # Configure retry strategy
@@ -48,7 +49,7 @@ ALLOW_MOCK_FALLBACK = os.environ.get("ALLOW_MOCK_MARKET_DATA", "false").strip().
 
 BASE_URL = "https://api.twelvedata.com"
 
-DEFAULT_LOCAL_MARKETS = [
+LEGACY_LOCAL_MARKETS = [
     {"symbol": "AAPL", "instrument_name": "Apple Inc.", "aliases": ["Apple", "苹果"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
     {"symbol": "AMZN", "instrument_name": "Amazon.com, Inc.", "aliases": ["Amazon", "亚马逊"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
     {"symbol": "GOOGL", "instrument_name": "Alphabet Inc.", "aliases": ["Google", "Alphabet", "谷歌"], "exchange": "NASDAQ", "country": "United States", "instrument_type": "Common Stock"},
@@ -59,6 +60,35 @@ DEFAULT_LOCAL_MARKETS = [
     {"symbol": "0941.HK", "instrument_name": "China Mobile Limited", "aliases": ["China Mobile", "中国移动"], "exchange": "HKEX", "country": "Hong Kong", "instrument_type": "Equity"},
     {"symbol": "9988.HK", "instrument_name": "Alibaba Group Holding Limited", "aliases": ["Alibaba", "阿里巴巴"], "exchange": "HKEX", "country": "Hong Kong", "instrument_type": "Equity"},
 ]
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def load_local_market_catalog() -> list[Dict[str, Any]]:
+    catalog: list[Dict[str, Any]] = []
+    for filename in ("market_symbols.us.json", "market_symbols.hk.json"):
+        path = DATA_DIR / filename
+        if not path.exists():
+            continue
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"DEBUG: failed to load {path}: {exc}", file=sys.stderr)
+            continue
+
+        if not isinstance(payload, list):
+            print(f"DEBUG: invalid local market catalog {path}", file=sys.stderr)
+            continue
+
+        for row in payload:
+            if isinstance(row, dict):
+                catalog.append(row)
+
+    return catalog or LEGACY_LOCAL_MARKETS
+
+
+DEFAULT_LOCAL_MARKETS = load_local_market_catalog()
 
 # Try to import yfinance, but don't fail if it's not installed or broken
 try:

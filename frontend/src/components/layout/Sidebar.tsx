@@ -10,7 +10,8 @@ import {
   Shield, 
   Activity,
   Home,
-  FileText
+  FileText,
+  PieChart
 } from 'lucide-react';
 import { clsx } from 'clsx';
 
@@ -20,6 +21,7 @@ const navigation = [
   { name: '策略管理', href: '/strategies', icon: BarChart3 },
   { name: '交易执行', href: '/trading', icon: Activity },
   { name: '投资组合', href: '/portfolio', icon: Wallet },
+  { name: '组合回测', href: '/portfolio-backtest', icon: PieChart },
   { name: '风险控制', href: '/risk', icon: Shield },
   { name: '回测系统', href: '/backtest', icon: FileText },
   { name: '系统设置', href: '/settings', icon: Settings },

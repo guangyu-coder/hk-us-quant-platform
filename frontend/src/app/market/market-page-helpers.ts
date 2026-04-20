@@ -5,6 +5,12 @@ export type ChangePercentRange = {
   min?: number | null;
   max?: number | null;
 };
+export type MarketMoversCoverage = {
+  covered: number;
+  total: number;
+  missing: number;
+  success_rate: number;
+};
 
 export type MarketModulePath = '/market' | '/market/chart' | '/market/orderbook';
 
@@ -193,3 +199,58 @@ export const hasNextMarketPage = (
   pageSize: number,
   total: number
 ): boolean => page * pageSize < total;
+
+export const formatMarketTimestamp = (value: string | null | undefined): string => {
+  if (!value) {
+    return '等待加载';
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
+};
+
+export const getMarketBoardModeLabel = (mode: BoardMode): string => {
+  if (mode === 'all') {
+    return '全部股票';
+  }
+
+  return mode === 'gainers' ? '涨幅榜' : '跌幅榜';
+};
+
+export const getMarketBoardTone = (mode: BoardMode): 'neutral' | 'positive' | 'negative' => {
+  if (mode === 'gainers') {
+    return 'positive';
+  }
+
+  if (mode === 'losers') {
+    return 'negative';
+  }
+
+  return 'neutral';
+};
+
+export const formatMarketCoverageSummary = (coverage: MarketMoversCoverage): string =>
+  `真实覆盖 ${coverage.covered} / ${coverage.total}`;
+
+export const formatMarketCoverageHint = (coverage: MarketMoversCoverage): string => {
+  const missing = typeof coverage.missing === 'number'
+    ? coverage.missing
+    : Math.max(coverage.total - coverage.covered, 0);
+
+  if (coverage.total > 0 && coverage.covered >= coverage.total) {
+    return `已覆盖全部 ${coverage.total} 只股票`;
+  }
+
+  return `成功率 ${coverage.success_rate.toFixed(1)}%，未覆盖 ${missing} 只`;
+};

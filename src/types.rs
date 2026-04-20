@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -677,6 +677,147 @@ impl RiskMetrics {
             calculated_at: Utc::now(),
         }
     }
+}
+
+/// Input asset definition for a portfolio backtest configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioAssetInput {
+    pub symbol: String,
+    pub display_name: String,
+    pub market: String,
+    pub instrument_type: String,
+    pub target_weight: Decimal,
+}
+
+/// Input payload for creating or updating a portfolio backtest configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestConfigInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub initial_capital: Decimal,
+    pub fee_bps: Decimal,
+    pub slippage_bps: Decimal,
+    pub rebalancing_frequency: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub is_active: bool,
+    pub assets: Vec<PortfolioAssetInput>,
+}
+
+/// Compact list row for a portfolio backtest configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestConfigListItem {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub initial_capital: Decimal,
+    pub fee_bps: Decimal,
+    pub slippage_bps: Decimal,
+    pub rebalancing_frequency: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub is_active: bool,
+    pub asset_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Detailed view of a portfolio backtest configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestConfigDetail {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub initial_capital: Decimal,
+    pub fee_bps: Decimal,
+    pub slippage_bps: Decimal,
+    pub rebalancing_frequency: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub is_active: bool,
+    pub assets: Vec<PortfolioAssetInput>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Summary of a portfolio backtest run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestRunSummary {
+    pub id: Uuid,
+    pub config_id: Uuid,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub initial_capital: Decimal,
+    pub final_capital: Option<Decimal>,
+    pub total_return: Option<Decimal>,
+    pub annualized_return: Option<Decimal>,
+    pub max_drawdown: Option<Decimal>,
+    pub sharpe_ratio: Option<Decimal>,
+    pub volatility: Option<Decimal>,
+    pub summary: Option<serde_json::Value>,
+    pub error_message: Option<String>,
+}
+
+/// Persisted holdings row for a portfolio backtest run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestHoldingRow {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub symbol: String,
+    pub holding_date: NaiveDate,
+    pub quantity: Decimal,
+    pub price: Decimal,
+    pub market_value: Decimal,
+    pub weight: Decimal,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persisted rebalance row for a portfolio backtest run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestRebalanceRow {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub symbol: String,
+    pub rebalance_date: NaiveDate,
+    pub action: String,
+    pub pre_weight: Decimal,
+    pub target_weight: Decimal,
+    pub post_weight: Decimal,
+    pub trade_value: Decimal,
+    pub quantity_delta: Decimal,
+    pub fee_cost: Decimal,
+    pub slippage_cost: Decimal,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Daily aligned price point used by the portfolio backtest engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioDailyPrice {
+    pub symbol: String,
+    pub trading_date: NaiveDate,
+    pub price: Decimal,
+}
+
+/// One point in the portfolio equity curve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestEquityPoint {
+    pub trading_date: NaiveDate,
+    pub total_value: Decimal,
+    pub cash_balance: Decimal,
+    pub invested_value: Decimal,
+    pub daily_return: Option<Decimal>,
+    pub drawdown: Option<Decimal>,
+}
+
+/// Deduplicated payload returned by the portfolio backtest APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioBacktestReport {
+    pub config: PortfolioBacktestConfigDetail,
+    pub run: PortfolioBacktestRunSummary,
+    pub equity_curve: Vec<PortfolioBacktestEquityPoint>,
+    pub holdings: Vec<PortfolioBacktestHoldingRow>,
+    pub rebalances: Vec<PortfolioBacktestRebalanceRow>,
 }
 
 /// Backtest result structure

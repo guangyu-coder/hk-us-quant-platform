@@ -6,6 +6,9 @@ import {
   filterSearchResultsByMarket,
   filterSearchResultsByScope,
   filterStocksByChangePercentRange,
+  getMarketBoardTone,
+  formatMarketTimestamp,
+  getMarketBoardModeLabel,
   getMarketInstrumentTypeLabel,
   inferMarketFromSearchResult,
   hasNextMarketPage,
@@ -185,4 +188,22 @@ test('detects whether paginated market list has a next page', () => {
   assert.equal(hasNextMarketPage(1, 25, 100), true);
   assert.equal(hasNextMarketPage(4, 25, 100), false);
   assert.equal(hasNextMarketPage(2, 50, 75), false);
+});
+
+test('formats market timestamps into readable local strings', () => {
+  assert.equal(formatMarketTimestamp(null), '等待加载');
+  assert.match(formatMarketTimestamp('2026-04-15T06:19:42+00:00'), /\d{2}\/\d{2} \d{2}:\d{2}:\d{2}/);
+  assert.equal(formatMarketTimestamp('invalid-timestamp'), 'invalid-timestamp');
+});
+
+test('returns readable market board mode labels', () => {
+  assert.equal(getMarketBoardModeLabel('all'), '全部股票');
+  assert.equal(getMarketBoardModeLabel('gainers'), '涨幅榜');
+  assert.equal(getMarketBoardModeLabel('losers'), '跌幅榜');
+});
+
+test('returns readable market board tones', () => {
+  assert.equal(getMarketBoardTone('all'), 'neutral');
+  assert.equal(getMarketBoardTone('gainers'), 'positive');
+  assert.equal(getMarketBoardTone('losers'), 'negative');
 });

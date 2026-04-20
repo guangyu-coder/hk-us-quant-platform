@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Shared base image for all Rust build stages
 FROM rust:1.89-slim-bookworm AS chef
 
@@ -20,6 +18,7 @@ FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY data ./data
 COPY migrations ./migrations
 COPY scripts ./scripts
 
@@ -30,20 +29,15 @@ FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY data ./data
 COPY migrations ./migrations
 COPY scripts ./scripts
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release && \
+RUN cargo build --release && \
     cp /app/target/release/hk-us-quant-platform /app/hk-us-quant-platform
 
 # Runtime stage
@@ -57,6 +51,8 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     && pip3 install --no-cache-dir --break-system-packages \
+        sqlalchemy \
+        psycopg2-binary \
         requests \
         yfinance \
         pandas \
@@ -67,6 +63,7 @@ RUN useradd -m -u 1001 -s /bin/bash appuser
 WORKDIR /app
 
 COPY --from=builder /app/hk-us-quant-platform /app/
+COPY --from=builder /app/data /app/data
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/scripts /app/scripts
 

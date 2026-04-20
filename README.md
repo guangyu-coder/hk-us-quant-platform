@@ -5,6 +5,7 @@ This is a self-hosted private quant research MVP. It is intentionally narrow: cr
 ## Current Scope
 - Strategy creation, editing, and deletion
 - Backtest execution and report review
+- Portfolio backtest configuration, execution, and portfolio-level report review
 - Orders, trades, and performance history
 - Private deployment, refresh, and recovery workflows
 
@@ -12,7 +13,8 @@ This is a self-hosted private quant research MVP. It is intentionally narrow: cr
 1. Create or edit a strategy in the web UI.
 2. Run a backtest from that strategy.
 3. Review the latest report and compare results.
-4. Use the deployment SOP when you update the stack.
+4. Create a portfolio backtest when you want a fixed-weight multi-symbol research workflow.
+5. Use the deployment SOP when you update the stack.
 
 ## Stack
 - Rust backend with Postgres and Redis

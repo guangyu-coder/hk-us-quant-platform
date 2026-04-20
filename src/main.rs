@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::Path,
     extract::Query,
@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ mod events;
 mod execution;
 mod market_data;
 mod portfolio;
+mod portfolio_backtest;
 mod risk;
 mod strategy;
 mod types;
@@ -40,15 +42,18 @@ use crate::error::AppError;
 use crate::events::EventBus;
 use crate::execution::ExecutionService;
 use crate::portfolio::{PortfolioExecutionHandler, PortfolioService};
+use crate::portfolio_backtest::run_portfolio_backtest;
+use crate::portfolio_backtest::load_portfolio_backtest_report;
 use crate::risk::RiskCheckResult;
 use crate::risk::RiskService;
 use crate::strategy::build_latest_strategy_signal_snapshot;
 use crate::strategy::StrategyService;
 use crate::types::{
     BacktestExperimentMetadata, BacktestResult, ExecutionTrade, MarketData, MarketMoversSnapshot,
-    OrderSide, OrderStatus, OrderType, RiskLimits, SignalReviewRecord, StrategyConfig,
-    StrategyExecutionOverview, StrategyLatestBacktestSummary, StrategyLatestRealTradeSummary,
-    StrategyRecentSignalSummary, StrategySignalSnapshot,
+    OrderSide, OrderStatus, OrderType, PortfolioAssetInput, PortfolioBacktestConfigInput,
+    RiskLimits, SignalReviewRecord, StrategyConfig, StrategyExecutionOverview,
+    StrategyLatestBacktestSummary, StrategyLatestRealTradeSummary, StrategyRecentSignalSummary,
+    StrategySignalSnapshot,
 };
 use crate::websocket::{
     start_heartbeat, ws_handler_with_state, MarketDataUpdate, WSManager, WSMessage, WSState,
@@ -58,6 +63,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 static APP_BOOT_AT: OnceLock<String> = OnceLock::new();
+const PORTFOLIO_WEIGHT_EPSILON: f64 = 0.0001;
 
 /// Request body for creating a strategy
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,417 +292,49 @@ fn market_status_label(degraded: bool, has_error: bool) -> &'static str {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn search_result(
-    symbol: &str,
-    instrument_name: &str,
-    exchange: &str,
-    country: &str,
-    instrument_type: &str,
-    aliases: &[&str],
-) -> SearchResult {
-    SearchResult {
-        symbol: symbol.to_string(),
-        instrument_name: instrument_name.to_string(),
-        exchange: exchange.to_string(),
-        country: country.to_string(),
-        instrument_type: instrument_type.to_string(),
-        aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
-    }
+static BUILT_IN_MARKET_SYMBOLS: OnceLock<Vec<SearchResult>> = OnceLock::new();
+
+fn parse_market_catalog(contents: &str, label: &str) -> Vec<SearchResult> {
+    serde_json::from_str(contents)
+        .unwrap_or_else(|error| panic!("failed to parse built-in market catalog {label}: {error}"))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn built_in_market_symbols(market: Option<&str>) -> Vec<SearchResult> {
-    let us_symbols = vec![
-        search_result(
-            "AAPL",
-            "Apple Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Apple"],
-        ),
-        search_result(
-            "AMZN",
-            "Amazon.com, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Amazon"],
-        ),
-        search_result(
-            "GOOGL",
-            "Alphabet Inc. Class A",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Alphabet", "Google"],
-        ),
-        search_result(
-            "MSFT",
-            "Microsoft Corporation",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Microsoft"],
-        ),
-        search_result(
-            "NVDA",
-            "NVIDIA Corporation",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["NVIDIA"],
-        ),
-        search_result(
-            "TSLA",
-            "Tesla, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Tesla"],
-        ),
-        search_result(
-            "META",
-            "Meta Platforms, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Meta", "Facebook"],
-        ),
-        search_result(
-            "NFLX",
-            "Netflix, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Netflix"],
-        ),
-        search_result(
-            "AMD",
-            "Advanced Micro Devices, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["AMD"],
-        ),
-        search_result(
-            "INTC",
-            "Intel Corporation",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Intel"],
-        ),
-        search_result(
-            "CRM",
-            "Salesforce, Inc.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Salesforce"],
-        ),
-        search_result(
-            "ORCL",
-            "Oracle Corporation",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Oracle"],
-        ),
-        search_result(
-            "ADBE",
-            "Adobe Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Adobe"],
-        ),
-        search_result(
-            "QCOM",
-            "QUALCOMM Incorporated",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Qualcomm"],
-        ),
-        search_result(
-            "AVGO",
-            "Broadcom Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Broadcom"],
-        ),
-        search_result(
-            "JPM",
-            "JPMorgan Chase & Co.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["JPMorgan Chase"],
-        ),
-        search_result(
-            "BAC",
-            "Bank of America Corporation",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Bank of America"],
-        ),
-        search_result(
-            "WFC",
-            "Wells Fargo & Company",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Wells Fargo"],
-        ),
-        search_result(
-            "GS",
-            "The Goldman Sachs Group, Inc.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Goldman Sachs"],
-        ),
-        search_result(
-            "V",
-            "Visa Inc.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Visa"],
-        ),
-        search_result(
-            "MA",
-            "Mastercard Incorporated",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Mastercard"],
-        ),
-        search_result(
-            "KO",
-            "The Coca-Cola Company",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Coca-Cola"],
-        ),
-        search_result(
-            "PEP",
-            "PepsiCo, Inc.",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["PepsiCo"],
-        ),
-        search_result(
-            "MCD",
-            "McDonald's Corporation",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["McDonald's"],
-        ),
-        search_result(
-            "DIS",
-            "The Walt Disney Company",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Disney"],
-        ),
-        search_result(
-            "NKE",
-            "NIKE, Inc.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Nike"],
-        ),
-        search_result(
-            "COST",
-            "Costco Wholesale Corporation",
-            "NASDAQ",
-            "United States",
-            "Common Stock",
-            &["Costco"],
-        ),
-        search_result(
-            "WMT",
-            "Walmart Inc.",
-            "NYSE",
-            "United States",
-            "Common Stock",
-            &["Walmart"],
-        ),
-        search_result(
-            "SPY",
-            "SPDR S&P 500 ETF Trust",
-            "NYSEARCA",
-            "United States",
-            "ETF",
-            &["S&P 500 ETF"],
-        ),
-        search_result(
-            "QQQ",
-            "Invesco QQQ Trust",
-            "NASDAQ",
-            "United States",
-            "ETF",
-            &["Nasdaq-100 ETF"],
-        ),
-        search_result(
-            "DIA",
-            "SPDR Dow Jones Industrial Average ETF Trust",
-            "NYSEARCA",
-            "United States",
-            "ETF",
-            &["Dow Jones ETF"],
-        ),
-        search_result(
-            "IWM",
-            "iShares Russell 2000 ETF",
-            "NYSEARCA",
-            "United States",
-            "ETF",
-            &["Russell 2000 ETF"],
-        ),
-    ];
-
-    let hk_symbols = vec![
-        search_result(
-            "0001.HK",
-            "CK Hutchison Holdings Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["CK Hutchison"],
-        ),
-        search_result(
-            "0005.HK",
-            "HSBC Holdings plc",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["HSBC"],
-        ),
-        search_result(
-            "0011.HK",
-            "Hang Seng Bank Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Hang Seng Bank"],
-        ),
-        search_result(
-            "0388.HK",
-            "Hong Kong Exchanges and Clearing Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["HKEX"],
-        ),
-        search_result(
-            "0700.HK",
-            "Tencent Holdings Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Tencent"],
-        ),
-        search_result(
-            "0939.HK",
-            "China Construction Bank Corporation",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["CCB"],
-        ),
-        search_result(
-            "0941.HK",
-            "China Mobile Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["China Mobile"],
-        ),
-        search_result(
-            "1299.HK",
-            "AIA Group Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["AIA"],
-        ),
-        search_result(
-            "1398.HK",
-            "Industrial and Commercial Bank of China Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["ICBC"],
-        ),
-        search_result(
-            "2318.HK",
-            "Ping An Insurance (Group) Company of China, Ltd.",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Ping An"],
-        ),
-        search_result(
-            "2388.HK",
-            "BOC Hong Kong (Holdings) Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["BOC Hong Kong"],
-        ),
-        search_result(
-            "2628.HK",
-            "China Life Insurance Company Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["China Life"],
-        ),
-        search_result(
-            "3690.HK",
-            "Meituan",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Meituan"],
-        ),
-        search_result(
-            "3988.HK",
-            "Bank of China Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Bank of China"],
-        ),
-        search_result(
-            "9988.HK",
-            "Alibaba Group Holding Limited",
-            "HKEX",
-            "Hong Kong",
-            "Common Stock",
-            &["Alibaba"],
-        ),
-    ];
+    let all_symbols = BUILT_IN_MARKET_SYMBOLS.get_or_init(|| {
+        let mut symbols =
+            parse_market_catalog(include_str!("../data/market_symbols.us.json"), "US");
+        symbols.extend(parse_market_catalog(
+            include_str!("../data/market_symbols.hk.json"),
+            "HK",
+        ));
+        symbols
+    });
 
     match normalize_market_filter(market) {
-        Some("US") => us_symbols,
-        Some("HK") => hk_symbols,
-        _ => {
-            let mut combined = us_symbols;
-            combined.extend(hk_symbols);
-            combined
-        }
+        Some("US") => all_symbols
+            .iter()
+            .filter(|item| {
+                infer_market_from_symbol_record(
+                    &item.symbol,
+                    Some(&item.exchange),
+                    Some(&item.country),
+                ) == "US"
+            })
+            .cloned()
+            .collect(),
+        Some("HK") => all_symbols
+            .iter()
+            .filter(|item| {
+                infer_market_from_symbol_record(
+                    &item.symbol,
+                    Some(&item.exchange),
+                    Some(&item.country),
+                ) == "HK"
+            })
+            .cloned()
+            .collect(),
+        _ => all_symbols.clone(),
     }
 }
 
@@ -902,6 +540,98 @@ fn normalize_market_movers_direction(direction: Option<&str>) -> String {
     }
 }
 
+fn market_movers_refresh_targets() -> [(&'static str, &'static str); 4] {
+    [
+        ("US", "Common Stock"),
+        ("US", "ETF"),
+        ("HK", "Common Stock"),
+        ("HK", "ETF"),
+    ]
+}
+
+async fn run_market_movers_refresh_script(
+    database_url: &str,
+    market: &str,
+    instrument_type: &str,
+) -> Result<Value> {
+    let output = Command::new("python3")
+        .arg("/app/scripts/build_market_movers.py")
+        .arg("--market")
+        .arg(market)
+        .arg("--instrument-type")
+        .arg(instrument_type)
+        .arg("--db-url")
+        .arg(database_url)
+        .arg("--limit")
+        .arg("0")
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn movers refresh for {market} {instrument_type}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "movers refresh failed for {} {}: {}",
+            market,
+            instrument_type,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    serde_json::from_slice::<Value>(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse movers refresh output for {market} {instrument_type}"
+        )
+    })
+}
+
+async fn refresh_market_movers_snapshots(config: Arc<AppConfig>) {
+    for (market, instrument_type) in market_movers_refresh_targets() {
+        match run_market_movers_refresh_script(&config.database.url, market, instrument_type).await {
+            Ok(summary) => {
+                info!(
+                    market = market,
+                    instrument_type = instrument_type,
+                    covered = summary.get("covered").and_then(|value| value.as_i64()),
+                    total_symbols = summary
+                        .get("total_symbols")
+                        .and_then(|value| value.as_i64()),
+                    success_rate = summary
+                        .get("success_rate")
+                        .and_then(|value| value.as_f64()),
+                    "Market movers snapshot refresh finished"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    market = market,
+                    instrument_type = instrument_type,
+                    error = %error,
+                    "Market movers snapshot refresh failed"
+                );
+            }
+        }
+    }
+}
+
+fn start_market_movers_refresh_loop(config: Arc<AppConfig>) {
+    let refresh_interval_secs = config.trading.movers_refresh_interval_secs;
+    if refresh_interval_secs == 0 {
+        info!("Market movers auto refresh disabled");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(refresh_interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            refresh_market_movers_snapshots(config.clone()).await;
+        }
+    });
+}
+
 fn parse_market_movers_direction(direction: Option<&str>) -> Result<String, AppError> {
     let normalized = normalize_market_movers_direction(direction);
     if matches!(normalized.as_str(), "gainers" | "losers") {
@@ -933,10 +663,27 @@ fn market_movers_snapshot_to_value(snapshot: &MarketMoversSnapshot) -> Value {
     })
 }
 
+fn market_movers_coverage_value(covered: usize, total: usize) -> Value {
+    let missing = total.saturating_sub(covered);
+    let success_rate = if total > 0 {
+        ((covered as f64 / total as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    json!({
+        "covered": covered,
+        "total": total,
+        "missing": missing,
+        "success_rate": success_rate,
+    })
+}
+
 fn market_movers_snapshot_response_from_rows(
     market: &str,
     instrument_type: &str,
     direction: &str,
+    total_symbols: usize,
     rows: Vec<MarketMoversSnapshot>,
 ) -> Value {
     let normalized_market =
@@ -979,6 +726,11 @@ fn market_movers_snapshot_response_from_rows(
         .first()
         .map(|row| json!(row.source.clone()))
         .unwrap_or(Value::Null);
+    let covered_symbols = latest_rows
+        .iter()
+        .map(|row| row.symbol.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     json!({
         "success": true,
@@ -988,6 +740,7 @@ fn market_movers_snapshot_response_from_rows(
         "captured_at": captured_at_value,
         "source": source_value,
         "count": latest_rows.len(),
+        "coverage": market_movers_coverage_value(covered_symbols, total_symbols),
         "data": latest_rows.iter().map(market_movers_snapshot_to_value).collect::<Vec<_>>(),
     })
 }
@@ -1057,6 +810,29 @@ async fn query_market_movers_snapshots_from_db(
             source: row.get::<String, _>("source"),
         })
         .collect::<Vec<_>>())
+}
+
+async fn count_active_market_symbols_from_db(
+    db_pool: &PgPool,
+    market: &str,
+    instrument_type: &str,
+) -> Result<usize, AppError> {
+    let total = sqlx::query_scalar::<_, i64>(
+        "
+        SELECT COUNT(*)::BIGINT
+        FROM market_symbols
+        WHERE is_active = TRUE
+          AND market = $1
+          AND instrument_type = $2
+        ",
+    )
+    .bind(market)
+    .bind(instrument_type)
+    .fetch_one(db_pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(total.max(0) as usize)
 }
 
 async fn query_market_symbols_from_db(
@@ -1532,6 +1308,7 @@ async fn main() -> Result<()> {
         .await?;
 
     start_heartbeat(app_state.ws_manager.clone(), 30);
+    start_market_movers_refresh_loop(app_state.config.clone());
 
     let ws_manager = app_state.ws_manager.clone();
     let mut event_rx = app_state.event_bus.subscribe_local();
@@ -1631,6 +1408,38 @@ fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/lifecycle/settings",
             post(update_lifecycle_settings),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/configs",
+            post(create_portfolio_backtest_config),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/configs",
+            get(list_portfolio_backtest_configs),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/configs/:config_id",
+            get(get_portfolio_backtest_config),
+        )
+        .route(
+            "/api/v1/portfolio-backtests",
+            post(create_portfolio_backtest_config),
+        )
+        .route(
+            "/api/v1/portfolio-backtests",
+            get(list_portfolio_backtest_configs),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/:config_id",
+            get(get_portfolio_backtest_config),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/:config_id/run",
+            post(run_portfolio_backtest_config),
+        )
+        .route(
+            "/api/v1/portfolio-backtests/runs/:run_id",
+            get(get_portfolio_backtest_run),
         )
         .route("/api/v1/strategies", get(list_strategies))
         .route("/api/v1/strategies", post(create_strategy))
@@ -2028,11 +1837,14 @@ async fn list_market_movers(
         &direction,
     )
     .await?;
+    let total_symbols = count_active_market_symbols_from_db(&state.db_pool, &market, &instrument_type)
+        .await?;
 
     Ok(Json(market_movers_snapshot_response_from_rows(
         &market,
         &instrument_type,
         &direction,
+        total_symbols,
         db_rows,
     )))
 }
@@ -2242,6 +2054,190 @@ async fn list_backtests(
         .into_iter()
         .map(backtest_to_json)
         .collect::<Vec<_>>())))
+}
+
+async fn fetch_portfolio_backtest_config_list(
+    db_pool: &PgPool,
+) -> Result<Vec<crate::types::PortfolioBacktestConfigListItem>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            id,
+            name,
+            description,
+            initial_capital,
+            fee_bps,
+            slippage_bps,
+            rebalancing_frequency,
+            start_date,
+            end_date,
+            is_active,
+            COALESCE(jsonb_array_length(assets), 0)::INT AS asset_count,
+            created_at,
+            updated_at
+        FROM portfolio_backtest_configs
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .fetch_all(db_pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::types::PortfolioBacktestConfigListItem {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                description: row.try_get("description")?,
+                initial_capital: row.try_get("initial_capital")?,
+                fee_bps: row.try_get("fee_bps")?,
+                slippage_bps: row.try_get("slippage_bps")?,
+                rebalancing_frequency: row.try_get("rebalancing_frequency")?,
+                start_date: row.try_get("start_date")?,
+                end_date: row.try_get("end_date")?,
+                is_active: row.try_get("is_active")?,
+                asset_count: row.try_get("asset_count")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+async fn fetch_portfolio_backtest_config_detail(
+    db_pool: &PgPool,
+    config_id: Uuid,
+) -> Result<crate::types::PortfolioBacktestConfigDetail, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            name,
+            description,
+            initial_capital,
+            fee_bps,
+            slippage_bps,
+            rebalancing_frequency,
+            start_date,
+            end_date,
+            is_active,
+            assets,
+            created_at,
+            updated_at
+        FROM portfolio_backtest_configs
+        WHERE id = $1
+        "#,
+    )
+    .bind(config_id)
+    .fetch_optional(db_pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(AppError::not_found(format!(
+            "portfolio_backtest_config {}",
+            config_id
+        )));
+    };
+
+    let assets_value: Value = row.try_get("assets")?;
+    let assets = sanitize_portfolio_asset_inputs(&serde_json::from_value::<
+        Vec<PortfolioAssetInput>,
+    >(assets_value)?);
+
+    Ok(crate::types::PortfolioBacktestConfigDetail {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        initial_capital: row.try_get("initial_capital")?,
+        fee_bps: row.try_get("fee_bps")?,
+        slippage_bps: row.try_get("slippage_bps")?,
+        rebalancing_frequency: row.try_get("rebalancing_frequency")?,
+        start_date: row.try_get("start_date")?,
+        end_date: row.try_get("end_date")?,
+        is_active: row.try_get("is_active")?,
+        assets,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+async fn list_portfolio_backtest_configs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::types::PortfolioBacktestConfigListItem>>, AppError> {
+    let configs = fetch_portfolio_backtest_config_list(&state.db_pool).await?;
+    Ok(Json(configs))
+}
+
+async fn get_portfolio_backtest_config(
+    State(state): State<AppState>,
+    Path(config_id): Path<String>,
+) -> Result<Json<crate::types::PortfolioBacktestConfigDetail>, AppError> {
+    let config_id = Uuid::parse_str(&config_id)
+        .map_err(|_| AppError::validation("Invalid portfolio backtest config id"))?;
+    let config = fetch_portfolio_backtest_config_detail(&state.db_pool, config_id).await?;
+    Ok(Json(config))
+}
+
+async fn create_portfolio_backtest_config(
+    State(state): State<AppState>,
+    Json(req): Json<PortfolioBacktestConfigInput>,
+) -> Result<Json<crate::types::PortfolioBacktestConfigDetail>, AppError> {
+    let normalized = normalize_portfolio_backtest_config_input(&req)?;
+    let assets_json = serde_json::to_value(&normalized.assets)?;
+
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO portfolio_backtest_configs (
+            name,
+            description,
+            initial_capital,
+            fee_bps,
+            slippage_bps,
+            rebalancing_frequency,
+            start_date,
+            end_date,
+            is_active,
+            assets
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+    )
+    .bind(&req.name)
+    .bind(&req.description)
+    .bind(req.initial_capital)
+    .bind(req.fee_bps)
+    .bind(req.slippage_bps)
+    .bind(&normalized.rebalancing_frequency)
+    .bind(normalized.start_date)
+    .bind(normalized.end_date)
+    .bind(req.is_active)
+    .bind(assets_json)
+    .fetch_one(&state.db_pool)
+    .await?;
+
+    let config_id: Uuid = inserted.try_get("id")?;
+    let config = fetch_portfolio_backtest_config_detail(&state.db_pool, config_id).await?;
+    Ok(Json(config))
+}
+
+async fn run_portfolio_backtest_config(
+    State(state): State<AppState>,
+    Path(config_id): Path<String>,
+) -> Result<Json<crate::types::PortfolioBacktestReport>, AppError> {
+    let config_id = Uuid::parse_str(&config_id)
+        .map_err(|_| AppError::validation("Invalid portfolio backtest config id"))?;
+    let report = run_portfolio_backtest(&state.db_pool, config_id).await?;
+    Ok(Json(report))
+}
+
+async fn get_portfolio_backtest_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<crate::types::PortfolioBacktestReport>, AppError> {
+    let run_id = Uuid::parse_str(&run_id)
+        .map_err(|_| AppError::validation("Invalid portfolio backtest run id"))?;
+    let report = load_portfolio_backtest_report(&state.db_pool, run_id).await?;
+    Ok(Json(report))
 }
 
 async fn get_strategy_state(
@@ -2731,6 +2727,164 @@ fn validate_backtest_date_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Res
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedPortfolioBacktestConfig {
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    rebalancing_frequency: String,
+    assets: Vec<PortfolioAssetInput>,
+}
+
+fn normalize_portfolio_rebalancing_frequency(frequency: &str) -> Option<&'static str> {
+    match frequency.trim().to_ascii_lowercase().as_str() {
+        "daily" => Some("daily"),
+        "weekly" => Some("weekly"),
+        "monthly" => Some("monthly"),
+        _ => None,
+    }
+}
+
+fn validate_portfolio_rebalancing_frequency(frequency: &str) -> Result<&'static str, AppError> {
+    normalize_portfolio_rebalancing_frequency(frequency).ok_or_else(|| {
+        AppError::validation(format!(
+            "Unsupported rebalancing_frequency: {}",
+            frequency
+        ))
+    })
+}
+
+fn parse_portfolio_date(input: &str, field_name: &str) -> Result<NaiveDate, AppError> {
+    NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d").map_err(|_| {
+        AppError::validation(format!(
+            "Invalid {}: expected YYYY-MM-DD",
+            field_name
+        ))
+    })
+}
+
+fn sanitize_portfolio_asset_input(asset: &PortfolioAssetInput) -> PortfolioAssetInput {
+    PortfolioAssetInput {
+        symbol: asset.symbol.trim().to_ascii_uppercase(),
+        display_name: asset.display_name.trim().to_string(),
+        market: asset.market.trim().to_ascii_uppercase(),
+        instrument_type: asset.instrument_type.trim().to_string(),
+        target_weight: asset.target_weight,
+    }
+}
+
+fn sanitize_portfolio_asset_inputs(assets: &[PortfolioAssetInput]) -> Vec<PortfolioAssetInput> {
+    assets.iter().map(sanitize_portfolio_asset_input).collect()
+}
+
+fn normalize_portfolio_asset_inputs(
+    assets: &[PortfolioAssetInput],
+) -> Result<Vec<PortfolioAssetInput>, AppError> {
+    if assets.len() < 2 {
+        return Err(AppError::validation(
+            "Portfolio backtests require at least 2 assets",
+        ));
+    }
+
+    let mut seen_symbols = std::collections::HashSet::new();
+    let mut seen_markets = std::collections::HashSet::new();
+    let mut total_weight = Decimal::ZERO;
+    let normalized_assets = sanitize_portfolio_asset_inputs(assets);
+    for asset in &normalized_assets {
+        if asset.symbol.is_empty() {
+            return Err(AppError::validation(
+                "Portfolio asset symbol cannot be empty",
+            ));
+        }
+
+        if !seen_symbols.insert(asset.symbol.clone()) {
+            return Err(AppError::validation(format!(
+                "Duplicate portfolio asset symbol: {}",
+                asset.symbol
+            )));
+        }
+
+        if asset.target_weight <= Decimal::ZERO {
+            return Err(AppError::validation(format!(
+                "Asset {} must have a positive target_weight",
+                asset.symbol
+            )));
+        }
+
+        if asset.market.is_empty() {
+            return Err(AppError::validation(
+                "Portfolio asset market cannot be empty",
+            ));
+        }
+
+        seen_markets.insert(asset.market.clone());
+
+        total_weight += asset.target_weight;
+    }
+
+    if seen_markets.len() > 1 {
+        return Err(AppError::validation(
+            "Portfolio backtest v1 requires all assets to be in the same market",
+        ));
+    }
+
+    if (total_weight - Decimal::ONE).abs()
+        > Decimal::from_f64(PORTFOLIO_WEIGHT_EPSILON).unwrap_or(Decimal::new(1, 4))
+    {
+        return Err(AppError::validation(format!(
+            "Portfolio weights must sum to 1.0 within tolerance {} (got {:.6})",
+            PORTFOLIO_WEIGHT_EPSILON,
+            total_weight.to_f64().unwrap_or(0.0)
+        )));
+    }
+
+    Ok(normalized_assets)
+}
+
+fn normalize_portfolio_backtest_config_input(
+    config: &PortfolioBacktestConfigInput,
+) -> Result<NormalizedPortfolioBacktestConfig, AppError> {
+    if config.initial_capital <= Decimal::ZERO {
+        return Err(AppError::validation(
+            "Portfolio initial_capital must be positive",
+        ));
+    }
+
+    if config.fee_bps < Decimal::ZERO {
+        return Err(AppError::validation("Portfolio fee_bps must be non-negative"));
+    }
+
+    if config.slippage_bps < Decimal::ZERO {
+        return Err(AppError::validation(
+            "Portfolio slippage_bps must be non-negative",
+        ));
+    }
+
+    let start_date = parse_portfolio_date(&config.start_date, "start_date")?;
+    let end_date = parse_portfolio_date(&config.end_date, "end_date")?;
+    if end_date < start_date {
+        return Err(AppError::validation(
+            "Portfolio end_date must be on or after start_date",
+        ));
+    }
+
+    let assets = normalize_portfolio_asset_inputs(&config.assets)?;
+    let rebalancing_frequency =
+        validate_portfolio_rebalancing_frequency(&config.rebalancing_frequency)?.to_string();
+
+    Ok(NormalizedPortfolioBacktestConfig {
+        start_date,
+        end_date,
+        rebalancing_frequency,
+        assets,
+    })
+}
+
+fn validate_portfolio_backtest_config_input(
+    config: &PortfolioBacktestConfigInput,
+) -> Result<(), AppError> {
+    normalize_portfolio_backtest_config_input(config).map(|_| ())
 }
 
 fn backtest_to_json(result: crate::types::BacktestResult) -> Value {
@@ -3745,7 +3899,10 @@ mod http_e2e_tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use std::env;
+    use tokio::sync::OnceCell;
     use tower::ServiceExt;
+
+    static E2E_APP: OnceCell<(axum::Router, PgPool)> = OnceCell::const_new();
 
     #[test]
     fn test_interval_normalization() {
@@ -3787,6 +3944,273 @@ mod http_e2e_tests {
             error.to_string(),
             "Invalid backtest date range: end_date must be on or after start_date."
         );
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_fewer_than_two_assets() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "daily".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![crate::types::PortfolioAssetInput {
+                symbol: "AAPL".to_string(),
+                display_name: "Apple".to_string(),
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                target_weight: Decimal::new(1, 0),
+            }],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_invalid_weight_sum() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "weekly".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(6, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "MSFT".to_string(),
+                    display_name: "Microsoft".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(3, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_unsupported_rebalancing_frequency() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "hourly".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "MSFT".to_string(),
+                    display_name: "Microsoft".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_duplicate_symbols() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "monthly".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "aapl".to_string(),
+                    display_name: "Apple Duplicate".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_non_positive_capital_and_negative_costs() {
+        let mut config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::ZERO,
+            fee_bps: Decimal::new(-1, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "daily".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "MSFT".to_string(),
+                    display_name: "Microsoft".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+
+        config.initial_capital = Decimal::new(100000, 0);
+        config.fee_bps = Decimal::new(1, 0);
+        config.slippage_bps = Decimal::new(-1, 0);
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_invalid_dates() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "portfolio".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "daily".to_string(),
+            start_date: "2026/01/01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "MSFT".to_string(),
+                    display_name: "Microsoft".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(5, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_config_rejects_mixed_markets() {
+        let config = crate::types::PortfolioBacktestConfigInput {
+            name: "mixed-markets".to_string(),
+            description: None,
+            initial_capital: Decimal::new(100000, 0),
+            fee_bps: Decimal::new(5, 0),
+            slippage_bps: Decimal::new(2, 0),
+            rebalancing_frequency: "daily".to_string(),
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-12-31".to_string(),
+            is_active: true,
+            assets: vec![
+                crate::types::PortfolioAssetInput {
+                    symbol: "AAPL".to_string(),
+                    display_name: "Apple".to_string(),
+                    market: "US".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(6, 1),
+                },
+                crate::types::PortfolioAssetInput {
+                    symbol: "0700.HK".to_string(),
+                    display_name: "Tencent".to_string(),
+                    market: "HK".to_string(),
+                    instrument_type: "Common Stock".to_string(),
+                    target_weight: Decimal::new(4, 1),
+                },
+            ],
+        };
+
+        assert!(validate_portfolio_backtest_config_input(&config).is_err());
+    }
+
+    #[test]
+    fn portfolio_backtest_frequency_normalizes_supported_values() {
+        assert_eq!(
+            normalize_portfolio_rebalancing_frequency("Weekly"),
+            Some("weekly")
+        );
+        assert_eq!(
+            normalize_portfolio_rebalancing_frequency("hourly"),
+            None
+        );
+    }
+
+    #[test]
+    fn portfolio_backtest_asset_normalization_sanitizes_symbol_and_market() {
+        let assets = vec![
+            crate::types::PortfolioAssetInput {
+                symbol: " aapl ".to_string(),
+                display_name: " Apple ".to_string(),
+                market: " us ".to_string(),
+                instrument_type: " Common Stock ".to_string(),
+                target_weight: Decimal::new(6, 1),
+            },
+            crate::types::PortfolioAssetInput {
+                symbol: "msft".to_string(),
+                display_name: "Microsoft".to_string(),
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                target_weight: Decimal::new(4, 1),
+            },
+        ];
+
+        let normalized = sanitize_portfolio_asset_inputs(&assets);
+        assert_eq!(normalized[0].symbol, "AAPL");
+        assert_eq!(normalized[0].market, "US");
+        assert_eq!(normalized[0].display_name, "Apple");
+        assert_eq!(normalized[0].instrument_type, "Common Stock");
+        assert_eq!(normalized[1].symbol, "MSFT");
     }
 
     #[test]
@@ -3955,10 +4379,11 @@ mod http_e2e_tests {
     fn market_symbol_list_expands_us_universe() {
         let us_symbols = built_in_market_symbols(Some("US"));
 
-        assert!(us_symbols.len() >= 25, "expected a much larger US universe");
+        assert!(us_symbols.len() >= 60, "expected a substantially larger US universe");
         assert!(us_symbols.iter().any(|item| item.symbol == "AAPL"));
         assert!(us_symbols.iter().any(|item| item.symbol == "NVDA"));
         assert!(us_symbols.iter().any(|item| item.symbol == "META"));
+        assert!(us_symbols.iter().any(|item| item.symbol == "SPY"));
         assert!(us_symbols.iter().all(|item| !item.symbol.ends_with(".HK")));
     }
 
@@ -3966,10 +4391,29 @@ mod http_e2e_tests {
     fn market_symbol_list_expands_hk_universe() {
         let hk_symbols = built_in_market_symbols(Some("HK"));
 
-        assert!(hk_symbols.len() >= 15, "expected a much larger HK universe");
+        assert!(hk_symbols.len() >= 30, "expected a substantially larger HK universe");
         assert!(hk_symbols.iter().any(|item| item.symbol == "0700.HK"));
         assert!(hk_symbols.iter().any(|item| item.symbol == "9988.HK"));
+        assert!(hk_symbols.iter().any(|item| item.symbol == "2800.HK"));
         assert!(hk_symbols.iter().all(|item| item.symbol.ends_with(".HK")));
+    }
+
+    #[test]
+    fn market_symbol_list_includes_etfs_for_both_markets() {
+        let us_symbols = built_in_market_symbols(Some("US"));
+        let hk_symbols = built_in_market_symbols(Some("HK"));
+
+        let us_etf_count = us_symbols
+            .iter()
+            .filter(|item| item.instrument_type == "ETF")
+            .count();
+        let hk_etf_count = hk_symbols
+            .iter()
+            .filter(|item| item.instrument_type == "ETF")
+            .count();
+
+        assert!(us_etf_count >= 10, "expected at least 10 US ETFs");
+        assert!(hk_etf_count >= 5, "expected at least 5 HK ETFs");
     }
 
     #[test]
@@ -4073,8 +4517,13 @@ mod http_e2e_tests {
             },
         ];
 
-        let response =
-            market_movers_snapshot_response_from_rows("US", "Common Stock", "gainers", rows);
+        let response = market_movers_snapshot_response_from_rows(
+            "US",
+            "Common Stock",
+            "gainers",
+            3,
+            rows,
+        );
 
         assert_eq!(response["market"], json!("US"));
         assert_eq!(response["instrument_type"], json!("Common Stock"));
@@ -4125,7 +4574,8 @@ mod http_e2e_tests {
             },
         ];
 
-        let response = market_movers_snapshot_response_from_rows("HK", "ETF", "losers", rows);
+        let response =
+            market_movers_snapshot_response_from_rows("HK", "ETF", "losers", 1, rows);
 
         assert_eq!(response["market"], json!("HK"));
         assert_eq!(response["instrument_type"], json!("ETF"));
@@ -4133,6 +4583,69 @@ mod http_e2e_tests {
         assert_eq!(response["captured_at"], json!(captured_at.to_rfc3339()));
         assert_eq!(response["count"], json!(1));
         assert_eq!(response["data"][0]["symbol"], json!("2800.HK"));
+    }
+
+    #[test]
+    fn market_movers_response_includes_snapshot_coverage() {
+        let captured_at = Utc::now();
+        let rows = vec![
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "AAPL".to_string(),
+                instrument_name: "Apple Inc.".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(190.25),
+                change: Some(3.5),
+                change_percent: Some(1.87),
+                currency: Some("USD".to_string()),
+                rank: 1,
+                captured_at,
+                source: "script".to_string(),
+            },
+            crate::types::MarketMoversSnapshot {
+                market: "US".to_string(),
+                instrument_type: "Common Stock".to_string(),
+                direction: "gainers".to_string(),
+                symbol: "MSFT".to_string(),
+                instrument_name: "Microsoft Corporation".to_string(),
+                exchange: "NASDAQ".to_string(),
+                country: "United States".to_string(),
+                price: Some(420.0),
+                change: Some(9.0),
+                change_percent: Some(2.19),
+                currency: Some("USD".to_string()),
+                rank: 2,
+                captured_at,
+                source: "script".to_string(),
+            },
+        ];
+
+        let response = market_movers_snapshot_response_from_rows(
+            "US",
+            "Common Stock",
+            "gainers",
+            2,
+            rows,
+        );
+
+        assert_eq!(response["coverage"]["covered"], json!(2));
+        assert_eq!(response["coverage"]["total"], json!(2));
+        assert_eq!(response["coverage"]["missing"], json!(0));
+        assert_eq!(response["coverage"]["success_rate"], json!(100.0));
+    }
+
+    #[test]
+    fn market_movers_refresh_targets_cover_all_market_segments() {
+        let targets = market_movers_refresh_targets();
+
+        assert_eq!(targets.len(), 4);
+        assert!(targets.contains(&("US", "Common Stock")));
+        assert!(targets.contains(&("US", "ETF")));
+        assert!(targets.contains(&("HK", "Common Stock")));
+        assert!(targets.contains(&("HK", "ETF")));
     }
 
     #[test]
@@ -4579,66 +5092,287 @@ mod http_e2e_tests {
     }
 
     async fn setup_e2e_app() -> (axum::Router, PgPool) {
-        let config = Arc::new(AppConfig::load().unwrap());
-        let db_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(config.database.max_connections)
-            .connect(&config.database.url)
-            .await
-            .unwrap();
+        let (app, db_pool) = E2E_APP
+            .get_or_init(|| async {
+                let config = Arc::new(AppConfig::load().unwrap());
+                let db_pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(config.database.max_connections)
+                    .connect(&config.database.url)
+                    .await
+                    .unwrap();
 
-        sqlx::migrate!("./migrations").run(&db_pool).await.unwrap();
+                sqlx::migrate!("./migrations").run(&db_pool).await.unwrap();
 
-        let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
-        let redis_conn = redis_client
-            .get_multiplexed_async_connection()
-            .await
-            .unwrap();
-        let event_bus = Arc::new(EventBus::new(redis_client).await.unwrap());
+                let redis_client = redis::Client::open(config.redis.url.as_str()).unwrap();
+                let redis_conn = redis_client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .unwrap();
+                let event_bus = Arc::new(EventBus::new(redis_client).await.unwrap());
 
-        let data_service = Arc::new(
-            DataService::new(db_pool.clone(), redis_conn.clone(), event_bus.clone())
-                .await
-                .unwrap(),
-        );
-        let strategy_service = Arc::new(
-            StrategyService::new(db_pool.clone(), event_bus.clone())
-                .await
-                .unwrap(),
-        );
-        let execution_service = Arc::new(
-            ExecutionService::new(db_pool.clone(), event_bus.clone())
-                .await
-                .unwrap(),
-        );
-        let portfolio_service = Arc::new(
-            PortfolioService::new(db_pool.clone(), event_bus.clone())
-                .await
-                .unwrap(),
-        );
-        let risk_service = Arc::new(
-            RiskService::new(
-                db_pool.clone(),
-                event_bus.clone(),
-                config.trading.max_order_size,
+                let data_service = Arc::new(
+                    DataService::new(db_pool.clone(), redis_conn.clone(), event_bus.clone())
+                        .await
+                        .unwrap(),
+                );
+                let strategy_service = Arc::new(
+                    StrategyService::new(db_pool.clone(), event_bus.clone())
+                        .await
+                        .unwrap(),
+                );
+                let execution_service = Arc::new(
+                    ExecutionService::new(db_pool.clone(), event_bus.clone())
+                        .await
+                        .unwrap(),
+                );
+                let portfolio_service = Arc::new(
+                    PortfolioService::new(db_pool.clone(), event_bus.clone())
+                        .await
+                        .unwrap(),
+                );
+                let risk_service = Arc::new(
+                    RiskService::new(
+                        db_pool.clone(),
+                        event_bus.clone(),
+                        config.trading.max_order_size,
+                    )
+                    .await
+                    .unwrap(),
+                );
+
+                let state = AppState {
+                    config,
+                    db_pool: db_pool.clone(),
+                    data_service,
+                    strategy_service,
+                    execution_service,
+                    portfolio_service,
+                    risk_service,
+                    event_bus,
+                    ws_manager: Arc::new(WSManager::new(128)),
+                    lifecycle_manager: Arc::new(RwLock::new(
+                        DataLifecycleManager::new(db_pool.clone()),
+                    )),
+                };
+
+                (create_router(state), db_pool)
+            })
+            .await;
+
+        (app.clone(), db_pool.clone())
+    }
+
+    #[tokio::test]
+    async fn portfolio_backtest_config_create_list_detail_round_trip() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, _) = setup_e2e_app().await;
+        let config_name = format!("portfolio-backtest-{}", Utc::now().timestamp_millis());
+        let create_payload = json!({
+            "name": config_name,
+            "description": "round trip test",
+            "initial_capital": 100000,
+            "fee_bps": 5,
+            "slippage_bps": 2,
+            "rebalancing_frequency": "Weekly",
+            "start_date": "2026-01-01",
+            "end_date": "2026-12-31",
+            "is_active": true,
+            "assets": [
+                {
+                    "symbol": " aapl ",
+                    "display_name": "Apple",
+                    "market": " us ",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.6
+                },
+                {
+                    "symbol": "msft",
+                    "display_name": "Microsoft",
+                    "market": "US",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.4
+                }
+            ]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/portfolio-backtests/configs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&create_payload).unwrap()))
+                    .unwrap(),
             )
             .await
-            .unwrap(),
-        );
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: Value = serde_json::from_slice(&bytes).unwrap();
+        let config_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["rebalancing_frequency"], json!("weekly"));
+        assert_eq!(created["assets"].as_array().unwrap().len(), 2);
 
-        let state = AppState {
-            config,
-            db_pool: db_pool.clone(),
-            data_service,
-            strategy_service,
-            execution_service,
-            portfolio_service,
-            risk_service,
-            event_bus,
-            ws_manager: Arc::new(WSManager::new(128)),
-            lifecycle_manager: Arc::new(RwLock::new(DataLifecycleManager::new(db_pool.clone()))),
-        };
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/portfolio-backtests/configs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_bytes = list_response.into_body().collect().await.unwrap().to_bytes();
+        let list: Value = serde_json::from_slice(&list_bytes).unwrap();
+        let list_item = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == json!(config_id))
+            .expect("created config should appear in list");
+        assert_eq!(list_item["rebalancing_frequency"], json!("weekly"));
+        assert_eq!(list_item["asset_count"], json!(2));
 
-        (create_router(state), db_pool)
+        let detail_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/portfolio-backtests/configs/{config_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_bytes = detail_response.into_body().collect().await.unwrap().to_bytes();
+        let detail: Value = serde_json::from_slice(&detail_bytes).unwrap();
+        assert_eq!(detail["id"], json!(config_id));
+        assert_eq!(detail["name"], json!(create_payload["name"]));
+        assert_eq!(detail["rebalancing_frequency"], json!("weekly"));
+        assert_eq!(detail["assets"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["assets"][0]["symbol"], json!("AAPL"));
+        assert_eq!(detail["assets"][0]["market"], json!("US"));
+        assert_eq!(detail["assets"][1]["symbol"], json!("MSFT"));
+    }
+
+    #[tokio::test]
+    async fn portfolio_backtest_config_rejects_invalid_frequency_via_route() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, _) = setup_e2e_app().await;
+        let payload = json!({
+            "name": format!("portfolio-backtest-invalid-frequency-{}", Utc::now().timestamp_millis()),
+            "description": "invalid frequency",
+            "initial_capital": 100000,
+            "fee_bps": 5,
+            "slippage_bps": 2,
+            "rebalancing_frequency": "hourly",
+            "start_date": "2026-01-01",
+            "end_date": "2026-12-31",
+            "is_active": true,
+            "assets": [
+                {
+                    "symbol": "AAPL",
+                    "display_name": "Apple",
+                    "market": "US",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.5
+                },
+                {
+                    "symbol": "MSFT",
+                    "display_name": "Microsoft",
+                    "market": "US",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.5
+                }
+            ]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/portfolio-backtests/configs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported rebalancing_frequency"));
+    }
+
+    #[tokio::test]
+    async fn portfolio_backtest_config_rejects_invalid_weight_total_via_route() {
+        if env::var("RUN_E2E_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let (app, _) = setup_e2e_app().await;
+        let payload = json!({
+            "name": format!("portfolio-backtest-invalid-weight-{}", Utc::now().timestamp_millis()),
+            "description": "invalid weights",
+            "initial_capital": 100000,
+            "fee_bps": 5,
+            "slippage_bps": 2,
+            "rebalancing_frequency": "daily",
+            "start_date": "2026-01-01",
+            "end_date": "2026-12-31",
+            "is_active": true,
+            "assets": [
+                {
+                    "symbol": "AAPL",
+                    "display_name": "Apple",
+                    "market": "US",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.6
+                },
+                {
+                    "symbol": "MSFT",
+                    "display_name": "Microsoft",
+                    "market": "US",
+                    "instrument_type": "Common Stock",
+                    "target_weight": 0.3
+                }
+            ]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/portfolio-backtests/configs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Portfolio weights must sum to 1.0"));
     }
 
     #[tokio::test]

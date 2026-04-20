@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Multi-stage build for Next.js frontend
 FROM node:18-alpine AS base
 
