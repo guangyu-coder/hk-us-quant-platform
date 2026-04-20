@@ -1093,10 +1093,8 @@ impl TryFrom<SignalReviewRow> for SignalReviewRecord {
 
     fn try_from(row: SignalReviewRow) -> Result<Self, Self::Error> {
         let suggested_order = match row.suggested_order {
-            Some(value) => {
-                serde_json::from_value::<Option<StrategySuggestedOrderDraft>>(value)
-                    .map_err(AppError::Serialization)?
-            }
+            Some(value) => serde_json::from_value::<Option<StrategySuggestedOrderDraft>>(value)
+                .map_err(AppError::Serialization)?,
             None => None,
         };
 
@@ -1270,7 +1268,10 @@ fn estimate_signal_strength(
     closes: &[Decimal],
 ) -> f64 {
     match (kind, signal_type) {
-        ("simple_moving_average" | "dual_ma" | "ma_crossover", SignalType::Buy | SignalType::Sell) => {
+        (
+            "simple_moving_average" | "dual_ma" | "ma_crossover",
+            SignalType::Buy | SignalType::Sell,
+        ) => {
             let short_period = config
                 .parameters
                 .get("short_period")
@@ -1330,12 +1331,13 @@ pub fn build_strategy_signal_snapshot(
     timeframe: Option<String>,
     signal: Signal,
 ) -> StrategySignalSnapshot {
-    let suggested_order = signal_side_label(signal.signal_type).map(|side| StrategySuggestedOrderDraft {
-        symbol: signal.symbol.clone(),
-        side: side.to_string(),
-        quantity: 100,
-        strategy_id: strategy_id.clone(),
-    });
+    let suggested_order =
+        signal_side_label(signal.signal_type).map(|side| StrategySuggestedOrderDraft {
+            symbol: signal.symbol.clone(),
+            side: side.to_string(),
+            quantity: 100,
+            strategy_id: strategy_id.clone(),
+        });
 
     StrategySignalSnapshot {
         strategy_id,

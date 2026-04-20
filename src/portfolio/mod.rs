@@ -171,7 +171,10 @@ impl PortfolioService {
         let mut where_clauses = Vec::new();
         let mut bind_index = 1;
 
-        if strategy_id.filter(|value| !value.trim().is_empty()).is_some() {
+        if strategy_id
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        {
             where_clauses.push(format!("strategy_id = ${bind_index}"));
             bind_index += 1;
         }
@@ -198,7 +201,10 @@ impl PortfolioService {
             sql = sql.bind(symbol.trim());
         }
 
-        let rows = sql.fetch_all(&self.db_pool).await.map_err(AppError::Database)?;
+        let rows = sql
+            .fetch_all(&self.db_pool)
+            .await
+            .map_err(AppError::Database)?;
         Ok(rows.into_iter().map(ExecutionTrade::from).collect())
     }
 
